@@ -33,7 +33,11 @@
 
 Watch a complete memory co-management walkthrough.
 
-[Watch the demo video](docs/videos/MemoSync-demo.mp4)
+<video controls preload="metadata" width="960" height="540" style="display: block; width: 100%; max-width: 960px; height: auto; margin: 0 auto;" src="docs/videos/MemoSync-demo.mp4"></video>
+
+<p align="center">
+  <a href="docs/videos/MemoSync-demo.mp4">Video file (MP4)</a>
+</p>
 
 ## Why MemoSync
 
