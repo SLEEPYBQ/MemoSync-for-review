@@ -33,7 +33,7 @@
 
 Watch a complete memory co-management walkthrough.
 
-https://github.com/user-attachments/assets/ff36208e-a127-48fd-a0d5-cf42f87c4f9e
+[Watch the demo video](docs/videos/MemoSync-demo.mp4)
 
 ## Why MemoSync
 
