@@ -37,6 +37,11 @@ Branches inspect files and run bounded read-only commands. They cannot edit proj
 
 `MEMOSYNC_ISOLATE_CLI=1` creates separate engine profiles. Main sessions and branches use the same selected provider configuration. Credentials remain in the reviewer's local environment and are not inserted into model prompts or source files.
 
-## Reproduction
+## Offline validation
 
-Run `bun run check` and `bun test src/ --timeout 30000` for offline validation. Provider-backed smoke commands are listed in the [README](../README.md#verification). Transport checks exercise real branching and continuation; application checks exercise two complete turns with temporary memory reviews, working-memory injection, and auditing.
+```bash
+bun run check
+bun test src/ --timeout 30000
+```
+
+These checks validate types, frontend builds, and behavior through mocked CLI transports without model API calls. See [Development](../README.md#development) for the local development command.
