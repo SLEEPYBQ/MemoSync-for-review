@@ -270,21 +270,23 @@ describe("AppSocket", () => {
     const ws = FakeWebSocket.instances[0]!
     ws.open()
 
-
+    // The zombie-WS case: the frame is written into a half-open TCP hole —
+    // no ack, no error, and no close event ever fires.
     const sendPromise = socket.command({ type: "chat.send", content: "hello" } as never)
     expect(ws.sent).toHaveLength(1)
 
     for (const id of [...timers.timeouts.keys()]) timers.runTimeout(id)
 
     await expect(sendPromise).rejects.toThrow(/timed out/i)
-
+    // The proven-dead socket is not kept around — a reconnect is underway.
     expect(FakeWebSocket.instances.length).toBeGreaterThanOrEqual(2)
     socket.dispose()
   })
 
   test("a command that failed while disconnected is not ghost-replayed on reconnect", async () => {
-
-
+    // Live repro (QA §24): server down → send fails visibly (draft restored,
+    // user re-sends) — but the queued envelope survived in outboundQueue and
+    // was flushed on reconnect, delivering the "failed" message a second time.
     const socket = new AppSocket("ws://localhost/ws")
     socket.start()
     const ws = FakeWebSocket.instances[0]!
@@ -294,13 +296,15 @@ describe("AppSocket", () => {
     const sendPromise = socket.command({ type: "chat.send", content: "hello" } as never)
     expect(ws.sent.filter((e) => e.type === "command")).toHaveLength(0)
 
-
+    // Next reconnect attempt also fails — its close rejects the pending command
+    // (this is when the UI reports the failure and restores the draft).
     for (const id of [...timers.timeouts.keys()]) timers.runTimeout(id)
     const ws2 = FakeWebSocket.instances[1]!
     ws2.close()
     await expect(sendPromise).rejects.toThrow()
 
-
+    // The server comes back: the fresh connection must NOT receive the command
+    // the UI already reported dead.
     for (const id of [...timers.timeouts.keys()]) timers.runTimeout(id)
     const ws3 = FakeWebSocket.instances[2]!
     ws3.open()

@@ -10,7 +10,7 @@ function result(snapshot: Awaited<ReturnType<StudyPreviewRuntimeController["stat
   }
 }
 
-
+/** Agent-readable diagnostics and a safe restart for the server-owned preview. */
 export function toClaudeStudyPreviewMcpServer(
   runtime: Pick<StudyPreviewRuntimeController, "status" | "restart">,
   projectPath: string,

@@ -4,7 +4,9 @@ import type { LlmJsonCaller } from './deepseek';
 
 export interface MemoryReasoningContext { sessionId?: string; projectId?: string }
 
-
+/** Auxiliary Board actions use the same CLI provider as their conversation.
+ * Async-local scope prevents simultaneous chats from borrowing each other's
+ * parent session. This adapter performs no direct provider HTTP requests. */
 export function createBranchJsonCaller(input: {
   resolve: (context: MemoryReasoningContext) => MemoryBranchInput;
   createBranch?: typeof createMemoryBranch;
@@ -26,14 +28,14 @@ export function createBranchJsonCaller(input: {
   return { callJson, run: <T>(context: MemoryReasoningContext, operation: () => T): T => contexts.run(context, operation) };
 }
 
-
+/** Read a clone; the actual route retains ownership of request validation. */
 export async function memoryRequestContext(req: Request, url: URL): Promise<MemoryReasoningContext> {
   let body: Record<string, unknown> = {};
   if (req.method === 'POST' || req.method === 'PATCH' || req.method === 'PUT') {
     try {
       const parsed = await req.clone().json();
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
-    } catch {   }
+    } catch { /* route returns the validation error */ }
   }
   const firstString = (...values: unknown[]) => values.find(value => typeof value === 'string' && value.length) as string | undefined;
   return {

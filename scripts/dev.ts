@@ -112,7 +112,7 @@ async function waitForLocalUrl(url: string, timeoutMs = 30_000) {
         return
       }
     } catch {
-
+      // Keep polling until Vite is ready or the timeout expires.
     }
 
     await Bun.sleep(250)

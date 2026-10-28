@@ -1,11 +1,17 @@
 import type { TranscriptEntry } from "../../../shared/types"
 
-
+/**
+ * The guide's demo conversation, as a sequence of SCENES the participant
+ * clicks through — each scene is the transcript at one real moment of a
+ * turn (gates open one at a time, exactly like live usage). Content is
+ * scripted to match the study task (a React + Fastify web shop), and every
+ * entry uses the real transcript shapes rendered by the real components.
+ */
 export interface GuideScene {
   entries: TranscriptEntry[]
-
+  /** Frozen streaming preview under the transcript (the "typing" moment). */
   streamingText?: string
-
+  /** Footer status label for in-progress moments (e.g. "requesting"). */
   statusLabel?: string
 }
 
@@ -19,7 +25,7 @@ function entry<T extends Omit<TranscriptEntry, "_id" | "createdAt">>(value: T, i
   return { ...base(id), ...value } as unknown as TranscriptEntry
 }
 
-
+/** Row anchors the spotlight points at (single rows use the entry id). */
 export const TOUR_ANCHORS = {
   userPrompt: "demo-user-prompt",
   preview: "demo-preview",
@@ -44,7 +50,7 @@ const MEMORIES = {
   imageColors: { id: "M-07", content: "Generated product images should use vivid, high-contrast colors", scope: "personal" },
 }
 
-
+/** MemoSync arm: the full turn, gate by gate. */
 export function buildMemoSyncScenes() {
   n = 0
   const empty: GuideScene = { entries: [] }
@@ -52,7 +58,7 @@ export function buildMemoSyncScenes() {
     entry({ kind: "user_prompt", content: GUIDE_DEMO_PROMPT, attachments: [] }, TOUR_ANCHORS.userPrompt),
   ]
 
-
+  // Step 1 open: candidates from the previous turn, waiting for review.
   const proposalsOpen = [
     ...ask,
     entry({ kind: "memory_proposals", proposalsId: "p1", turn: 2, pending: true, candidates: [] }),
@@ -66,14 +72,19 @@ export function buildMemoSyncScenes() {
     }),
   ]
 
-
+  // Step 1 settles with one accepted memory and one deferred Candidate. Its
+  // real summary remains reopenable while Step 2 is pending. The same pending
+  // scene lets the Transfer lesson show "it ran, then finished" rather than a
+  // standing placeholder.
   const transferPending = [
     ...proposalsOpen,
     entry({ kind: "memory_proposals_decision", proposalsId: "p1", decision: "skipped" }),
     entry({ kind: "memory_transfer", transferId: "t1", turn: 2, pending: true, suggestions: [] }),
   ]
-
-
+  // Encode finished, decode still running: Source/Encoder/Abstract rule are
+  // on the card, the "In this project" cell shows its localizing skeleton.
+  // The tour's timed reveal fills ONLY that landing cell (mentor 2026-08-15:
+  // the beat is the localization landing, never a whole-card placeholder).
   const transferSuggestionBase = {
     sourceId: "M-11",
     sourceContent: "Destructive actions get a small confirmation dialog first",
@@ -100,8 +111,9 @@ export function buildMemoSyncScenes() {
       suggestions: [
         {
           ...transferSuggestionBase,
-
-
+          // `content` + `landing` are what flips the card to decoded — the
+          // old demo data used a nonexistent `localized` field, which is why
+          // the landing cell skeleton never resolved in the tour.
           content: "Ask for confirmation before emptying the cart",
           bound: ["emptying the cart"],
           suggestedScope: "project",
@@ -111,7 +123,7 @@ export function buildMemoSyncScenes() {
     }),
   ]
 
-
+  // Transfer handled → the library checkup opens with one finding.
   const checkupOpen = [
     ...transferOpen,
     entry({ kind: "memory_transfer_decision", transferId: "t1", decision: "handled" }),
@@ -129,7 +141,8 @@ export function buildMemoSyncScenes() {
     }),
   ]
 
-
+  // Checkup handled → the injection preview gate opens (undecided: the
+  // turn is genuinely waiting here, buttons visible).
   const previewOpen = [
     ...checkupOpen,
     entry({ kind: "memory_checkup_decision", checkupId: "c1", decision: "handled" }),
@@ -154,7 +167,7 @@ export function buildMemoSyncScenes() {
     }),
   ]
 
-
+  // Gate passed → the assistant is writing its first reply.
   const replying: TranscriptEntry[] = [
     ...previewOpen,
     entry({ kind: "memory_preview_decision", previewId: "v1", decision: "go_on", expectedUses: [] }),
@@ -208,7 +221,7 @@ export function buildMemoSyncScenes() {
       TOUR_ANCHORS.finalReply
     ),
     entry({ kind: "result", subtype: "success", isError: false, durationMs: 74_000, result: "Added the Clear cart button." }),
-
+    // The post-turn audit: verdicts on how each injected memory was used.
     entry(
       {
         kind: "memory_trace",
@@ -247,7 +260,10 @@ export function buildMemoSyncScenes() {
     ),
   ]
 
-
+  // Alternate ending for the violated-audit step: the reply CLAIMS to follow
+  // the cart-context memory (inline [M-02] self-report) but actually bypassed
+  // it — exactly the drift the audit exists to catch. Everything up to the
+  // tool rows is the same turn.
   const auditViolated = [
     ...tools,
     entry(
@@ -298,7 +314,8 @@ export function buildMemoSyncScenes() {
     ),
   ]
 
-
+  // The wrong use is visible while the reply is still streaming. This is the
+  // only scene that arms the current-turn citation Stop control.
   const interruptStreaming: GuideScene = {
     entries: replying,
     streamingText:
@@ -306,7 +323,8 @@ export function buildMemoSyncScenes() {
     statusLabel: "running",
   }
 
-
+  // The participant stopped at the exact bad sentence. No result or audit is
+  // appended to the interrupted attempt.
   const interruptOpen = [
     ...replying,
     entry(
@@ -336,7 +354,9 @@ export function buildMemoSyncScenes() {
     ),
   ]
 
-
+  // Resume is a continuation of the parked attempt. The resolution settles
+  // the same recovery card, then the corrected continuation and its audit
+  // appear without replaying Long-term or Working Memory gates.
   const resumed = [
     ...interruptOpen,
     entry({
@@ -435,144 +455,13 @@ export function buildMemoSyncScenes() {
   }
 }
 
-
-export function buildAutoScenes() {
-  n = 100
-  const empty: GuideScene = { entries: [] }
-  const ask = [entry({ kind: "user_prompt", content: GUIDE_DEMO_PROMPT, attachments: [] }, TOUR_ANCHORS.userPrompt)]
-
-  const firstReplyText =
-    "I'll add the button to the cart page. From earlier sessions I know the cart state lives in CartContext, and you prefer a confirmation dialog before destructive actions. I'll follow both. Let me look at the cart code first."
-
-  const replying: GuideScene = {
-    entries: ask,
-    streamingText:
-      "I'll add the button to the cart page. From earlier sessions I know the cart state lives in CartContext, and you prefer a",
-    statusLabel: "running",
-  }
-
-  const tools = [
-    ...ask,
-    entry({ kind: "assistant_text", text: firstReplyText }, TOUR_ANCHORS.firstReply),
-    entry({
-      kind: "tool_call",
-      tool: {
-        toolId: "tool-1",
-        toolKind: "bash",
-        toolName: "Bash",
-        input: { command: "ls client/src/cart client/src/pages", description: "Find the cart page and context" },
-      },
-    }),
-    entry({
-      kind: "tool_result",
-      toolId: "tool-1",
-      content: "client/src/cart:\nCartContext.tsx\ncartApi.ts\n\nclient/src/pages:\nCartPage.tsx\nCatalogPage.tsx\nCheckoutPage.tsx",
-    }),
-    entry({
-      kind: "tool_call",
-      tool: {
-        toolId: "tool-2",
-        toolKind: "edit_file",
-        toolName: "Edit",
-        input: {
-          filePath: "client/src/pages/CartPage.tsx",
-          oldString: "      <CartLineItems items={items} />",
-          newString:
-            "      <CartLineItems items={items} />\n      <ClearCartButton onConfirm={clearCart} />",
-        },
-      },
-    }),
-    entry({ kind: "tool_result", toolId: "tool-2", content: "Updated client/src/pages/CartPage.tsx" }),
-  ]
-
-  const final = [
-    ...tools,
-    entry(
-      {
-        kind: "assistant_text",
-        text:
-          "Done. The cart page now has a “Clear cart” button:\n\n- Clicking it opens a small confirmation dialog first.\n- Confirming calls CartContext's `clearCart` action, so the header badge and totals update everywhere.\n\nTry it: open the cart, add an item, and press “Clear cart”.",
-      },
-      TOUR_ANCHORS.finalReply
-    ),
-    entry({ kind: "result", subtype: "success", isError: false, durationMs: 68_000, result: "Added the Clear cart button." }),
-  ]
-
-  return {
-    empty,
-    ask: { entries: ask, statusLabel: "requesting" } satisfies GuideScene,
-    replying,
-    tools: { entries: tools, statusLabel: "running" } satisfies GuideScene,
-    final: { entries: final } satisfies GuideScene,
-  }
-}
-
-
-export function buildStaticScenes() {
-  n = 200
-  const empty: GuideScene = { entries: [] }
-  const ask = [entry({ kind: "user_prompt", content: GUIDE_DEMO_PROMPT, attachments: [] }, TOUR_ANCHORS.userPrompt)]
-
-  const firstReplyText =
-    "The Markdown notes sent with this turn say the cart state lives in CartContext and that destructive actions need a confirmation dialog. I'll follow both."
-
-  const tools = [
-    ...ask,
-    entry({ kind: "assistant_text", text: firstReplyText }, TOUR_ANCHORS.firstReply),
-    entry({
-      kind: "tool_call",
-      tool: {
-        toolId: "tool-1",
-        toolKind: "edit_file",
-        toolName: "Edit",
-        input: {
-          filePath: "client/src/pages/CartPage.tsx",
-          oldString: "      <CartLineItems items={items} />",
-          newString:
-            "      <CartLineItems items={items} />\n      <ClearCartButton onConfirm={clearCart} />",
-        },
-      },
-    }),
-    entry({ kind: "tool_result", toolId: "tool-1", content: "Updated client/src/pages/CartPage.tsx" }),
-    entry({ kind: "assistant_text", text: "The code change is in. I'll record the new stable project fact in the shared notebook." }),
-    entry({
-      kind: "tool_call",
-      tool: {
-        toolId: "tool-2",
-        toolKind: "edit_file",
-        toolName: "Edit",
-        input: {
-          filePath: "MEMORY.md",
-          oldString: "# Project notes",
-          newString: "# Project notes\n- Cart page has a Clear cart button (confirmation dialog → CartContext.clearCart)",
-        },
-      },
-    }),
-    entry({ kind: "tool_result", toolId: "tool-2", content: "Updated MEMORY.md" }),
-  ]
-
-  const final = [
-    ...tools,
-    entry(
-      {
-        kind: "assistant_text",
-        text:
-          "Done. The cart page now has a “Clear cart” button with a confirmation dialog, wired to CartContext's `clearCart` action. I also noted the new button in MEMORY.md for next time.\n\nTry it: open the cart, add an item, and press “Clear cart”.",
-      },
-      TOUR_ANCHORS.finalReply
-    ),
-    entry({ kind: "result", subtype: "success", isError: false, durationMs: 71_000, result: "Added the Clear cart button." }),
-  ]
-
-  return {
-    empty,
-    ask: { entries: ask, statusLabel: "requesting" } satisfies GuideScene,
-    tools: { entries: tools, statusLabel: "running" } satisfies GuideScene,
-    final: { entries: final } satisfies GuideScene,
-  }
-}
-
-
+/**
+ * Demo memories seeded into the client memory store while the tour is open —
+ * candidate cards and citation chips resolve content by id from the store,
+ * so without these the demo would render "dismissed" tombstones. Removed on
+ * tour unmount; loadAll() replacing them mid-tour is healed by the tour's
+ * re-seed effect.
+ */
 export const DEMO_MEMORY_ITEMS = [
   {
     id: "M-01",

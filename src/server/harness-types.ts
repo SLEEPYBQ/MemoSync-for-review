@@ -4,11 +4,11 @@ export interface HarnessEvent {
   type: "transcript" | "session_token" | "assistant_delta"
   entry?: TranscriptEntry
   sessionToken?: string
-
+  /** Normalized Claude SDK turn provenance; unknown fails closed in study mode. */
   origin?: "human" | "task-notification" | "auto-continuation" | "channel" | "peer" | "coordinator" | "unknown"
-
+  /** assistant_delta: id of the engine message item this chunk belongs to. */
   itemId?: string
-
+  /** assistant_delta: the raw text chunk (append to same-item chunks). */
   delta?: string
 }
 

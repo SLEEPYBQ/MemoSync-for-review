@@ -11,9 +11,6 @@ import { GitPanel } from "../../components/chat-ui/GitPanel"
 import { SessionMemoriesPanel } from "../../components/memory-chat/SessionMemoriesPanel"
 import { TurnInterruptContext, type TurnInterruptApi } from "../../components/messages/shared"
 import { submitStudyPrompt } from "../study/studyPromptIntercept"
-import { MemorySummaryPanel } from "../../components/memory-chat/MemorySummaryPanel"
-import { StaticMemoryPanel } from "../../components/memory-chat/StaticMemoryPanel"
-import { useConditionPolicy } from "../../lib/conditionApi"
 import { useAppDialog } from "../../components/ui/app-dialog"
 import { Card, CardContent } from "../../components/ui/card"
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "../../components/ui/resizable"
@@ -477,7 +474,6 @@ function ChatWorkspace({
 export function ChatPage() {
   const state = useOutletContext<AppState>()
   const dialog = useAppDialog()
-  const conditionPolicy = useConditionPolicy()
   const layoutRootRef = useRef<HTMLDivElement>(null)
   const transcriptListRef = useRef<LegendListRef | null>(null)
   const isAtEndRef = useRef(true)
@@ -490,7 +486,10 @@ export function ChatPage() {
   const [pendingTerminalCommands, setPendingTerminalCommands] = useState<Record<string, string>>({})
   const showEmptyState = state.messages.length === 0 && state.runtime?.title === "New Chat"
 
-
+  // Redesign 2026-08-07 §3: after an early stop (Stop pressed — the latest
+  // turn ends on an interrupted entry with no newer turn flow), a red strip
+  // above the composer invites the correction. Dismissible; auto-clears on
+  // the next turn because the interrupted entry stops being the latest.
   const lastInterruptedId = useMemo(() => {
     for (let i = state.messages.length - 1; i >= 0; i--) {
       const m = state.messages[i]!
@@ -505,7 +504,10 @@ export function ChatPage() {
     setDismissedStopBannerId(lastInterruptedId)
   }, [lastInterruptedId])
 
-
+  // The engine reports its slash commands/skills in system_init — the newest
+  // one wins (models/settings can change between session boots). Powers the
+  // composer's "/" autocomplete; a fresh chat falls back to the per-provider
+  // cache inside ChatInput until its first turn boots.
   const rememberSlashCommands = useSlashCommandsStore((s) => s.remember)
   const availableSlashCommands = useMemo(() => {
     for (let i = state.messages.length - 1; i >= 0; i--) {
@@ -643,7 +645,8 @@ export function ChatPage() {
     chatInputRef.current?.enqueueFiles(files)
   }, [state.hasSelectedProject])
 
-
+  // Dismissing a preview gate cancels the whole turn — the typed message must
+  // not be the casualty: it goes back into the (empty) composer.
   const messagesRef = useRef(state.messages)
   messagesRef.current = state.messages
   const handleMemoryPreviewRespondWithRestore = useCallback<AppState["handleMemoryPreviewRespond"]>(
@@ -754,7 +757,10 @@ export function ChatPage() {
     toggleRightPanel(projectId, "files")
   }, [projectId, toggleRightPanel])
 
-
+  // The session-memories panel shows PER-CHAT state (pins); leaving it open
+  // across a chat switch shows the previous chat's "bringing everything"
+  // against a new chat still at the bring-in gate (QA BUG-003). Close it on
+  // chat change; the user reopens it in the context they mean.
   const memoryPanelChatIdRef = useRef(state.activeChatId)
   useEffect(() => {
     if (memoryPanelChatIdRef.current === state.activeChatId) return
@@ -831,8 +837,9 @@ export function ChatPage() {
     content: string,
     options?: Parameters<typeof state.handleSend>[1],
   ) => {
-
-
+    // Opening-Board flow (2026-08-19 E1): the first prompt of an unreviewed
+    // study task is captured; the Board modal runs, then the prompt continues
+    // on its own. Everything else passes straight through.
     await submitStudyPrompt({
       content,
       attachments: options?.attachments,
@@ -1169,24 +1176,17 @@ export function ChatPage() {
     state.chatDiffSnapshot,
     wrapDiffLines,
   ])
-
-
-  const memoryPanelContent =
-    projectId && state.activeChatId
-      ? conditionPolicy.condition === "auto"
-        ? <MemorySummaryPanel chatId={state.activeChatId} projectId={projectId} exposureInitiator={rightSidebarVisibility.openInitiator} onClose={handleCloseRightSidebar} />
-        : conditionPolicy.condition === "static"
-          ? <StaticMemoryPanel chatId={state.activeChatId} projectId={projectId} exposureInitiator={rightSidebarVisibility.openInitiator} onClose={handleCloseRightSidebar} />
-          : <SessionMemoriesPanel
-              chatId={state.activeChatId}
-              projectId={projectId}
-              messages={state.memoryRecordMessages}
-              streamingText={state.runtime?.streamingText ?? null}
-              isTurnActive={state.canCancel}
-              exposureInitiator={rightSidebarVisibility.openInitiator}
-              onClose={handleCloseRightSidebar}
-            />
-      : null
+  const memoryPanelContent = projectId && state.activeChatId
+    ? <SessionMemoriesPanel
+        chatId={state.activeChatId}
+        projectId={projectId}
+        messages={state.memoryRecordMessages}
+        streamingText={state.runtime?.streamingText ?? null}
+        isTurnActive={state.canCancel}
+        exposureInitiator={rightSidebarVisibility.openInitiator}
+        onClose={handleCloseRightSidebar}
+      />
+    : null
   const rightPanelContent = activeRightPanel === "browser" && projectId
     ? <BrowserPanel key={projectId} projectId={projectId} socket={state.socket} onClose={handleCloseRightSidebar} onRunQuickAction={handleRunQuickAction} />
     : activeRightPanel === "memory" && projectId && state.activeChatId
@@ -1197,7 +1197,9 @@ export function ChatPage() {
           ? <ChatSidebarContent {...gitPanelContentProps} />
           : null
 
-
+  // Per-memory interrupt plumbing (2026-08-19 C1/C2): every citation chip
+  // under this provider (reply text + sidebar live row) carries a stop entry
+  // while the turn is cancellable, and the recovery card resumes through it.
   const turnInterruptApi = useMemo<TurnInterruptApi | null>(() => {
     const chatId = state.activeChatId
     if (!chatId) return null
@@ -1249,8 +1251,11 @@ export function ChatPage() {
             })
           }}
           onLayoutChanged={(layout) => {
-
-
+            // Ignore the callback the panel group fires on MOUNT, before the
+            // layout width has been measured (layoutWidth still 0). At that
+            // point getRightSidebarSizePx falls back to the hardcoded default,
+            // so persisting it overwrote the user's saved width on every refresh
+            // (BUG PANEL-1). Genuine drags happen after the width is measured.
             if (!showRightSidebar || isRightSidebarAnimating.current || layoutWidth <= 0) {
               return
             }

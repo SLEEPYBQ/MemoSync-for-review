@@ -23,7 +23,7 @@ function mem(id: string, content: string, over: Partial<MemoryItem> = {}): Memor
   };
 }
 
-
+/** Fake LlmJsonCaller that records calls and returns a canned object. */
 function fakeCallJson(result: Record<string, unknown>): { call: LlmJsonCaller; calls: DeepSeekJsonRequest[] } {
   const calls: DeepSeekJsonRequest[] = [];
   const call: LlmJsonCaller = async (req) => {
@@ -33,7 +33,7 @@ function fakeCallJson(result: Record<string, unknown>): { call: LlmJsonCaller; c
   return { call, calls };
 }
 
-
+/** Fake logger that records emitted events. */
 function fakeLogger(): { logger: { event: (e: ExperimentEvent) => void }; events: ExperimentEvent[] } {
   const events: ExperimentEvent[] = [];
   return { logger: { event: (e) => events.push(e) }, events };
@@ -82,7 +82,7 @@ describe('createTraceService', () => {
       { id: 'M-02', label: 'violated', note: 'response ran a direct prod query' },
     ]);
 
-
+    // system/user content reaches the LLM caller with the exchange + memory fields.
     expect(calls).toHaveLength(1);
     expect(calls[0].system).toContain('operational');
     expect(calls[0].system).toContain('injected_without_effect');
@@ -108,7 +108,8 @@ describe('createTraceService', () => {
     const good = await run('Ran the tests per [M-01],\n  quietly.');
     expect(good.summary).toBe('Ran the tests per [M-01], quietly.');
 
-
+    // A citation of a memory NOT in play this turn is unwrapped to plain text
+    // — no client may render a clickable reference to it.
     const hallucinated = await run('Ran tests per [M-01] and honored [M-99].');
     expect(hallucinated.summary).toBe('Ran tests per [M-01] and honored M-99.');
 
@@ -133,8 +134,8 @@ describe('createTraceService', () => {
     const service = createTraceService({ callJson: call });
 
     const outcome = await service.trace({ sessionId: 's1', userText: 'u', assistantText: 'a', usedMemories: [m1, m2] });
-
-
+    // The no-effect id renders as plain text — the summary may not claim
+    // influence for a memory the labels just called inert.
     expect(outcome.summary).toBe('No influence, but M-01 shaped the answer per [M-02].');
   });
 
@@ -153,11 +154,11 @@ describe('createTraceService', () => {
       return service.trace({ sessionId: 's1', userText: 'u', assistantText: 'a', usedMemories: [m1, m2] });
     };
 
-
+    // The no-effect citation in the tail vanishes; the citable one stays.
     expect((await run('Broke the port rule. [M-01] [M-02]')).summary).toBe('Broke the port rule. [M-01]');
-
+    // A tail of ONLY de-cited ids collapses to the sentence itself.
     expect((await run('Broke the port rule per [M-01]. [M-02]')).summary).toBe('Broke the port rule per [M-01].');
-
+    // Prose mentions mid-sentence keep their bare id — only the tail is swept.
     expect((await run('M-02 stayed idle while [M-01] was broken. [M-02]')).summary).toBe(
       'M-02 stayed idle while [M-01] was broken.',
     );
@@ -415,7 +416,7 @@ describe('not_applicable decision-tree contract (2026-08-19)', () => {
       { id: 'M-02', label: 'violated', note: 'ran on 3000', quote: 'listening on port 3000', cause: 'not_followed', impact: 'none' },
       { id: 'M-03', label: 'operational', note: 'ok' },
     ]);
-
+    // M-01 de-cited (NA is not citable); M-02 keeps its citation.
     expect(outcome.summary).toBe('Skipped image work M-01 but broke the port rule [M-02].');
   });
 });

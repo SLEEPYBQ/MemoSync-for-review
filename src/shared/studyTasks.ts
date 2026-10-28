@@ -1,12 +1,20 @@
+// The experiment's task catalog and post-session quiz schema, straight from
+// the study design (MemoSync Experiment Final): each session ends with a
+// three-question probe per INJECTED memory item, yielding D_i (desired
+// content/scope), A_i (believed content/scope), and the participant's own
+// execution judgment; the system snapshots O_i (actual content/scope) behind
+// the scenes. Wording is blinding-safe: every arm says "the agent".
 
-
+// The brief TEXT deliberately lives server-side only (src/server/study-briefs.ts):
+// participants must not be able to read a locked task's instructions out of
+// the client bundle. This module carries only ids, titles, and the quiz schema.
 export interface StudyTask {
   id: string
-
+  /** Neutral display title (no product names, no benchmark jargon). */
   title: string
-
+  /** Stable workspace slug. S1 and S2 deliberately share one project tree. */
   projectSlug: "apartment" | "car"
-
+  /** Participant-facing project title, matching the registered sidebar row. */
   projectTitle: string
 }
 
@@ -17,17 +25,18 @@ export const STUDY_TASKS: StudyTask[] = [
   { id: "098-S2", title: "Car rentals · Session 2", projectSlug: "car", projectTitle: "Car rentals" },
 ]
 
-
+/** Bump when participant-facing training or task-wrapper rules materially change. */
 export const STUDY_GUIDE_VERSION = "2026-08-22-v10"
 export const STUDY_BRIEF_VERSION = "v1"
 
-
+/** Serial gate: completed = D/A/E and both Raw TLX blocks submitted. */
 export type StudyTaskStatus = "completed" | "active" | "locked"
 
 export function getStudyTask(id: string): StudyTask | undefined {
   return STUDY_TASKS.find((task) => task.id === id)
 }
 
+// --- Quiz schema (one record per injected memory item) ---------------------
 
 export const DESIRED_CONTENT_OPTIONS = ["accurate", "needs_edit", "not_intended"] as const
 export const DESIRED_SCOPE_OPTIONS = ["session", "project", "personal"] as const
@@ -50,14 +59,14 @@ export type StudyAssessedMemoryAnswer =
   | { kind: "not_remembered"; presence: "absent"; scope: null }
   | { kind: "unsure"; presence: "unknown"; scope: StudyAssessedScope }
 
-
+/** One frozen probe. `cue` is the last-focused full atomic memory content. */
 export interface StudyQuestionnaireItem {
   probeId: string
   snapshotId: string
   cue: string
 }
 
-
+/** Canonical answer tied to one probe in one immutable freeze snapshot. */
 export interface StudyQuestionnaireAnswer {
   probeId: string
   snapshotId: string
@@ -84,7 +93,7 @@ function includesLiteral<const T extends readonly string[]>(options: T, value: u
   return typeof value === "string" && options.includes(value)
 }
 
-
+/** Parse a frozen questionnaire item without truncating or rewriting its cue. */
 export function parseStudyQuestionnaireItem(raw: unknown): StudyQuestionnaireItem | null {
   if (!isRecord(raw)) return null
   if (!hasExactKeys(raw, ["probeId", "snapshotId", "cue"])) return null
@@ -94,7 +103,7 @@ export function parseStudyQuestionnaireItem(raw: unknown): StudyQuestionnaireIte
   return { probeId: raw.probeId, snapshotId: raw.snapshotId, cue: raw.cue }
 }
 
-
+/** Parse an answer into the canonical questionnaire representation. */
 export function parseStudyQuestionnaireAnswer(raw: unknown): StudyQuestionnaireAnswer | null {
   if (!isRecord(raw) || !isNonEmptyString(raw.probeId) || !isNonEmptyString(raw.snapshotId)) return null
   if (raw.probeId !== raw.probeId.trim() || raw.snapshotId !== raw.snapshotId.trim()) return null
@@ -182,11 +191,17 @@ export function parseStudyQuestionnaireAnswer(raw: unknown): StudyQuestionnaireA
   }
 }
 
-
+/** True only when the draft can be parsed as one complete canonical answer. */
 export function isStudyQuestionnaireAnswerComplete(raw: unknown): boolean {
   return parseStudyQuestionnaireAnswer(raw) !== null
 }
 
+// --- Quiz schema v2 (study-owner corrections, 2026-08-20 ledger §3.3) -------
+//
+// v2 replaces the categorical probes with 1..5 ordinal ratings plus explicit
+// out-of-scale states: Q2 has one unknown state, Q3 has not_applicable. Q1
+// no longer has a not_intended branch. The v1 types above stay untouched so
+// legacy submissions remain readable; the two encodings are never cross-parsed.
 
 export type StudyQuestionnaireVersion = 1 | 2
 export const STUDY_QUESTIONNAIRE_VERSION = 2 as const
@@ -194,9 +209,9 @@ export const STUDY_QUESTIONNAIRE_VERSION = 2 as const
 export const ORDINAL_RATING_OPTIONS = [1, 2, 3, 4, 5] as const
 export type StudyOrdinalRating = (typeof ORDINAL_RATING_OPTIONS)[number]
 
-
+/** Q2's unknown state lives outside the 1..5 scale, never at its midpoint. */
 export const ASSESSED_UNKNOWN_OPTION = "unknown" as const
-
+/** Q3's not-applicable state, distinct from ordinal value 1 (not applied). */
 export const EXECUTION_NOT_APPLICABLE_OPTION = "not_applicable" as const
 
 export type StudyDesiredMemoryAnswerV2 =
@@ -229,7 +244,11 @@ function parseOptionalText(value: unknown): string | null | undefined {
   return value.trim() || null
 }
 
-
+/**
+ * Strict v2 parser. Every branch is matched exactly: a missing follow-up,
+ * a scope where the branch forbids one, a midpoint-encoded unknown, or any
+ * v1 categorical vocabulary (not_intended, kind fields, Q3 unsure) is null.
+ */
 export function parseStudyQuestionnaireAnswerV2(raw: unknown): StudyQuestionnaireAnswerV2 | null {
   if (!isRecord(raw) || !isNonEmptyString(raw.probeId) || !isNonEmptyString(raw.snapshotId)) return null
   if (raw.probeId !== raw.probeId.trim() || raw.snapshotId !== raw.snapshotId.trim()) return null
@@ -300,25 +319,25 @@ export function parseStudyQuestionnaireAnswerV2(raw: unknown): StudyQuestionnair
   return { probeId: raw.probeId, snapshotId: raw.snapshotId, desired, assessed, execution }
 }
 
-
+/** True only when the draft parses as one complete canonical v2 answer. */
 export function isStudyQuestionnaireAnswerV2Complete(raw: unknown): boolean {
   return parseStudyQuestionnaireAnswerV2(raw) !== null
 }
 
-
+/** @deprecated Flat compatibility shape for the existing route/UI migration. */
 export interface StudyQuizAnswer {
   memoryId: string
-
+  /** Q1 · D_i: does the item express what the participant wanted remembered? */
   desiredContent: (typeof DESIRED_CONTENT_OPTIONS)[number]
   desiredScope: (typeof DESIRED_SCOPE_OPTIONS)[number]
-
+  /** Q2 · A_i: what the participant believes the agent currently remembers. */
   believedContent: (typeof BELIEVED_CONTENT_OPTIONS)[number]
   believedScope: (typeof BELIEVED_SCOPE_OPTIONS)[number]
-
+  /** Q3 · the participant's own execution judgment for the current output. */
   execution: (typeof EXECUTION_OPTIONS)[number]
 }
 
-
+/** @deprecated Compatibility shape for the existing route/UI migration. */
 export interface StudyQuizItem {
   id: string
   summary: string

@@ -32,7 +32,7 @@ describe("parseStudyPostSessionPayload", () => {
       completionUrl: "https://app.prolific.com/submissions/complete?cc=SERVER-OWNED-CODE",
     }
     expect(parseStudyPostSessionPayload(complete)).toEqual(complete)
-
+    // Absent or null stays null-ish; the client never invents a code.
     expect(parseStudyPostSessionPayload({ ...complete, completionCode: null })).toEqual({
       ...complete,
       completionCode: null,

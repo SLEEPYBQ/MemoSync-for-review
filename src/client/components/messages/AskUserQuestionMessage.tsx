@@ -13,6 +13,7 @@ interface Props {
   isLatest: boolean
 }
 
+// Local components for DRY
 
 function QuestionCard({
   question,
@@ -45,7 +46,7 @@ function QuestionCard({
           ) : null}
           {question}
         </h3>
-
+        {/* Progress bar */}
         {totalQuestions > 1 && (
           <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-border">
             <div
@@ -155,8 +156,10 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
   const isDiscarded = message.result?.discarded === true
 
   const [currentIndex, setCurrentIndex] = useState(0)
-
-
+  // Selections stored as string[] (single-select = 0/1 element). Previously
+  // multiSelect joined labels with ", " and split them back, so any option
+  // whose label contained ", " (e.g. "Yes, continue") could never be selected
+  // and got torn into fragments on submit (BUG MSG-7).
   const [answers, setAnswers] = useState<Record<string, string[]>>({})
   const [customInputs, setCustomInputs] = useState<Record<string, string>>({})
   const [submittedAnswers, setSubmittedAnswers] = useState<AskUserQuestionAnswerMap | null>(savedAnswers ?? null)
@@ -191,7 +194,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
     } else {
       setAnswers({ ...answers, [key]: [label] })
       setCustomInputs({ ...customInputs, [key]: "" })
-
+      // Auto-advance to next question for single select
       if (currentIndex < questions.length - 1) {
         setTimeout(() => setCurrentIndex(currentIndex + 1), 150)
       }
@@ -245,7 +248,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
   }
 
   const handleCustomInputEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
-
+    // Enter during IME composition commits a candidate, not the answer (MSG-8).
     if (isImeComposingKeyEvent(event.nativeEvent)) return
     if (event.key !== "Enter") return
     if (!currentQuestion || !currentHasAnswer) return
@@ -260,7 +263,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
     handleNext()
   }
 
-
+  // Completed state
   if (isSubmitted || isComplete) {
     const displayAnswers = savedAnswers || submittedAnswers || {}
 
@@ -325,7 +328,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
     )
   }
 
-
+  // Pending state (not latest)
   if (!isLatest) {
     return (
       <div className="w-full py-2">
@@ -337,7 +340,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
     )
   }
 
-
+  // Active state - show one question at a time
   if (!currentQuestion) return null
 
   const selectedOptions = getSelectedOptions(currentQuestion)
@@ -361,7 +364,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
           />
         ))}
 
-
+        {/* Custom input */}
         <div className="transition-all bg-background">
           <div className="flex pr-5 items-center justify-between gap-3">
             <input

@@ -111,7 +111,9 @@ function MemoryChangesReviewSurface({
       </header>
 
       <div className="flex flex-col gap-3 bg-muted/10 p-3">
-
+        {/* data-entry-id: jump anchors for the sidebar Memory Record — the
+            three stations share one transcript row, so the row id alone
+            cannot address them. */}
         <MemoryReviewStation review={review} placement={placement} station="proposals" />
         <MemoryReviewStation review={review} placement={placement} station="transfer" />
         <MemoryReviewStation review={review} placement={placement} station="checkup" />
@@ -220,7 +222,10 @@ export function FocusedMemoryReviewStation({
   )
 }
 
-
+/** Candidate ids first observed while this Board instance is mounted. The
+ * cohort makes a just-accepted or soft-dismissed row stay in Step 1 long
+ * enough to expose its real inverse, without mistaking unrelated born-active
+ * memories for Candidate decisions. */
 export function extendCandidateReviewCohort(
   current: ReadonlySet<string>,
   items: MemoryItem[],
@@ -257,7 +262,9 @@ export function remainingCandidateReviewItems(
   return candidateReviewCohortItems(items, cohortIds).filter((item) => !currentIds.has(item.id))
 }
 
-
+/** The focused chat keeps its real MemoryProposalsGate (including settled
+ * summary and Review again). Other canonical Candidate rows join the same
+ * Step 1 below it, de-duplicated by id. */
 export function FocusedMemoryCandidateStep({
   controller,
   items,
@@ -319,7 +326,14 @@ export function FocusedMemoryChangesReview({ controller }: { controller: Focused
   )
 }
 
-
+/**
+ * The first pre-turn component. It owns only changes to memory: candidate
+ * proposals (Step 1), the Transfer card (memories from outside this
+ * conversation's context, when current-task relevance finds any), and suggestions about
+ * saved memories (Step 2). The injected-set preview is a different shared
+ * object in the paper and remains a separate transcript component after this
+ * one is settled.
+ */
 export function MemoryChangesReviewFlow({
   messages,
   stale = false,
@@ -359,7 +373,9 @@ export function MemoryChangesReviewFlow({
     await onMemoryPreparationReopen?.(from, stageId)
   }, [onMemoryPreparationReopen, resolvedCheckupRows, settledTransferRows])
 
-
+  // Regenerated downstream stations must not inherit the previous result's
+  // row receipts. The transcript's pending/waiting markers are the canonical
+  // reset boundary used by the in-chat gates too.
   useEffect(() => {
     setSettledTransferRows(new Map())
   }, [transfer?.transferId])

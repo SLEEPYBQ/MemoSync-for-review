@@ -36,9 +36,9 @@ describe("filterIndexPaths", () => {
 
   it("matches case-insensitive substrings and ranks basename hits first", () => {
     expect(filterIndexPaths(index, "APP")).toEqual(["src/client/app/App.tsx"])
-
+    // "panel" hits FilesPanel.tsx via its basename.
     expect(filterIndexPaths(index, "panel")[0]).toBe("src/client/components/chat-ui/FilesPanel.tsx")
-
+    // path-only match still returned, ranked after basename matches.
     const bySegment = filterIndexPaths(index, "client")
     expect(bySegment).toContain("src/client/app/App.tsx")
     expect(bySegment).toContain("src/client/components/chat-ui/FilesPanel.tsx")
@@ -80,7 +80,7 @@ describe("remapPathAfterRename", () => {
 
   it("leaves unrelated and prefix-similar paths alone", () => {
     expect(remapPathAfterRename("other.ts", "a/b.ts", "a/c.ts")).toBe("other.ts")
-
+    // "srcs" merely shares the "src" prefix — not under the renamed dir.
     expect(remapPathAfterRename("srcs/x.ts", "src", "lib")).toBe("srcs/x.ts")
   })
 })

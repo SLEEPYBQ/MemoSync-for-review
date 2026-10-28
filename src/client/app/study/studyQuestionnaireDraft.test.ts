@@ -116,7 +116,7 @@ describe("buildStudyQuestionnaireAnswer (v2)", () => {
       believedScope: "project",
       execution: 3,
     }
-
+    // Missing desired scope.
     expect(buildStudyQuestionnaireAnswer(incomplete)).toBeNull()
     expect(buildStudyQuestionnaireAnswer({ ...incomplete, desiredScope: "session" })).not.toBeNull()
   })

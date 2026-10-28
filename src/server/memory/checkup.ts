@@ -1,26 +1,40 @@
-
-
+// Library checkup (redesign 2026-08-07 §3, step-one container 2). Three
+// parallel LLM queries — conflicts / redundancy / staleness — each returning
+// suggestions WITH a grounded one-line reason, followed by a merge pass that
+// guarantees one row per memory and never silently drops a finding. The old
+// numeric thresholds ("3 sessions quiet", "confirmed 3×") are demoted to
+// loose shortlist filters: they decide who gets LOOKED AT, the model decides
+// what to suggest, and the reason — not the number — is what the user sees.
+//
+// Proactive scope widening is retired. Step 2 keeps only the CONTENT problems
+// of what is already saved.
+//
+// Result reuse is keyed on every input that can change a Checkup verdict:
+// active memory identity/version/scope/reinforcement, quiet-shortlist
+// membership, acknowledged relations, pending revisions, and (only while a
+// staleness shortlist exists) today's date. Usage counters deliberately stay
+// OUT — they move every turn, while a real use already changes quiet evidence.
 import type { LlmJsonCaller } from './deepseek';
 import type { MemoryService } from './index';
 import type { MemoryItem } from './types';
-import type { SessionClockEntry } from './maintenance';
+import { shareMergeContext, type SessionClockEntry } from './maintenance';
 
 export type CheckupKind = 'conflict' | 'redundancy' | 'staleness';
 
 export interface CheckupSuggestion {
   kind: CheckupKind;
   memoryId: string;
-
+  /** conflict/redundancy: the other half of the pair. */
   otherMemoryId?: string;
-
+  /** One line, grounded in the item's text/evidence — this IS the suggestion's justification. */
   reason: string;
 }
 
 export interface CheckupResult {
   suggestions: CheckupSuggestion[];
-
+  /** Legacy field name: true when a prior Checkup result was reused and no queries ran. */
   cached: boolean;
-
+  /** Independent sidecar lanes that did not return a structurally valid result. */
   failedKinds?: CheckupKind[];
 }
 
@@ -35,21 +49,26 @@ export interface CheckupForkPrompt {
 }
 
 export interface CheckupService {
-
+  /** M branch sees every active item and the current task, including recently invalidated facts. */
   buildBranchPrompt?(ctx: CheckupContext, taskText?: string): CheckupForkPrompt;
-
+  /** True when `run` would actually fire queries — lets the gate show a skeleton only for real work. */
   needsRecompute(ctx: CheckupContext): boolean;
   run(ctx: CheckupContext): Promise<CheckupResult>;
-
-
+  /**
+   * Prewarm path (user decision 2026-08-08, option B): ONE combined
+   * out-of-band question covering all three checks, asked on a fork of the
+   * finished session at turn end — the trajectory context informs staleness
+   * and conflict judgment, and the next gate can reuse the result. Null when
+   * the pool is empty.
+   */
   buildForkPrompt?(ctx: CheckupContext): CheckupForkPrompt | null;
-
+  /** Validate + merge a fork reply for the exact dependency state that produced its prompt. */
   primeFromForkResult?(
     ctx: CheckupContext,
     dependencyKey: string,
     raw: Record<string, unknown>,
   ): Promise<CheckupResult | null>;
-
+  /** Persistent M branch: validation and merge are local, never sidecar reasoning. */
   primeFromBranchResult?(
     ctx: CheckupContext,
     dependencyKey: string,
@@ -57,7 +76,7 @@ export interface CheckupService {
   ): Promise<CheckupResult | null>;
 }
 
-
+/** Loose shortlist floor — half the old hard threshold. */
 const SHORTLIST_QUIET_SESSIONS = 2;
 const REASON_MAX_LEN = 160;
 const QUERY_TIMEOUT_MS = 60_000;
@@ -109,9 +128,9 @@ const VALID_KINDS: readonly CheckupKind[] = ['conflict', 'redundancy', 'stalenes
 interface CheckupServiceOptions {
   memory: MemoryService;
   callJson: LlmJsonCaller;
-
+  /** Session clock (same contract as maintenance): prior sessions with turns, newest first. */
   listRecentSessions: (projectId: string | undefined, excludeSessionId?: string) => SessionClockEntry[];
-
+  /** Test hook: today's date for the staleness prompt. */
   now?: () => Date;
 }
 
@@ -151,7 +170,7 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
     ];
   }
 
-
+  /** Items unreferenced for the last SHORTLIST_QUIET_SESSIONS sessions (loose shortlist, not a verdict). */
   function quietShortlist(ctx: CheckupContext): Set<string> {
     const sessions = listRecentSessions(ctx.projectId, ctx.sessionId);
     if (sessions.length < SHORTLIST_QUIET_SESSIONS) return new Set();
@@ -197,14 +216,17 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
     return { key, pool, poolById, quiet, quietItems, relatedPairs, openRevisionIds, today };
   }
 
-
+  /** Validate one pair-shaped finding list (conflict/redundancy). */
   function validatePairFindings(
     kind: CheckupKind,
     raw: Record<string, unknown>,
     snapshot: CheckupDependencySnapshot,
   ): CheckupSuggestion[] {
-
-
+    // Lane completion is decided before this validator: a top-level
+    // `findings` array means the call completed. Rows inside it remain
+    // untrusted and may be dropped for malformed fields, unknown/stale ids,
+    // acknowledged relations, open revisions, or duplication without
+    // turning the entire lane into a transport/schema failure.
     const list = Array.isArray(raw.findings) ? (raw.findings as unknown[]) : [];
     const out: CheckupSuggestion[] = [];
     const seenPairs = new Set<string>();
@@ -215,11 +237,13 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
       const b = typeof rec.otherMemoryId === 'string' ? rec.otherMemoryId : '';
       const reason = normalizeReason(rec.reason);
       if (!a || !b || a === b || !snapshot.poolById.has(a) || !snapshot.poolById.has(b) || !reason) continue;
+      if (kind === 'redundancy' && !shareMergeContext(snapshot.poolById.get(a)!, snapshot.poolById.get(b)!)) continue;
       const pairKey = normalizedPairKey(a, b);
       if (seenPairs.has(pairKey)) continue;
       seenPairs.add(pairKey);
-
-
+      // A direct acknowledged relation or a pending revision is already a
+      // review lane. Both come from the same immutable dependency snapshot as
+      // the prompt, so an in-flight mutation cannot rewrite old evidence.
       if (
         snapshot.relatedPairs.has(pairKey) ||
         snapshot.openRevisionIds.has(a) ||
@@ -230,7 +254,7 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
     return out;
   }
 
-
+  /** Validate one per-item finding list (staleness). */
   function validateItemFindings(
     kind: CheckupKind,
     raw: Record<string, unknown>,
@@ -251,7 +275,7 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
     return out;
   }
 
-
+  /** Deterministic fallback merge: group by memoryId, first kind wins the row, extra reasons append. */
   function codeMerge(findings: CheckupSuggestion[]): CheckupSuggestion[] {
     const byId = new Map<string, CheckupSuggestion>();
     for (const f of findings) {
@@ -265,7 +289,7 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
     return [...byId.values()];
   }
 
-
+  /** Model merge with a no-silent-drop guarantee; falls back to codeMerge. */
   async function mergeFindings(findings: CheckupSuggestion[]): Promise<CheckupSuggestion[]> {
     const ids = new Set(findings.map((f) => f.memoryId));
     const validatedTuples = new Set(
@@ -294,14 +318,15 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
         const reason = normalizeReason(rec.reason);
         const other = typeof rec.otherMemoryId === 'string' && rec.otherMemoryId ? rec.otherMemoryId : undefined;
         const tuple = JSON.stringify([id, kind, other ?? null]);
-
-
+        // The merge model may consolidate reasons, but it cannot invent a new
+        // actionable pair or change the finding kind. Only tuples already
+        // accepted by the snapshot validator are eligible for the final row.
         if (!id || !kind || !reason || !ids.has(id) || seen.has(id) || !validatedTuples.has(tuple)) continue;
         seen.add(id);
         out.push({ kind, memoryId: id, ...(other ? { otherMemoryId: other } : {}), reason });
       }
-
-
+      // Coverage guarantee: any memory the model dropped gets its original
+      // finding(s) back through the deterministic merge.
       const covered = new Set(out.map((s) => s.memoryId));
       const dropped = findings.filter((f) => !covered.has(f.memoryId));
       return [...out, ...codeMerge(dropped)];
@@ -319,12 +344,12 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
   }
 
   function branchDependencyKey(snapshot: CheckupDependencySnapshot): string {
-
-
+    // Every active item can have a content-based expiry, even if just added.
+    // The branch therefore depends on today's date regardless of quiet use.
     return `branch:${snapshot.today}:${snapshot.key}`;
   }
 
-
+  /** Store only a result whose prompt/validation snapshot is still current. */
   function storeReusableResult(ctx: CheckupContext, key: string, suggestions: CheckupSuggestion[]): void {
     const slot = resultSlot(ctx);
     reusableResults.set(slot, { key, suggestions });
@@ -373,7 +398,9 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
       }
     };
 
-
+    // Independent sidecars stay concurrent. A failed lane contributes no
+    // untrusted rows, but its failure remains explicit so successful lanes
+    // can still be reviewed without turning an incomplete audit into a clear.
     const lanes = await Promise.all([
       runPairLane('conflict', CONFLICTS_SYSTEM),
       runPairLane('redundancy', REDUNDANCY_SYSTEM),
@@ -411,8 +438,8 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
       if (branchDependencyKey(snapshot) !== dependencyKey && snapshot.key !== dependencyKey) return null;
       const keys = ['conflicts', 'redundancy', 'staleness'] as const;
       if (!keys.every((key) => Array.isArray(raw[key]))) return null;
-
-
+      // A malformed branch answer must not masquerade as an empty review.
+      // Acknowledged pairs are still filtered by the normal validators below.
       for (const key of keys) {
         for (const value of raw[key] as unknown[]) {
           if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -459,8 +486,9 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
     ): Promise<CheckupResult | null> {
       const snapshot = dependencySnapshot(ctx);
       if (snapshot.pool.length === 0 || snapshot.key !== dependencyKey) return null;
-
-
+      // The combined fork is complete only when every requested lane is
+      // present. A partial reply must fall back to the independent sidecars;
+      // treating a missing lane as empty would create a reusable false-clear.
       const keys = ['conflicts', 'redundancy', 'staleness'] as const;
       if (!keys.every((key) => Array.isArray(raw[key]))) return null;
       const findings: CheckupSuggestion[] = [
@@ -495,7 +523,9 @@ export function createCheckupService(opts: CheckupServiceOptions): CheckupServic
         const merged = await mergeFindings(analysis.findings);
         if (!dependencyIsCurrent(ctx, snapshot.key)) continue;
 
-
+        // The result slot represents the complete three-lane verdict for one
+        // dependency snapshot. Saving a partial answer there would prevent
+        // the failed lanes from retrying on the next gate.
         if (analysis.failedKinds.length === 0) {
           storeReusableResult(ctx, snapshot.key, merged);
           return { suggestions: merged, cached: false };

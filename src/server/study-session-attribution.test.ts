@@ -11,7 +11,8 @@ describe("study memory-interaction session attribution", () => {
       registry,
     })!
 
-
+    // Chat identity is deliberately absent from this interface: every valid
+    // assigned-project chat inside 038-S1 belongs to the same study session.
     expect(resolve()).toEqual({ taskId: "038-S1", sessionId: "038-S1" })
 
     registry.noteFreeze("038-S1")

@@ -1,8 +1,9 @@
-
-
+// Mutations for findings produced by the in-chat Memory Checkup. Detection is
+// owned by checkup.ts; this module only applies the participant's reviewed
+// actions with live-state validation, persistence, and telemetry.
 import type { LlmJsonCaller } from './deepseek';
 import type { MemoryService } from './index';
-import type { ActorMeta } from './types';
+import type { ActorMeta, MemoryItem } from './types';
 import { validateCandidate } from './capture';
 import type { StudySessionAttribution } from '../study-session-attribution';
 
@@ -21,7 +22,7 @@ Respond with strict JSON only:
 covering everything both originals said>", "type": "constraint" | "preference" | "lesson" | "fact", \
 "topic": "<short label or null>", "abstractionLevel": "concrete" | "contextual" | "general"}`;
 
-
+/** Shared prior-session shape used by Checkup and ordinary Transfer shelves. */
 export interface SessionClockEntry {
   id: string;
   startedAt: string;
@@ -29,16 +30,24 @@ export interface SessionClockEntry {
 
 export interface MaintenanceServiceOptions {
   memory: MemoryService;
-
+  /** LLM caller for drafting merged text; without it the merge action is unavailable. */
   callJson?: LlmJsonCaller;
+}
+
+export function shareMergeContext(a: MemoryItem, b: MemoryItem): boolean {
+  return a.scope === b.scope
+    && (a.scope !== 'project' || Boolean(a.projectId && a.projectId === b.projectId))
+    && (a.scope !== 'session' || Boolean(a.sessionId && a.sessionId === b.sessionId));
 }
 
 export function createMaintenanceService(opts: MaintenanceServiceOptions) {
   const { memory, callJson } = opts;
 
   return {
-
-
+    /**
+     * Archive from a Checkup finding. A card raced by another tab must fail,
+     * rather than double-log an action against a memory that is no longer live.
+     */
     archive(kind: AttentionKind, memoryId: string, meta: MaintenanceActorMeta) {
       const item = memory.store.getById(memoryId);
       if (!item) throw new Error(`Memory not found: ${memoryId}`);
@@ -57,7 +66,7 @@ export function createMaintenanceService(opts: MaintenanceServiceOptions) {
       return archived;
     },
 
-
+    /** Keep a Staleness finding: refresh its evidence clock without changing content. */
     renew(memoryId: string, meta: MaintenanceActorMeta) {
       const item = memory.store.renewMemory(memoryId, meta);
       memory.logger.event({
@@ -72,7 +81,10 @@ export function createMaintenanceService(opts: MaintenanceServiceOptions) {
       return item;
     },
 
-
+    /**
+     * Acknowledge that a redundant-looking pair is deliberately separate.
+     * The similar_to relation prevents the same pair from being suggested again.
+     */
     keepBoth(memoryId: string, otherMemoryId: string, meta: MaintenanceActorMeta): void {
       const a = memory.store.getById(memoryId);
       const b = memory.store.getById(otherMemoryId);
@@ -92,7 +104,10 @@ export function createMaintenanceService(opts: MaintenanceServiceOptions) {
       });
     },
 
-
+    /**
+     * Draft one item covering both originals. The draft lands as a Candidate
+     * revising both, so nothing is archived until the participant accepts it.
+     */
     async merge(memoryId: string, otherMemoryId: string, meta: MaintenanceActorMeta) {
       if (!callJson) throw new Error('Merge drafting is not available (no LLM caller configured)');
       const a = memory.store.getById(memoryId);
@@ -100,6 +115,9 @@ export function createMaintenanceService(opts: MaintenanceServiceOptions) {
       if (!a || !b) throw new Error('Memory not found');
       if (a.status !== 'active' || b.status !== 'active') {
         throw new Error('Both memories must still be active to merge');
+      }
+      if (!shareMergeContext(a, b)) {
+        throw new Error('Both memories must belong to the same scope and context to merge');
       }
       const draftRaw = await callJson({
         system: MERGE_SYSTEM,
@@ -124,6 +142,7 @@ export function createMaintenanceService(opts: MaintenanceServiceOptions) {
           abstractionLevel: draft.abstractionLevel,
           sensitive: draft.sensitive,
           projectId: a.scope === 'project' ? a.projectId : undefined,
+          sessionId: a.scope === 'session' ? a.sessionId : undefined,
           provenanceSessionId: meta.sessionId,
         },
         [a.id, b.id],

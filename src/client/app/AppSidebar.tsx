@@ -32,8 +32,8 @@ export function resolveSidebarProjectControls(studyMode: boolean) {
   const enabled = !studyMode
   return {
     addProject: enabled,
-
-
+    // Participants may open another chat inside the assigned canonical
+    // project; project admission, not chat count, is the treatment boundary.
     createChat: true,
     mutateProject: enabled,
     reorderProjects: enabled,
@@ -365,8 +365,11 @@ function AppSidebarImpl({
 
   const hasVisibleChats = activeVisibleCount > 0
   const brandName = useBrandName()
-
-
+  // Red dot on the Memory entry: drift needs attention, or memory changed
+  // since the last board visit — the meta-level model is out of date.
+  // The count is ambient gist for pending candidates (friction #4): review
+  // cards scroll out of the stream, and without a standing number the pile
+  // is invisible until the next Board visit.
   const [memoryBadge, setMemoryBadge] = useState(false)
   const [pendingCount, setPendingCount] = useState(0)
   useEffect(() => {
@@ -385,7 +388,7 @@ function AppSidebarImpl({
         setMemoryBadge(attention.items.length > 0 || fresh)
         setPendingCount(candidates.length)
       } catch {
-
+        // keep the last state — a missed poll must not flicker the badge
       }
     }
     void check()
@@ -588,7 +591,7 @@ function AppSidebarImpl({
                 if (resolveSidebarMemoryOpen(conditionPolicy.studyMode) === "overlay") {
                   onOpenMemoryBoard()
                 } else {
-
+                  // Normal product keeps the global route and project lens.
                   navigate(`/memory${currentProjectId ? `?project=${encodeURIComponent(currentProjectId)}` : ""}`)
                 }
                 onClose()

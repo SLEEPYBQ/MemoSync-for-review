@@ -1,5 +1,9 @@
-
-
+// The study's ALWAYS-VISIBLE strip inside the main app shell (study arms
+// only). Participants never have to find anything: when a session becomes
+// active, its instructions OPEN THEMSELVES once (and stay one click away in
+// every state afterwards); the one button that matters next is pinned beside
+// them. Only the quiz takes over the screen — that page must not allow
+// looking back.
 import { useCallback, useEffect, useState } from "react"
 import { useLocation, useNavigate } from "react-router-dom"
 import { BookOpen, Check, ClipboardList, Loader2 } from "lucide-react"
@@ -68,7 +72,7 @@ export function StudyDock({
   onDemoFinish,
 }: {
   demo?: boolean
-
+  /** Guide-only local handoff; production always navigates to StudyQuizPage. */
   onDemoFinish?: () => void
 } = {}) {
   const policy = useConditionPolicy()
@@ -101,19 +105,20 @@ export function StudyDock({
       window.clearInterval(timer)
       window.removeEventListener("focus", refreshOnFocus)
     }
-
+    // Re-check when navigating back from the quiz (its submit changes state).
   }, [refresh, studyMode, location.pathname])
 
   const active = progress?.tasks.find((task) => task.id === progress.activeTaskId) ?? null
   const activeId = active?.id ?? null
 
-
+  // The brief belongs to ONE task: switching tasks resets the dialog cache.
   useEffect(() => {
     setBrief(null)
     setBriefOpen(false)
   }, [activeId])
 
-
+  // Hand-holding: a newly active session opens its own instructions, once.
+  // Never over the guide or the study pages — those own the screen.
   const onFullscreenSurface = location.pathname === "/guide" || location.pathname.startsWith("/study")
   useEffect(() => {
     if (!activeId || !brief || brief.briefAcknowledged || progress?.postSessionPending || onFullscreenSurface) return
@@ -144,8 +149,8 @@ export function StudyDock({
         headers: { "content-type": "application/json" },
         body: "{}",
       }).catch(() => {
-
-
+        // Server receipt is authoritative. A failed acknowledgement will make
+        // the brief reappear after refresh instead of silently skipping it.
       })
     }
     setBriefOpen(false)
@@ -217,7 +222,8 @@ export function StudyDock({
             </span>
             <div className="ml-auto flex items-center gap-2">
               {instructionsButton}
-
+              {/* Bright and unmistakable (mentor 2026-08-15 H1): submitting
+                  through this button is the only way the session counts. */}
               <Button
                 size="sm"
                 className="shadow-md"
@@ -236,8 +242,8 @@ export function StudyDock({
       </div>
 
       <Dialog open={briefOpen} onOpenChange={(open) => {
-
-
+        // The first delivery is mandatory. Close controls remain inert until
+        // the explicit assignment CTA records the receipt.
         if (open || brief?.briefAcknowledged) setBriefOpen(open)
       }}>
         <DialogContent size="sm">

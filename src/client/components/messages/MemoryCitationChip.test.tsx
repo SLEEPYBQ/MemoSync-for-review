@@ -12,7 +12,8 @@ const ITEM = {
   status: "active",
 } as unknown as MemoryItem
 
-
+// renderToStaticMarkup reads zustand's INITIAL snapshot (v5 server render), so
+// the test seeds the initial state in place instead of setState.
 function seedInitialItems(items: MemoryItem[]) {
   const initial = useMemoryStore.getInitialState()
   initial.items.length = 0
@@ -38,7 +39,9 @@ function renderChip({ active, currentTurn }: { active: boolean; currentTurn: boo
   )
 }
 
-
+// 2026-08-19 evening revision (C1): the per-memory stop entry must be
+// DISCOVERABLE — a visible button right next to the chip while the turn runs,
+// not only a row inside the hover card.
 test("a current-turn chip shows a visible stop button while the turn runs", () => {
   const html = renderChip({ active: true, currentTurn: true })
   expect(html).toContain("Stop the turn over this memory")

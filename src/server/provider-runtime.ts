@@ -13,7 +13,7 @@ export function isCliIsolationEnabled(env: RuntimeEnv = process.env): boolean {
   return env.MEMOSYNC_ISOLATE_CLI === "1" || Boolean(env.MEMOSYNC_CLI_PROFILE_DIR?.trim())
 }
 
-
+/** Read-only path lookup, also used when checking whether a fork can resume. */
 export function resolveClaudeConfigDir(env: RuntimeEnv = process.env, homeDir = homedir()): string {
   if (isCliIsolationEnabled(env)) {
     return join(resolve(env.MEMOSYNC_CLI_PROFILE_DIR?.trim() || join(getDataRootDir(homeDir, env), "cli-profiles")), "claude")
@@ -21,7 +21,7 @@ export function resolveClaudeConfigDir(env: RuntimeEnv = process.env, homeDir = 
   return env.CLAUDE_CONFIG_DIR?.trim() || join(homeDir, ".claude")
 }
 
-
+/** Explicit official model picks cannot inherit a previously derived vendor route. */
 export function resolveOfficialClaudeEnv(baseEnv: RuntimeEnv = process.env): Record<string, string | undefined> {
   const env = { ...baseEnv }
   if (baseEnv.MEMOSYNC_USE_OWN_ANTHROPIC !== "1") {
@@ -45,12 +45,12 @@ function contains(parent: string, child: string): boolean {
   return remainder === "" || (remainder !== ".." && !remainder.startsWith(`..${sep}`) && !remainder.startsWith(sep))
 }
 
-
+/** Stable across the main session and its forks; never reuse a host CLI home. */
 function prepareProfileDir(engine: "claude" | "codex", env: RuntimeEnv): string {
   const root = resolve(env.MEMOSYNC_CLI_PROFILE_DIR?.trim() || join(getDataRootDir(homedir(), env), "cli-profiles"))
   const target = canonicalPath(join(root, engine))
   const protectedPaths = [join(homedir(), ".claude"), join(homedir(), ".codex")]
-
+  // An explicitly inherited host profile must not accidentally become the test profile.
   for (const value of [env.CLAUDE_CONFIG_DIR, env.CODEX_HOME]) {
     if (value?.trim() && !contains(canonicalPath(root), canonicalPath(resolve(value)))) {
       protectedPaths.push(resolve(value))
@@ -69,7 +69,7 @@ const CLAUDE_RUNTIME_SETTINGS = new Set([
   "CLAUDE_CODE_EFFORT_LEVEL",
 ])
 
-
+/** Called before per-chat provider routing. No mutation of process.env or host configuration. */
 export function buildIsolatedClaudeEnv(baseEnv: RuntimeEnv = process.env): Record<string, string | undefined> {
   const env = { ...baseEnv }
   if (!isCliIsolationEnabled(baseEnv)) return env
@@ -81,8 +81,8 @@ export function buildIsolatedClaudeEnv(baseEnv: RuntimeEnv = process.env): Recor
     }
   }
   if (baseEnv.MEMOSYNC_USE_OWN_ANTHROPIC === "1") {
-
-
+    // Deliberately supplied API settings only; OAuth, cloud-provider auth and custom headers
+    // do not cross this boundary. These settings also cover Anthropic-compatible gateways.
     for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"]) {
       if (baseEnv[key]) env[key] = baseEnv[key]
     }
@@ -94,7 +94,7 @@ export function buildIsolatedClaudeEnv(baseEnv: RuntimeEnv = process.env): Recor
   return env
 }
 
-
+/** Validate after model routing, before any SDK subprocess can consult saved credentials. */
 export function assertIsolatedClaudeCredentials(env: RuntimeEnv): void {
   if (isCliIsolationEnabled(env) && !env.ANTHROPIC_API_KEY?.trim() && !env.ANTHROPIC_AUTH_TOKEN?.trim()) {
     throw new Error("Isolated Claude requires an explicit provider API key; configure GLM_API_KEY, DEEPSEEK_API_KEY, or MEMOSYNC_USE_OWN_ANTHROPIC=1 with ANTHROPIC_API_KEY")
@@ -133,7 +133,7 @@ export function resolveCodexRuntimeModel(model: string, env: RuntimeEnv = proces
   return isCliIsolationEnabled(env) ? isolatedCodexProvider(env).model : env.CODEX_MODEL || model
 }
 
-
+/** Config travels as argv values, credentials as env values. No config/auth file is written. */
 export function prepareCodexRuntime(baseEnv: RuntimeEnv = process.env): {
   env: Record<string, string | undefined>
   args: string[]
@@ -147,8 +147,8 @@ export function prepareCodexRuntime(baseEnv: RuntimeEnv = process.env): {
       key.startsWith("OPENAI_") || key.startsWith("CODEX_") || key.startsWith("CHATGPT_")) delete env[key]
   }
   env.CODEX_HOME = prepareProfileDir("codex", baseEnv)
-
-
+  // This exact provider is command-line configuration so project config cannot select
+  // OpenAI auth instead. env_key never reads auth.json or the system credential store.
   const config: Record<string, string | boolean> = {
     model: provider.model,
     model_provider: "memosync_isolated",

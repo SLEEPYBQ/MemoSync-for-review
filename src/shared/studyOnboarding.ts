@@ -1,5 +1,8 @@
-
-
+/**
+ * The participant-facing information collected before the common study Guide.
+ * The orchestrator allocation remains the run identity; Prolific ID is a
+ * demographic/contact field and never participates in condition assignment.
+ */
 export const STUDY_ONBOARDING_CONSENT_VERSION = "2026-08-19-v1"
 export const STUDY_ONBOARDING_BRIEFING_VERSION = "2026-08-19-v1"
 
@@ -70,10 +73,10 @@ export interface StudyParticipantOnboardingRecord {
 
 export type StudyOnboardingStage = "information" | "consent" | "briefing" | "complete"
 
-
+/** Browser-safe projection for the participant's own isolated instance. */
 export interface StudyOnboardingStatus {
   stage: StudyOnboardingStage
   information?: StudyOnboardingInformation
-
+  /** URL-recorded Prolific ID supplied by the formal allocation. */
   prolificId?: string
 }

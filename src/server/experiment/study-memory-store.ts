@@ -13,7 +13,6 @@ import {
   type StudyQuestionnaireVersion,
 } from "../../shared/studyTasks"
 import type { StudyAttentionCheckResult } from "../../shared/studyAttentionChecks"
-import type { StaticFocusPayload } from "../memory/static-files"
 import type { StudyWorkspaceSnapshotMetadata, StudyWorkspaceTreeState } from "../study-workspace-snapshot"
 import type {
   StudyOnboardingInformation,
@@ -28,8 +27,9 @@ import {
 
 export type StudyMemoryScope = "session" | "project" | "personal"
 
-
-export const STUDY_COMPLETION_CODE = "TESTCODE"
+/** Server-owned Prolific completion code. Never ship this to client sources;
+ * the client only renders the value the server returns after completion. */
+export const STUDY_COMPLETION_CODE = "REVIEW_ONLY"
 export const STUDY_COMPLETION_CODE_VERSION = "2026-08-20-v1"
 export type StudyFocusMode = "skills" | "plain" | "file"
 export type StudyFocusOutcome = "delivered" | "empty" | "disabled" | "failed"
@@ -37,7 +37,24 @@ export type StudyCondition = "memosync" | "auto" | "static"
 
 export type StudyTelemetryKind = "monitoring" | "control" | "participant_prompt" | "stage_enter" | "surface_exposure"
 
+interface HistoricalStaticFocusPayload {
+  text: string
+  sources: readonly {
+    relPath: string
+    injectedContent: string
+    contentHash: string
+    truncated: boolean
+    start: number
+    end: number
+  }[]
+}
 
+/**
+ * Server-authoritative participant interaction evidence. The participant,
+ * condition and task window are assigned by the study runtime rather than
+ * accepted from browser payloads. JSONL remains only a projection of rows in
+ * this table.
+ */
 export interface StudyTelemetryEvent {
   eventId: string
   recordedAt: string
@@ -118,7 +135,7 @@ export interface FocusDeliveryInput {
   deliveryStage: "queued_to_claude"
   deliveryHash: string
   visiblePoolHash: string
-
+  /** Resume delivery that continues one participant-triggered memory interrupt. */
   resumeOfInterruptId?: string
   items: StudyFocusItemInput[]
   qualityFlags?: string[]
@@ -167,15 +184,19 @@ export interface StudyFreezeItem {
 
 export interface StudyFreezeSnapshot {
   schemaVersion: 1 | 2
-
-
+  /**
+   * Version of the memory-questionnaire instrument this snapshot's answers
+   * must use. Distinct from `schemaVersion` (the freeze payload shape) — the
+   * two must never be conflated. A legacy payload without this field is
+   * questionnaire v1; new snapshots persist 2.
+   */
   questionnaireVersion?: StudyQuestionnaireVersion
   snapshotId: string
   taskId: string
   frozenAt: string
   qualityFlags: string[]
   items: StudyFreezeItem[]
-
+  /** Immutable scoreable source tree captured at the same session boundary. */
   workspaceSnapshot?: StudyWorkspaceSnapshotMetadata
 }
 
@@ -184,7 +205,7 @@ export interface StudyWorkspaceBaseline extends StudyWorkspaceTreeState {
   capturedAt: string
 }
 
-
+/** The questionnaire version governing a freeze snapshot's answers. */
 export function freezeQuestionnaireVersion(snapshot: Pick<StudyFreezeSnapshot, "questionnaireVersion">): StudyQuestionnaireVersion {
   return snapshot.questionnaireVersion ?? 1
 }
@@ -216,10 +237,10 @@ export interface QuestionnaireSubmissionInput {
   submissionId: string
   snapshotId: string
   submittedAt: string
-
+  /** Must match the frozen snapshot's questionnaire version. */
   questionnaireVersion: StudyQuestionnaireVersion
   answers: unknown[]
-
+  /** Null/omitted only for pilot data created before formal attention checks. */
   attentionCheck?: StudyAttentionCheckResult | null
 }
 
@@ -296,7 +317,7 @@ export interface CompleteBaselineProjectCopyTransitionInput {
 export interface SusSubmissionInput {
   submissionId: string
   submittedAt: string
-
+  /** Server-owned allocation identity recorded on the completion receipt. */
   participantId: string
   response: StudySusResponse
 }
@@ -305,7 +326,10 @@ export interface StudySusSubmission extends Omit<SusSubmissionInput, "participan
   payloadHash: string
 }
 
-
+/**
+ * Immutable Prolific completion receipt issued in the same transaction that
+ * first accepts the final SUS. Exact retries return the original receipt.
+ */
 export interface StudyCompletionReceipt {
   participantId: string
   susSubmissionId: string
@@ -338,7 +362,7 @@ export interface ResolveStaticAtomsInput {
   snapshotHash: string
   observedAt: string
   atoms: StaticAtomInput[]
-
+  /** Present only while atomizing a payload that was actually queued to Claude. */
   focusTaskId?: string
 }
 
@@ -415,7 +439,7 @@ export interface ReserveStaticFocusDeliveryInput {
   turn: number
   focusedAt: string
   deliveryHash: string
-  payload: StaticFocusPayload
+  payload: HistoricalStaticFocusPayload
 }
 
 export interface PendingStaticFocusDelivery extends ReserveStaticFocusDeliveryInput {
@@ -430,7 +454,7 @@ export interface PendingStaticFocusFilter {
 
 export interface FinalizeStaticFocusDeliveryInput {
   injectionId: string
-
+  /** SHA-256 returned by the extractor for the exact reserved payload. */
   payloadHash: string
   atoms: StaticAtomInput[]
   qualityFlags?: string[]
@@ -1309,8 +1333,8 @@ export class StudyMemoryStore {
     if (!deliveryColumns.some((column) => column.name === "resume_of_interrupt_id")) {
       this.db.exec("ALTER TABLE study_focus_deliveries ADD COLUMN resume_of_interrupt_id TEXT")
     }
-
-
+    // Legacy questionnaire submissions predate the versioned instrument and
+    // migrate to questionnaire version 1 (2026-08-20 ledger, Slice B).
     const questionnaireColumns = this.db.query("PRAGMA table_info(study_questionnaire_submissions)").all() as Array<{ name: string }>
     if (!questionnaireColumns.some((column) => column.name === "questionnaire_version")) {
       this.db.exec("ALTER TABLE study_questionnaire_submissions ADD COLUMN questionnaire_version INTEGER NOT NULL DEFAULT 1")
@@ -1462,7 +1486,11 @@ export class StudyMemoryStore {
     return rows.map((row) => this.getStudyTelemetryEvent(row.event_id)!)
   }
 
-
+  /**
+   * Resolve only durable, server-attributed task evidence for a chat. More
+   * than one result is deliberately exposed to the caller as ambiguity rather
+   * than choosing whichever task happened to be active most recently.
+   */
   listStudyTelemetryTaskIdsForChat(chatId: string): string[] {
     const rows = this.db.query(`
       SELECT DISTINCT task_id
@@ -1839,10 +1867,14 @@ export class StudyMemoryStore {
     `).run(key, JSON.stringify([...contents]))
   }
 
-
+  /**
+   * Durably reserve one Static turn immediately after its exact text payload is
+   * queued to Claude. The row is the restart-safe hand-off to the asynchronous
+   * atomizer; questionnaire freeze must treat it as unfinished until finalized.
+   */
   reserveStaticFocusDelivery(input: ReserveStaticFocusDeliveryInput): PendingStaticFocusDelivery {
     const payloadJson = canonicalJson(input.payload)
-    const payload = JSON.parse(payloadJson) as StaticFocusPayload
+    const payload = JSON.parse(payloadJson) as HistoricalStaticFocusPayload
     const normalized = {
       injectionId: input.injectionId,
       taskId: input.taskId,
@@ -1894,7 +1926,7 @@ export class StudyMemoryStore {
     return this.hydratePendingStaticFocus(this.getStaticFocusLedger(input.injectionId)!)
   }
 
-
+  /** Pending Static turns in their durable dispatch order, optionally scoped. */
   listPendingStaticFocusDeliveries(filter: PendingStaticFocusFilter = {}): PendingStaticFocusDelivery[] {
     const clauses = ["status = 'pending'"]
     const params: string[] = []
@@ -1926,7 +1958,11 @@ export class StudyMemoryStore {
     `).get(taskId) !== null
   }
 
-
+  /**
+   * Apply extracted atoms and publish the corresponding focus delivery as one
+   * SQLite transaction. A later turn for the same Static namespace cannot
+   * overtake an earlier pending turn, even if its LLM extraction finishes first.
+   */
   finalizeStaticFocusDelivery(input: FinalizeStaticFocusDeliveryInput): FinalizedStaticFocusDelivery {
     const ledger = this.getStaticFocusLedger(input.injectionId)
     if (!ledger) throw new Error(`Pending Static focus delivery not found: ${input.injectionId}`)
@@ -2762,7 +2798,7 @@ export class StudyMemoryStore {
     return row ? JSON.parse(row.payload_json) as StudyFreezeSnapshot : null
   }
 
-
+  /** Remove an unanswered freeze checkpoint for the experimenter-only reopen flow. */
   removeTaskFreezeSnapshot(taskId: string): boolean {
     const snapshot = this.getTaskFreezeSnapshot(taskId)
     if (!snapshot) return false
@@ -2973,8 +3009,9 @@ export class StudyMemoryStore {
       const existing = this.getSusSubmission()
       if (existing) {
         if (existing.payloadHash !== payloadHash) throw new Error("SUS submission already exists")
-
-
+        // An exact retry returns the original immutable receipt. A legacy
+        // pre-receipt SUS row gets its missing receipt from the original SUS
+        // acceptance evidence, never from the later retry time.
         const receipt = this.getOrCreateCompletionReceipt(input.participantId, existing)
         return { created: false, submission: existing, receipt }
       }
@@ -2983,7 +3020,7 @@ export class StudyMemoryStore {
           singleton, submission_id, submitted_at, response_json, payload_hash
         ) VALUES (1, ?, ?, ?, ?)
       `).run(input.submissionId, input.submittedAt, responseJson, payloadHash)
-
+      // The durable code receipt is part of the same first acceptance.
       const receipt = this.insertCompletionReceipt({
         participantId: input.participantId,
         susSubmissionId: input.submissionId,
@@ -3038,7 +3075,11 @@ export class StudyMemoryStore {
     } : null
   }
 
-
+  /**
+   * Recover the server-owned completion receipt for a legacy SUS row that
+   * predates receipt persistence. The SUS submission is the durable issuance
+   * evidence, so its original timestamp and identity determine the receipt.
+   */
   ensureCompletionReceipt(participantId: string): StudyCompletionReceipt | null {
     if (!participantId.trim()) throw new Error("Completion receipt requires the allocation participant identity")
     const transaction = this.db.transaction(() => {
@@ -3094,7 +3135,7 @@ export class StudyMemoryStore {
   }
 
   private hydratePendingStaticFocus(row: StaticFocusLedgerRow): PendingStaticFocusDelivery {
-    const payload = JSON.parse(row.payload_json) as StaticFocusPayload
+    const payload = JSON.parse(row.payload_json) as HistoricalStaticFocusPayload
     return {
       dispatchSequence: row.dispatch_seq,
       injectionId: row.injection_id,

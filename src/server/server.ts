@@ -1,6 +1,7 @@
 import path from "node:path"
+import { homedir } from "node:os"
 import { stat } from "node:fs/promises"
-import { APP_NAME, getRuntimeProfile, LOG_PREFIX, SELF_UPDATE_ENABLED } from "../shared/branding"
+import { APP_NAME, getDataDir, getRuntimeProfile, LOG_PREFIX, SELF_UPDATE_ENABLED } from "../shared/branding"
 import { parseStudyProjects, registerStudyProjects, resolveRegisteredStudyProjects, type RegisteredStudyProject } from "./study-projects"
 import { studyWorkspaceStarterReady } from "./study-workspace-provenance"
 import { createStudyPromptGate, type StudyPromptGate } from "./study-prompt-gate"
@@ -15,12 +16,15 @@ import type { ShareMode } from "../shared/share"
 import { createAuthManager, validateRequestOrigin } from "./auth"
 import { listWorkspaceDirectories } from "./workspace-dirs"
 import { EventStore } from "./event-store"
-import { migrateLegacyDataRoot } from "./migrate-data-root"
+import { acquireDataDirectoryLock, acquireDataRootBootstrapLock } from "./data-directory-lock"
+import { isDefaultDataDirectory, prepareDefaultDataRoot } from "./migrate-data-root"
 import { AgentCoordinator, buildClaudeSdkRuntimeOptions, buildClaudeSubprocessEnv } from "./agent"
 import { AppSettingsManager } from "./app-settings"
 import { DiffStore } from "./diff-store"
 import { discoverProjects, type DiscoveredProject } from "./discovery"
 import { KeybindingsManager } from "./keybindings"
+import { loadRegistryModels } from "./registry-models"
+import { resolvePiConnection } from "./pi-agent"
 import { readLlmProviderSnapshot, validateLlmProviderCredentials, writeLlmProviderSnapshot } from "./llm-provider"
 import { getMachineDisplayName } from "./machine-name"
 import { TerminalManager } from "./terminal-manager"
@@ -28,11 +32,20 @@ import { StudyPreviewRuntime } from "./study-preview-runtime"
 import { UpdateManager } from "./update-manager"
 import type { UpdateInstallAttemptResult } from "./cli-runtime"
 import { createWsRouter, type ClientState } from "./ws-router"
-import { isPathPreviewProxyRequest, previewProxyTarget, proxyPreviewRequest } from "./preview-proxy"
+import { previewProxyTarget, proxyPreviewRequest } from "./preview-proxy"
+import {
+  isPreviewHostForm,
+  isPreviewNavigationRequest,
+  isolatedPreviewTarget,
+  PREVIEW_CALLBACK_PATH,
+  PREVIEW_GRANT_PATH,
+  PREVIEW_TICKETS_PATH,
+  stripPreviewPathPrefix,
+} from "../shared/preview-proxy"
 import { MemoryService } from "./memory"
 import { handleMemoryRequest } from "./memory/routes"
 import { handleStudyRequest } from "./study-routes"
-import { StudyQuestionnaireService, StudyQuestionnaireError } from "./study-questionnaire-service"
+import { StudyQuestionnaireService } from "./study-questionnaire-service"
 import { describeStudyWorkspace, resolveStudyWorkspaceProject, snapshotStudyWorkspace } from "./study-workspace-snapshot"
 import { StudySurveyService } from "./study-survey-service"
 import { StudyRegistry } from "./study-registry"
@@ -42,10 +55,6 @@ import { createStudyParticipantPromptReconciler } from "./study-participant-prom
 import { ExperimentLogger } from "./experiment/logger"
 import { resolveInstallId } from "./install-id"
 import { StudyMemoryStore } from "./experiment/study-memory-store"
-import { createStudyBaselineProjectCopyPreparer } from "./experiment/study-baseline-project-copy"
-import { createStaticMemoryExtractor } from "./experiment/static-memory-extractor"
-import { resolveFrozenStaticObjectStates } from "./experiment/static-freeze"
-import { createDeepSeekJsonCaller } from "./memory/deepseek"
 import { createBranchJsonCaller, memoryRequestContext } from "./memory/branch-caller"
 import { getServerProviderCatalog } from "./provider-catalog"
 import { createCaptureService } from "./memory/capture"
@@ -59,14 +68,12 @@ import { createCheckupService } from "./memory/checkup"
 import { createTransferDetectService } from "./memory/transfer-detect"
 import { createReviseInjectionService } from "./memory/revise-injection"
 import { createUsePlanService } from "./memory/use-plan"
-import { createSummaryService } from "./memory/summary"
 import { createMemoryBoardBacklogService } from "./memory/board-backlog"
-import { handleWorkspaceRequest, runDurableStaticEditOperation } from "./workspace-routes"
+import { handleWorkspaceRequest } from "./workspace-routes"
 import { resolveConditionPolicy, type ConditionPolicy } from "./experiment/condition"
 import { deleteProjectUpload, inferAttachmentContentType, inferProjectFileContentType, persistProjectUpload, resolveExistingProjectUpload } from "./uploads"
 import { ensureProjectDirectory, resolveExistingPathWithinRoot } from "./paths"
 import type { StudyProjectAccess } from "./study-project-access"
-import { isStaticMemoryMarkdownPath } from "../shared/staticMemoryPath"
 
 const MAX_UPLOAD_FILES = 50
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024
@@ -90,7 +97,7 @@ export async function persistUploadedFiles(args: {
       const attachment = await persistUpload({
         projectId: args.projectId,
         localPath: args.localPath,
-        fileName: file.name,
+        fileName: file.name || "upload",
         bytes,
         fallbackMimeType: file.type || undefined,
       })
@@ -131,7 +138,10 @@ export function validateUploadFiles(files: Array<{ name: string; size: number }>
   return null
 }
 
-
+/**
+ * Keep study identity authority in the server layer. The memory route only
+ * receives this refusal callback and never reads StudyRegistry or EventStore.
+ */
 export function createStudyEnforceAdmission(args: {
   policy: ConditionPolicy
   store: { getChat(chatId: string): { provider: AgentProvider | null } | null }
@@ -155,8 +165,9 @@ export function createStudyAuditAdmission(args: {
   studyPromptGate: StudyPromptGate | null
   isMemoryVisible: (chatId: string, memoryId: string) => boolean
 }): ((input: { chatId: string; memoryId: string }) => string | null) | undefined {
-
-
+  // Audit follow-ups (Enforce / Draft fix) exist in the memosync condition —
+  // in the normal deployment (studyMode false) as well as the memosync study
+  // arm. The study prompt gate (freeze/lifecycle) only applies when present.
   if (args.policy.condition !== "memosync") return undefined
   return ({ chatId, memoryId }) => {
     const chat = args.store.getChat(chatId)
@@ -217,13 +228,27 @@ export interface StartMemoSyncServerOptions {
   dataDir?: string
   password?: string | null
   strictPort?: boolean
-
-
+  /**
+   * When true, the auth layer trusts X-Forwarded-Proto for CSRF origin
+   * checks, redirect URLs, and the Secure cookie flag. The hostname still
+   * comes from the request URL / Host header. Only enable when the server is
+   * reachable solely through a trusted reverse proxy such as cloudflared.
+   */
   trustProxy?: boolean
-
+  /** Isolated HTTPS (or loopback) origin that also reaches this server and
+   * may execute preview content; defaults to MEMOSYNC_PREVIEW_ORIGIN. */
+  previewOrigin?: string
+  /** Public app origin used to bootstrap preview credentials from the preview
+   * origin; defaults to MEMOSYNC_APP_ORIGIN. */
+  appOrigin?: string
+  /** Extra browser origins allowed to access the development API and WebSocket. */
   allowedOrigins?: string[]
-
-
+  /**
+   * Inject (or disable) filesystem project discovery. Discovery scans the
+   * HOME of whatever machine the server process runs on (~/.claude,
+   * ~/.codex) — tests and QA harnesses pass () => [] so a server boot never
+   * walks the developer's real home directory.
+   */
   discoverProjects?: () => DiscoveredProject[]
   onMigrationProgress?: (message: string) => void
   update?: {
@@ -233,29 +258,115 @@ export interface StartMemoSyncServerOptions {
   }
 }
 
+export async function cleanupFailedMemoSyncStartup(args: {
+  error: unknown
+  cleanups: Array<() => void | Promise<void>>
+  releaseLock: () => void
+}): Promise<unknown> {
+  const failures = [args.error]
+  for (const cleanup of args.cleanups.reverse()) {
+    try {
+      await cleanup()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  try {
+    args.releaseLock()
+  } catch (error) {
+    failures.push(error)
+  }
+  return failures.length > 1
+    ? new AggregateError(failures, "MemoSync startup and cleanup failed")
+    : args.error
+}
+
 export async function startMemoSyncServer(options: StartMemoSyncServerOptions = {}) {
+  const homeDir = homedir()
+  const usesDefaultDataDir = !options.dataDir || isDefaultDataDirectory(options.dataDir, homeDir)
+  const bootstrapLock = usesDefaultDataDir ? acquireDataRootBootstrapLock(homeDir) : null
+  const startupCleanups: Array<() => void | Promise<void>> = []
+  let lock: ReturnType<typeof acquireDataDirectoryLock> | undefined
+  try {
+    if (usesDefaultDataDir) prepareDefaultDataRoot(homeDir)
+    lock = acquireDataDirectoryLock(options.dataDir ?? getDataDir(homeDir))
+    const dataLock = lock
+    const runtime = await startLockedMemoSyncServer(
+      { ...options, dataDir: dataLock.dataDir },
+      (cleanup) => startupCleanups.push(cleanup),
+    )
+    let stopping: Promise<void> | undefined
+    return {
+      ...runtime,
+      stop: () => stopping ??= (async () => {
+        const stopErrors: unknown[] = []
+        try {
+          await runtime.stop()
+        } catch (error) {
+          stopErrors.push(error)
+        }
+        try {
+          dataLock.release()
+        } catch (error) {
+          stopErrors.push(error)
+        }
+        if (stopErrors.length === 1) throw stopErrors[0]
+        if (stopErrors.length > 1) {
+          throw new AggregateError(stopErrors, "MemoSync shutdown and lock release failed")
+        }
+      })(),
+    }
+  } catch (error) {
+    throw await cleanupFailedMemoSyncStartup({
+      error,
+      cleanups: startupCleanups,
+      releaseLock: () => lock?.release(),
+    })
+  } finally {
+    bootstrapLock?.release()
+  }
+}
+
+async function startLockedMemoSyncServer(
+  options: StartMemoSyncServerOptions,
+  onStartupCleanup: (cleanup: () => void | Promise<void>) => void,
+) {
   const port = options.port ?? 3210
   const hostname = options.host ?? "127.0.0.1"
   const strictPort = options.strictPort ?? false
   const runtimeProfile = getRuntimeProfile()
-  const auth = options.password ? createAuthManager(options.password, { trustProxy: options.trustProxy ?? false }) : null
+  const trustProxy = options.trustProxy ?? false
+  // Isolated origins for executable preview content (see preview-proxy.ts).
+  // An HTTPS MEMOSYNC_PREVIEW_ORIGIN is required when the app is reached
+  // through a non-loopback public origin; MEMOSYNC_APP_ORIGIN lets the preview origin
+  // find its way back to the grant endpoint.
+  const previewOrigin = (options.previewOrigin ?? process.env.MEMOSYNC_PREVIEW_ORIGIN ?? "").trim() || null
+  const appPublicOrigin = (options.appOrigin ?? process.env.MEMOSYNC_APP_ORIGIN ?? "").trim() || null
+  const previewOriginHost = previewOrigin ? new URL(previewOrigin).host : null
+  const auth = options.password
+    ? createAuthManager(options.password, { trustProxy, previewOrigin, appOrigin: appPublicOrigin })
+    : null
   const allowedOrigins = options.allowedOrigins ?? (process.env.MEMOSYNC_ALLOWED_ORIGINS ?? "")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean)
-  if (!options.dataDir) migrateLegacyDataRoot()
-
-
+  // Study-condition policy: decides which memory behaviors exist in this
+  // instance (capture surfacing, preview gate, trace, board/working-set access)
+  // and whether remote git/GitHub access exists at all. Resolved BEFORE any
+  // service construction so arm isolation covers construction side effects,
+  // not just HTTP routes.
   const conditionPolicy = resolveConditionPolicy()
   const store = new EventStore(options.dataDir)
-
+  // Study deployments keep participants on local-only git.
   const diffStore = new DiffStore(store.dataDir, { remoteGitEnabled: !conditionPolicy.studyMode })
   const machineDisplayName = getMachineDisplayName()
   await store.initialize()
   await diffStore.initialize()
   await store.migrateLegacyTranscripts(options.onMigrationProgress)
-
-
+  // Study cross-project support (STUDY_PLAN §2.1 / T4): the orchestrator
+  // provisions multiple project workspaces per participant and lists them in
+  // STUDY_PROJECTS; register them here so all study projects appear
+  // deterministically (no participant hand-adds a project).
   let assignedStudyProjects: ReadonlyMap<StudyTask["projectSlug"], RegisteredStudyProject> = new Map()
   try {
     const studySpecs = parseStudyProjects(process.env.STUDY_PROJECTS)
@@ -277,19 +388,26 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
     console.error(`${LOG_PREFIX} STUDY_PROJECTS is misconfigured:`, error)
     throw error
   }
-
-
+  // Controlled experiment: participants get no engine/model/effort choice.
+  // The catalog narrows to Claude Code on the arm's configured DeepSeek
+  // model at effort "high" (DeepSeek's official default strength) — the
+  // dropdowns still open, they just hold one entry each (2026-08-09).
   if (conditionPolicy.studyMode) {
     applyStudyModelPin(process.env.DEEPSEEK_MODEL || DEFAULT_DEEPSEEK_MODEL_ID)
   }
-
-
+  // Memory layer (MemoSync): SQLite store + Markdown projection, rooted in the
+  // same data dir as the event store. Engine-agnostic; consumed by the memory
+  // HTTP routes and (P2+) the per-engine injection/tool adapters. Markdown
+  // write-back (startup ingest of hand edits) is part of normal MemoSync.
   const studyEventsPath = path.join(store.dataDir, "experiments", "events.jsonl")
   const studyMemoryStore = conditionPolicy.studyMode
     ? new StudyMemoryStore(path.join(store.dataDir, "experiments", "study.sqlite"))
     : null
-
-
+  if (studyMemoryStore) onStartupCleanup(() => studyMemoryStore.close())
+  // Formal allocations receive their immutable identity from the orchestrator.
+  // Fixed-arm local images without that env remain bootable for diagnostics,
+  // but onboarding/session routes fail closed rather than accepting a browser
+  // supplied identity.
   const studyParticipantId = process.env.PARTICIPANT_ID?.trim() ?? ""
   const studyOnboarding = studyMemoryStore && studyParticipantId
     ? new StudyOnboardingService({
@@ -298,8 +416,12 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
         expectedProlificId: process.env.PROLIFIC_PID,
       })
     : null
-
-
+  // Canonical lifecycle is recovered before the logger so every durable
+  // interaction is attributed against SQLite-backed freeze/completion state.
+  // The registry's JSONL replay scans the WHOLE events file synchronously at
+  // boot looking for study.* lifecycle events — which non-study deployments
+  // never emit, while their telemetry grows that file without bound. Skip the
+  // scan entirely outside study mode (behavior-identical: zero matches).
   const studyRegistry = new StudyRegistry(
     conditionPolicy.studyMode ? studyEventsPath : undefined,
     undefined,
@@ -326,20 +448,22 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
         assignedProjects: assignedStudyProjects,
       })
     : null
-
-
+  // Transcript append precedes prompt telemetry. Repair a process loss in
+  // that narrow seam before the listener can expose freeze or export routes.
   studyParticipantPromptReconciler?.reconcile()
   const memory = new MemoryService({
     dbPath: path.join(store.dataDir, "memory.sqlite"),
     dataDir: path.join(store.dataDir, "memories"),
     logger: new ExperimentLogger({
       filePath: studyEventsPath,
-
-
+      // Study allocations stamp the orchestrator-owned PARTICIPANT_ID; every
+      // other deployment stamps a persisted per-install id so longitudinal
+      // event streams from different machines stay separable.
       participant: studyParticipantId || resolveInstallId(store.dataDir),
       durableSink: studyTelemetry ? (input) => studyTelemetry.recordServerEvent(input) : undefined,
     }),
   })
+  onStartupCleanup(() => memory.close())
   const beginStudyMemoryMutation = conditionPolicy.studyMode
     ? () => studyRegistry.beginTreatmentMemoryMutation()
     : undefined
@@ -355,11 +479,14 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
   let server: ReturnType<typeof Bun.serve<ClientState>>
   let router: ReturnType<typeof createWsRouter>
   const terminals = new TerminalManager()
+  onStartupCleanup(() => terminals.closeAll())
   const keybindings = new KeybindingsManager()
+  onStartupCleanup(() => keybindings.dispose())
   const appSettings = new AppSettingsManager(path.join(store.dataDir, "settings.json"))
+  onStartupCleanup(() => appSettings.dispose())
   await appSettings.initialize()
-
-
+  // A participant toggling the preview gate is research data (STUDY_PLAN §2.4)
+  // — log every memoryPreview settings change, whether via UI or file edit.
   let prevMemoryPreviewSettings = JSON.stringify(appSettings.getSnapshot().memoryPreview)
   appSettings.onChange((snapshot) => {
     const next = JSON.stringify(snapshot.memoryPreview)
@@ -380,8 +507,7 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
       devMode: runtimeProfile === "dev",
       })
     : null
-
-
+  // Post-turn memory passes run on the selected CLI runtime when available.
   const branchMemory = createBranchJsonCaller({ resolve: context => {
     const chat = context.sessionId ? store.getChat(context.sessionId) : undefined
     const project = store.getProject(context.projectId ?? chat?.projectId ?? "")
@@ -398,38 +524,31 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
     }) : null
     return { provider, localPath, model: runtime?.model ?? model, parentSessionToken: chat?.sessionToken ?? null, subprocessEnv: runtime?.env }
   } })
-
-  const memoryLlm = conditionPolicy.condition === "memosync" ? branchMemory.callJson : createDeepSeekJsonCaller()
-  const staticMemoryExtractor =
-    memoryLlm && studyMemoryStore && conditionPolicy.condition === "static"
-      ? createStaticMemoryExtractor({
-          callJson: memoryLlm,
-          modelId: process.env.DEEPSEEK_MODEL || DEFAULT_DEEPSEEK_MODEL_ID,
-          cache: studyMemoryStore,
-        })
-      : null
-
-
-  const memoryTransfer = memoryLlm && conditionPolicy.boardWritable ? createTransferService({ callJson: memoryLlm }) : null
-
-
-  const memorySanitize = memoryLlm && conditionPolicy.capture === "review" ? createSanitizeService({ callJson: memoryLlm }) : null
-
-
+  const memoryLlm = branchMemory.callJson
+  // Cross-context transfer judgment (as-is / rewrite / context-bound) — the
+  // route degrades to a verbatim proposal without it.
+  const memoryTransfer = conditionPolicy.boardWritable ? createTransferService({ callJson: memoryLlm }) : null
+  // Sensitive-candidate redaction (DG1 "confirm" branch) — the route REFUSES
+  // without it (a failed redaction must never look like a clean one).
+  const memorySanitize = conditionPolicy.capture === "review" ? createSanitizeService({ callJson: memoryLlm }) : null
+  // Revision drafting (DG4 "propose fixes"): after a repeat-violation streak
+  // the system drafts a replacement that lands on the review lane. Exists only
+  // where there IS a review lane and a trace pass to trigger it.
   const memoryRevision =
-    memoryLlm && conditionPolicy.capture === "review" && conditionPolicy.trace
+    conditionPolicy.capture === "review" && conditionPolicy.trace
       ? createRevisionService({ memory, callJson: memoryLlm })
       : null
   if (memoryRevision && conditionPolicy.condition === "memosync") {
     const scan = memoryRevision.scanAndPropose.bind(memoryRevision)
     memoryRevision.scanAndPropose = input => branchMemory.run({ sessionId: input.sessionId }, () => scan(input))
   }
-
-
-  const memorySummary =
-    memoryLlm && conditionPolicy.condition === "auto" ? createSummaryService({ memory, callJson: memoryLlm }) : null
-
-
+  // Applies participant-reviewed Checkup actions. Detection belongs to the
+  // Checkup service; this service only validates and commits those actions.
+  // The session clock shared by Checkup and Transfer: prior sessions of
+  // the project that actually RAN a turn (lastTurnOutcome is replayed from
+  // turn events) — a fork that only copied a transcript sets hasMessages
+  // without ever running, and an archived chat still happened; neither must
+  // skew 过期.
   const listRecentSessions = (projectId: string | undefined, excludeSessionId?: string) => {
     if (!projectId) return []
     return store
@@ -441,20 +560,22 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
   const memoryMaintenance = conditionPolicy.preview
     ? createMaintenanceService({
         memory,
-
-        callJson: memoryLlm ?? undefined,
+        // Enables the redundant-pair merge action (LLM-drafted merge proposals).
+        callJson: memoryLlm,
       })
     : null
-
-
+  // Step-one library checkup (redesign 2026-08-07 §3): three parallel LLM
+  // queries + merge, cache keyed on library content — exists only where the
+  // step-one gates exist (the review arm's chat flow).
   const memoryCheckup =
-    memoryLlm && conditionPolicy.preview && conditionPolicy.capture === "review"
+    conditionPolicy.preview && conditionPolicy.capture === "review"
       ? createCheckupService({ memory, callJson: memoryLlm, listRecentSessions })
       : null
-
-
+  // Transfer detection: turn end prepares source-side rules from other
+  // contexts; each next prompt reruns relevance and task-bound Decode/landing.
+  // Rides the same arm gating as the checkup, plus the transfer service.
   const memoryTransferDetect =
-    memoryLlm && memoryTransfer && conditionPolicy.preview && conditionPolicy.capture === "review"
+    memoryTransfer && conditionPolicy.preview && conditionPolicy.capture === "review"
       ? createTransferDetectService({
           memory,
           callJson: memoryLlm,
@@ -463,12 +584,12 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
           listProjects: () => store.listProjects().map((p) => ({ id: p.id, title: p.title })),
         })
       : null
-
-
+  // "Ask agent to revise" on the Step 2 gate — natural-language adjustment of
+  // the injected set. Same availability as the gate itself.
   const memoryReviseInjection =
-    memoryLlm && conditionPolicy.preview ? createReviseInjectionService({ callJson: memoryLlm }) : null
+    conditionPolicy.preview ? createReviseInjectionService({ callJson: memoryLlm }) : null
   const memoryUsePlan =
-    memoryLlm && conditionPolicy.preview ? createUsePlanService({ callJson: memoryLlm }) : null
+    conditionPolicy.preview ? createUsePlanService({ callJson: memoryLlm }) : null
   const studyOpeningAttachmentSnapshots = conditionPolicy.studyMode && conditionPolicy.condition === "memosync"
     ? createStudyOpeningAttachmentSnapshotStore(path.join(store.dataDir, "experiments", "opening-attachments"))
     : undefined
@@ -523,8 +644,9 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
             ...violation,
             disqualifying: true as const,
           }
-
-
+          // This evidence can affect compensation eligibility, so its source
+          // of truth is transactional study.sqlite. JSONL remains the common
+          // cross-condition analysis projection and never contains raw text.
           studyMemoryStore?.recordInstructionGuardEvent(event)
           memory.logger.event({ type: "study.instruction_guard", ...event })
         },
@@ -544,10 +666,10 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
     registry: studyRegistry,
   })
   const studyPreviewRuntime = conditionPolicy.studyMode ? new StudyPreviewRuntime() : null
-  const memoryCapture = memoryLlm && conditionPolicy.capture !== "off" ? createCaptureService({
-    memory, callJson: memoryLlm, surface: conditionPolicy.capture,
+  const memoryCapture = createCaptureService({
+    memory, callJson: memoryLlm,
     durablePromptCapture: conditionPolicy.studyMode && conditionPolicy.condition === "memosync",
-  }) : null
+  })
   if (memoryCapture && conditionPolicy.condition === "memosync") {
     const route = memoryCapture.routeProposal.bind(memoryCapture)
     memoryCapture.routeProposal = (raw, input) => branchMemory.run(input, () => route(raw, input))
@@ -558,7 +680,6 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
     policy: conditionPolicy,
     memoryBranches: conditionPolicy.condition === "memosync",
     studyMemoryStore,
-    staticMemoryExtractor,
     studyPreviewRuntime,
     getActiveStudyTaskId: () => conditionPolicy.studyMode ? studyRegistry.activeTaskId() : null,
     studyPromptGate,
@@ -570,15 +691,16 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
       : null,
     getMemoryPreviewSettings: () => appSettings.getSnapshot().memoryPreview,
     capture: memoryCapture,
-
-
-    memoryTrace: memoryLlm && conditionPolicy.trace ? createTraceService({ callJson: memoryLlm }) : null,
+    // No logger: the coordinator CAS-validates trace verdicts against live
+    // memory state and emits memory.trace itself.
+    memoryTrace: conditionPolicy.trace ? createTraceService({ callJson: memoryLlm }) : null,
     memoryRevision,
     memoryCheckup,
     memoryTransferDetect,
-
-
-    memoryRelevance: memoryLlm && conditionPolicy.preview ? createRelevanceService({ callJson: memoryLlm }) : null,
+    // Sidecar relevance prediction on the receipt (REDESIGN D6): the receipt
+    // itself stays a pure plan readout; the prediction arrives as its own
+    // entry, visually marked as a guess.
+    memoryRelevance: conditionPolicy.preview ? createRelevanceService({ callJson: memoryLlm }) : null,
     memoryUsePlan,
     memoryPreview: conditionPolicy.preview,
     onStateChange: (chatId?: string, options?: { immediate?: boolean }) => {
@@ -594,6 +716,7 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
     },
   })
   agent = activeAgent
+  onStartupCleanup(() => activeAgent.shutdownStudyRuntime())
   const studyWorkingMemoryAdmission = createStudyWorkingMemoryAdmission({
     policy: conditionPolicy,
     store,
@@ -613,7 +736,6 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
         registry: studyRegistry,
         logger: memory.logger,
         memoryStore: memory.store,
-        getAutoProjectCloneRef: (memoryId) => memory.getAutoProjectCloneRef(memoryId),
         studyFreezeBlocker: () => activeAgent.studyFreezeBlocker(),
         reconcileParticipantPrompts: () => {
           studyParticipantPromptReconciler?.reconcile()
@@ -635,46 +757,10 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
             frozenAt,
           })
         },
-        resolveAdditionalObjectStates: async (taskId, identities) => {
-          const staticIdentities = identities.filter((identity) => identity.scheme === "static")
-          if (staticIdentities.length === 0) return []
-          if (!staticMemoryExtractor) {
-            throw new StudyQuestionnaireError(
-              "Static memory measurement is unavailable. Please retry or let the experimenter know.",
-              503,
-            )
-          }
-          try {
-            return await resolveFrozenStaticObjectStates({
-              taskId,
-              identities: staticIdentities,
-              store: studyMemoryStore,
-              extractor: staticMemoryExtractor,
-              getWorkspaceDir: (namespace) => store.getProject(namespace)?.localPath,
-            })
-          } catch (error) {
-            throw new StudyQuestionnaireError(
-              error instanceof Error
-                ? `Could not freeze Static memory state: ${error.message}`
-                : "Could not freeze Static memory state.",
-              503,
-            )
-          }
-        },
         getChatInfo: (chatId) => {
           const chat = store.getChat(chatId)
           return chat ? { title: chat.title, projectId: chat.projectId } : undefined
         },
-      })
-    : null
-  const studyBaselineProjectCopyPreparer = studyMemoryStore
-    ? createStudyBaselineProjectCopyPreparer({
-        policy: conditionPolicy,
-        store: studyMemoryStore,
-        dataDir: store.dataDir,
-        memory,
-        summaries: memorySummary,
-        assignedProjects: assignedStudyProjects,
       })
     : null
   const studySurvey = studyMemoryStore
@@ -683,7 +769,6 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
         registry: studyRegistry,
         logger: memory.logger,
         allocationParticipantId: studyParticipantId,
-        nextSessionPreparer: studyBaselineProjectCopyPreparer,
         completionUrl: process.env.PROLIFIC_COMPLETION_URL,
       })
     : null
@@ -716,9 +801,9 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
     getDiscoveredProjects: () => discoveredProjects,
     machineDisplayName,
     updateManager,
-
+    // Thunk: actualPort is assigned when Bun.serve binds, later in this fn.
     getSelfPort: () => actualPort,
-
+    // Study deployments cut non-essential outbound access (skills.sh).
     remoteSkillsEnabled: !conditionPolicy.studyMode,
     studyProjectAccess,
     studyPreviewRuntime: studyPreviewRuntime ?? undefined,
@@ -729,22 +814,10 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
       const task = getStudyTask(taskId)
       return Boolean(task && assignedStudyProjects.get(task.projectSlug)?.projectId === projectId)
     },
-
-
+    // Study arms only: the serial gate can refuse prompts (chat from a
+    // completed session, pending questionnaire, or a finished study).
   })
-
-
-  activeAgent.resumePendingStaticFocusMaterializations()
-
-
-  activeAgent.resumeOpeningBoardPreparation()
-  const staleEmptyChatPruneInterval = setInterval(() => {
-    void router.pruneStaleEmptyChats()
-      .then(() => router.broadcastSnapshots())
-  }, STALE_EMPTY_CHAT_PRUNE_INTERVAL_MS)
-
-
-  void activeAgent.drainOrphanedQueues()
+  onStartupCleanup(() => router.dispose())
 
   const distDir = path.join(import.meta.dir, "..", "..", "dist", "client")
 
@@ -760,21 +833,61 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
         async fetch(req, serverInstance) {
           const url = new URL(req.url)
 
-
+          // Dev-server preview requests encode the target port in either a
+          // localhost subdomain or /__memosync/preview/<port> path, then proxy
+          // inside this process's network namespace (see preview-proxy.ts).
+          // Executable preview content must live on an ISOLATED origin
+          // (<port>.localhost locally, or MEMOSYNC_PREVIEW_ORIGIN when the app
+          // is reached through a public gateway) so it can never read the
+          // host-only app session cookie or call authenticated /api routes.
           const previewPort = previewProxyTarget(req, actualPort)
-          if (previewPort !== null) {
-
-
-            if (isPathPreviewProxyRequest(req, previewPort)) {
-              if (!validateRequestOrigin(req, {
-                trustProxy: options.trustProxy ?? false,
-                allowedOrigins,
-              })) {
+          const onPreviewOrigin = previewOriginHost !== null && url.host === previewOriginHost
+          if (previewPort !== null || onPreviewOrigin) {
+            if (auth && url.pathname === PREVIEW_CALLBACK_PATH) {
+              return auth.handlePreviewCallback(req)
+            }
+            if (previewPort === null) {
+              return new Response("Not found", { status: 404 })
+            }
+            if (!isPreviewHostForm(url.host) && !onPreviewOrigin) {
+              // Path form on the app origin: redirect navigations to the
+              // isolated origin and explicitly block everything else —
+              // upstream content never executes here.
+              if (!isPreviewNavigationRequest(req)) {
                 return new Response("Forbidden", { status: 403 })
               }
-              if (auth && !auth.isAuthenticated(req)) {
-                return new Response("Unauthorized", { status: 401 })
+              if (auth && auth.isAuthenticated(req)) {
+                return auth.previewTicketRedirect(req, previewPort)
               }
+              const isolated = isolatedPreviewTarget(
+                req,
+                previewPort,
+                previewOrigin,
+                stripPreviewPathPrefix(url.pathname, previewPort),
+              )
+              if (isolated) {
+                return Response.redirect(`${isolated.origin}${isolated.path}${url.search}`, 302)
+              }
+              return new Response(
+                `<!doctype html><meta charset="utf-8"><title>Preview unavailable</title>` +
+                `<body style="font-family:system-ui;color:#667085;display:grid;place-items:center;height:100vh;margin:0">` +
+                `<p style="max-width:32rem;padding:0 1.5rem;font-size:14px">` +
+                `Previews run on an isolated origin. Open MemoSync locally, or ask whoever hosts` +
+                ` this server to set MEMOSYNC_PREVIEW_ORIGIN to an HTTPS origin.` +
+                `</p>`,
+                { status: 403, headers: { "content-type": "text/html; charset=utf-8" } },
+              )
+            }
+            if (!validateRequestOrigin(req, {
+              trustProxy,
+              allowedOrigins,
+            })) {
+              return new Response("Forbidden", { status: 403 })
+            }
+            if (auth && !auth.isPreviewAuthenticated(req, previewPort)) {
+              const bootstrap = auth.previewBootstrapRedirect(req, previewPort)
+              if (bootstrap) return bootstrap
+              return new Response("Unauthorized", { status: 401 })
             }
             return proxyPreviewRequest(req, url, previewPort)
           }
@@ -803,6 +916,20 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
           }
 
           if (auth) {
+            if (url.pathname === PREVIEW_GRANT_PATH) {
+              if (req.method !== "GET") {
+                return new Response(null, { status: 405, headers: { Allow: "GET" } })
+              }
+              return auth.handlePreviewGrant(req)
+            }
+
+            if (url.pathname === PREVIEW_TICKETS_PATH) {
+              if (req.method !== "POST") {
+                return new Response(null, { status: 405, headers: { Allow: "POST" } })
+              }
+              return auth.handlePreviewTicketMint(req)
+            }
+
             if (url.pathname === "/auth/login") {
               if (req.method === "GET") {
                 return auth.redirectToApp(req)
@@ -813,7 +940,9 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
               return new Response(null, { status: 405, headers: { Allow: "GET, POST" } })
             }
 
-
+            // The experimenter's unfreeze escape hatch authenticates by its
+            // admin key alone (checked in the study routes): mid-session
+            // rescue must not require fishing a participant's cookie.
             const isStudyAdminRequest =
               url.pathname === "/api/study/unfreeze" && req.headers.has("x-study-admin")
             if (url.pathname === "/ws") {
@@ -856,8 +985,6 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
 
           const projectFileContentResponse = await handleProjectFileContent(req, url, store, {
             beginStudyMemoryMutation,
-            experimentLogger: memory.logger,
-            getActiveStudyTaskId: () => conditionPolicy.studyMode ? studyRegistry.activeTaskId() : null,
             studyProjectAccess,
           })
           if (projectFileContentResponse) {
@@ -866,8 +993,6 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
 
           const workspaceResponse = await handleWorkspaceRequest(req, url, store, {
             beginStudyMemoryMutation,
-            experimentLogger: memory.logger,
-            getActiveStudyTaskId: () => conditionPolicy.studyMode ? studyRegistry.activeTaskId() : null,
             studyProjectAccess,
           })
           if (workspaceResponse) {
@@ -880,8 +1005,6 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
             transfer: memoryTransfer,
             sanitize: memorySanitize,
             maintenance: memoryMaintenance,
-            summary: memorySummary,
-            summaryProjectRefusal: studyProjectAccess?.projectRefusal,
             reviseInjection: memoryReviseInjection,
             usePlan: memoryUsePlan,
             revision: memoryRevision,
@@ -935,7 +1058,8 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
             return memoryResponse
           }
 
-
+          // Experiment shell: task briefs + the post-session quiz over the
+          // immutable set of memories actually focused during the session.
           const studyResponse = await handleStudyRequest(req, url, {
             registry: studyRegistry,
             questionnaire: studyQuestionnaire,
@@ -954,8 +1078,8 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
                       disqualifying: false,
                       ...attempt,
                     }
-
-
+                    // UI events are deterrence/review signals only. A browser
+                    // shortcut is never, by itself, compensation evidence.
                     studyMemoryStore.recordInstructionGuardEvent(event)
                     memory.logger.event({ type: "study.instruction_guard", ...event })
                   },
@@ -979,12 +1103,23 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
             return studyResponse
           }
 
+          // The client reads the study-condition policy to gate its surfaces
+          // (Memory Board nav, session-memories panel, review cards). The
+          // provider catalog rides along so the launcher's picker honors the
+          // study pin even before any chat snapshot exists.
+          if (url.pathname === "/api/model-registry/models" && req.method === "GET") {
+            if (conditionPolicy.studyMode) return Response.json({ models: [] })
+            const connection = await resolvePiConnection()
+            return Response.json({ models: connection ? await loadRegistryModels(connection, url.searchParams.get("model") || undefined) : [] })
+          }
 
           if (url.pathname === "/api/condition") {
             return Response.json({ data: conditionPolicy, providers: deployedProviders() })
           }
 
-
+          // Add Project's path picker browses the WORKSPACE machine's
+          // filesystem — participants otherwise read the path field as their
+          // own computer (pilot feedback 2026-08-11).
           if (url.pathname === "/api/workspace/dirs") {
             return Response.json({ data: listWorkspaceDirectories(url.searchParams.get("path") ?? undefined) })
           }
@@ -1006,7 +1141,7 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
           },
         },
       })
-
+      // port 0 = ephemeral: adopt whatever the OS actually bound.
       actualPort = server.port ?? actualPort
       break
     } catch (err: unknown) {
@@ -1020,20 +1155,43 @@ export async function startMemoSyncServer(options: StartMemoSyncServerOptions = 
     }
   }
 
+  onStartupCleanup(() => server.stop(true))
+  // Do not launch writers until startup can no longer fail to bind.
+  activeAgent.resumeOpeningBoardPreparation()
+  const staleEmptyChatPruneInterval = setInterval(() => {
+    void router.pruneStaleEmptyChats()
+      .then(() => router.broadcastSnapshots())
+  }, STALE_EMPTY_CHAT_PRUNE_INTERVAL_MS)
+  onStartupCleanup(() => clearInterval(staleEmptyChatPruneInterval))
+  void activeAgent.drainOrphanedQueues()
+
   const shutdown = async () => {
     clearInterval(staleEmptyChatPruneInterval)
-    for (const chatId of [...activeAgent.activeTurns.keys()]) {
-      await activeAgent.cancel(chatId)
+    const shutdownErrors: unknown[] = []
+    const attempt = async (action: () => void | Promise<void>) => {
+      try {
+        await action()
+      } catch (error) {
+        shutdownErrors.push(error)
+      }
     }
-    await activeAgent.shutdownStudyRuntime()
-    router.dispose()
-    appSettings.dispose()
-    keybindings.dispose()
-    terminals.closeAll()
-    memory.close()
-    studyMemoryStore?.close()
-    await store.compact()
-    server.stop(true)
+    await attempt(() => server.stop(true))
+    for (const chatId of [...activeAgent.activeTurns.keys()]) {
+      await attempt(() => activeAgent.cancel(chatId))
+    }
+    await attempt(() => activeAgent.shutdownStudyRuntime())
+    await attempt(() => activeAgent.forceStopAllTurns())
+    await attempt(() => router.dispose())
+    await attempt(() => appSettings.dispose())
+    await attempt(() => keybindings.dispose())
+    await attempt(() => terminals.closeAll())
+    await attempt(() => memory.close())
+    await attempt(() => studyMemoryStore?.close())
+    await attempt(() => store.compact())
+    if (shutdownErrors.length === 1) throw shutdownErrors[0]
+    if (shutdownErrors.length > 1) {
+      throw new AggregateError(shutdownErrors, "MemoSync shutdown failed")
+    }
   }
 
   return {
@@ -1078,7 +1236,12 @@ export async function handleProjectUpload(
     return Response.json({ error: "Upload request is too large." }, { status: 413 })
   }
 
-  const formData = await req.formData()
+  let formData: FormData
+  try {
+    formData = await req.formData()
+  } catch {
+    return Response.json({ error: "Could not read the upload request. Please try again." }, { status: 400 })
+  }
   const files = formData
     .getAll("files")
     .filter((value): value is File => value instanceof File)
@@ -1090,6 +1253,18 @@ export async function handleProjectUpload(
   const validationError = validateUploadFiles(files)
   if (validationError) {
     return Response.json({ error: validationError.error }, { status: validationError.status })
+  }
+
+  const clientSizes = formData.getAll("clientFileSizes")
+  if (clientSizes.length > 0) {
+    if (clientSizes.length !== files.length || clientSizes.some((value) =>
+      typeof value !== "string" || !value.trim() || !Number.isSafeInteger(Number(value)) || Number(value) < 0
+    )) {
+      return Response.json({ error: "Invalid upload size metadata." }, { status: 400 })
+    }
+    if (files.some((file, index) => file.size !== Number(clientSizes[index]))) {
+      return Response.json({ error: "The uploaded file size does not match. Please try again." }, { status: 400 })
+    }
   }
 
   try {
@@ -1156,7 +1331,7 @@ async function handleAttachmentContent(req: Request, url: URL, store: EventStore
   })
 }
 
-
+// Exported for tests (project-file-content.test.ts) — not part of the public API.
 export async function handleProjectFileContent(
   req: Request,
   url: URL,
@@ -1213,15 +1388,6 @@ export async function handleProjectFileContent(
     if (!relativePath || relativePath === "." || relativePath.startsWith("../") || relativePath.includes("/../") || path.posix.isAbsolute(relativePath)) {
       return Response.json({ error: "Invalid project file path" }, { status: 400 })
     }
-    if (
-      req.method === "PUT"
-      && resolveConditionPolicy().condition === "static"
-      && isStaticMemoryMarkdownPath(relativePath)
-      && !isStaticMemoryMarkdownPath(requestedRelativePath)
-    ) {
-      return Response.json({ error: "Invalid Static memory file path" }, { status: 400 })
-    }
-
     const resolved = await resolveExistingPathWithinRoot(project.localPath, relativePath)
     if (!resolved.ok) {
       return Response.json(
@@ -1242,8 +1408,8 @@ export async function handleProjectFileContent(
     }
 
     if (req.method === "PUT") {
-
-
+      // Save from the Files editor. Existing files only (resolve above already
+      // 404s otherwise), so the panel can't create paths the tree doesn't show.
       const declaredSize = Number(req.headers.get("content-length"))
       if (Number.isFinite(declaredSize) && declaredSize > MAX_EDITOR_SAVE_BYTES) {
         return Response.json({ error: "File too large to save" }, { status: 413 })
@@ -1252,54 +1418,14 @@ export async function handleProjectFileContent(
       if (Buffer.byteLength(body, "utf8") > MAX_EDITOR_SAVE_BYTES) {
         return Response.json({ error: "File too large to save" }, { status: 413 })
       }
-      let previousContent = ""
       try {
-        previousContent = await file.text()
-      } catch {
-
-
-      }
-      const isStaticMemoryMarkdown = isStaticMemoryMarkdownPath(relativePath)
-      const changedStaticMemory = resolveConditionPolicy().condition === "static"
-        && isStaticMemoryMarkdown
-        && body !== previousContent
-      const activeTaskId = options.getActiveStudyTaskId?.() ?? null
-      const operationId = req.headers.get("x-memosync-event-id")?.trim() || undefined
-      if (changedStaticMemory && activeTaskId && !operationId) {
-        return Response.json(
-          { error: { code: "EVENT_ID_REQUIRED", message: "A durable Static edit operationId is required during the study" } },
-          { status: 400 },
-        )
-      }
-      const durationHeader = req.headers.get("x-memosync-edit-duration-ms")
-      const rawDuration = durationHeader === null ? Number.NaN : Number(durationHeader)
-      const durationMs = Number.isFinite(rawDuration) && rawDuration >= 0 ? Math.round(rawDuration) : undefined
-      const writeAndStat = async () => {
         await Bun.write(filePath, body)
         const written = await stat(filePath)
-        if (!written.isFile()) throw new Error("Static memory target is not a file")
-      }
-      try {
-        if (changedStaticMemory) {
-          await runDurableStaticEditOperation({
-            logger: options.experimentLogger,
-            taskId: activeTaskId,
-            operationId,
-            chatId: req.headers.get("x-memosync-session-id") || undefined,
-            projectId: project.id,
-            path: relativePath,
-            durationMs,
-            run: writeAndStat,
-          })
-        } else {
-          await writeAndStat()
-        }
+        if (!written.isFile()) throw new Error("File save target is not a file")
       } catch (error) {
         const status = error !== null && typeof error === "object" && "status" in error && error.status === 409 ? 409 : 500
         return Response.json(
-          status === 409
-            ? { error: { code: "OPERATION_ALREADY_RECORDED", message: "This Static memory edit was already recorded. Refresh to recover its current outcome." } }
-            : { error: "Failed to write file" },
+          { error: "Failed to write file" },
           { status },
         )
       }

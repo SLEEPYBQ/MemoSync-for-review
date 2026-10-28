@@ -35,8 +35,8 @@ describe("GuidePostSessionJourney", () => {
     expect(monitoring).toContain("Monitoring workload")
     expect(control).toContain("Control workload")
     expect(sus).toContain("System usability")
-
-
+    // Both Guide TLX previews start genuinely unanswered: no preselected
+    // midpoint thumb, no dimension marked answered (study owner 2026-08-20).
     for (const html of [monitoring, control]) {
       expect(html.match(/>Not answered</g)).toHaveLength(6)
       expect(html.match(/data-answered="false"/g)).toHaveLength(6)
@@ -56,10 +56,11 @@ describe("GuidePostSessionJourney", () => {
 
   test("never reveals the real completion code in the Guide preview or client sources", async () => {
     const complete = renderToStaticMarkup(<GuidePostSessionJourney phase="complete" />)
-    expect(complete).not.toContain("TESTCODE")
+    expect(complete).not.toContain("REVIEW_ONLY")
     expect(complete).not.toContain("data-completion-code")
 
-
+    // The real code is server-owned: it must not exist anywhere in the client
+    // bundle sources (test files are not shipped and are excluded).
     const { readdirSync, readFileSync, statSync } = await import("node:fs")
     const { join } = await import("node:path")
     const root = new URL("../..", import.meta.url).pathname
@@ -69,7 +70,7 @@ describe("GuidePostSessionJourney", () => {
         const full = join(dir, entry)
         if (statSync(full).isDirectory()) walk(full)
         else if (/\.(ts|tsx|css|html)$/.test(entry) && !/\.test\./.test(entry)) {
-          if (readFileSync(full, "utf8").includes("TESTCODE")) offenders.push(full)
+          if (readFileSync(full, "utf8").includes("REVIEW_ONLY")) offenders.push(full)
         }
       }
     }

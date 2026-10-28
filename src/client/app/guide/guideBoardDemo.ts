@@ -9,7 +9,7 @@ import { DEMO_MEMORY_ITEMS } from "./guideScenes"
 
 export interface GuideBoardDemo {
   blocking: true
-
+  /** Enable the real production controls against the local Guide controller. */
   interactive?: boolean
   status: MemoryBoardReviewStatus
   memoryItems: MemoryItem[]
@@ -99,7 +99,11 @@ export const GUIDE_BOARD_PENDING_DEMO: GuideBoardDemo = {
   memoryItems: DEMO_MEMORY_ITEMS,
 }
 
-
+/**
+ * Guide-only Candidate journey seed. It deliberately has no Transfer or
+ * Checkup backlog: after the one real Board projection, the Guide teaches
+ * those production stations in the main-chat sequence.
+ */
 export const GUIDE_BOARD_CANDIDATE_DEMO: GuideBoardDemo = {
   blocking: true,
   interactive: true,
@@ -143,7 +147,11 @@ function withCounts(snapshot: GuideBoardDemoSnapshot): GuideBoardDemoSnapshot {
   }
 }
 
-
+/**
+ * Tutorial-only in-memory backend for the real Board controls. The production
+ * components still issue their normal HTTP requests; the Guide fetch shim
+ * routes only its declared fixtures here and never reaches participant data.
+ */
 export function createGuideBoardDemoController(initial: GuideBoardDemo): GuideBoardDemoController {
   let current = withCounts(cloneDemo(initial))
   const listeners = new Set<(snapshot: GuideBoardDemoSnapshot) => void>()

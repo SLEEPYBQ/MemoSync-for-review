@@ -1,5 +1,21 @@
-import { PREVIEW_PROXY_PATH_PREFIX, previewProxyPath } from "../shared/preview-proxy"
+import { PREVIEW_COOKIE_NAME, PREVIEW_PROXY_PATH_PREFIX, previewProxyPath } from "../shared/preview-proxy"
+import { SESSION_COOKIE_NAME } from "./auth"
 
+// Dev-server preview proxy. In Docker, an agent can start a server on ANY
+// container port (8901, 5000, …) — publishing port ranges can never cover
+// that, so the app server itself proxies to 127.0.0.1:<targetPort>.
+//
+// A browser on the Docker host uses http://<targetPort>.localhost:<appPort>.
+// A browser reaching MemoSync through Cloudflare / SSH cannot use localhost
+// (that would be the participant's computer), so it uses the same app origin:
+//   /__memosync/preview/<targetPort>/...
+// Text responses on the path form adapt URL-bearing syntax so root-relative
+// assets and module imports remain inside that prefix. Ordinary JavaScript
+// strings are deliberately left untouched.
+//
+// WebSocket upgrades are not passed through. Vite's HMR client is replaced by
+// a small compatibility module, making manual Browser Refresh the explicit
+// update mode while preserving normal module and CSS rendering.
 
 const HOST_PATTERN = /^(\d{1,5})\.localhost(?::\d+)?$/i
 const PATH_PATTERN = new RegExp(`^${PREVIEW_PROXY_PATH_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/(\\d{1,5})(?:/|$)`)
@@ -22,14 +38,15 @@ export function isPathPreviewProxyRequest(req: Request, targetPort: number) {
   return isPathProxyRequest(new URL(req.url), targetPort)
 }
 
-function stripPathProxyPrefix(pathname: string, targetPort: number) {
+export function stripPathProxyPrefix(pathname: string, targetPort: number) {
   const base = pathProxyBase(targetPort)
   if (pathname === base.slice(0, -1)) return "/"
   const stripped = pathname.slice(base.length - 1)
   return stripped.startsWith("/") ? stripped : `/${stripped}`
 }
 
-
+/** The target port encoded in the request's Host, or null when this is not a
+ * preview-proxy request. `selfPort` guards against proxying to ourselves. */
 export function previewProxyTarget(req: Request, selfPort: number): number | null {
   const host = req.headers.get("host") ?? ""
   const match = host.match(HOST_PATTERN)
@@ -44,12 +61,27 @@ export function previewProxyTarget(req: Request, selfPort: number): number | nul
   return validTargetPort(port, selfPort) ? port : null
 }
 
+// Executable preview content must never be canonicalized onto the app origin:
+// the previous redirect let preview scripts call authenticated MemoSync APIs.
+// Isolated preview hosts carry their own memosync_preview credential instead.
 
+/** Build the client-facing proxy origin for a target port (used in tests;
+ * the client derives it from window.location at runtime). */
 export function previewProxyOrigin(targetPort: number, appHostWithPort: string): string {
   return `http://${targetPort}.localhost${appHostWithPort.includes(":") ? `:${appHostWithPort.split(":")[1]}` : ""}`
 }
 
 const HOP_BY_HOP = ["connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-authenticate", "proxy-authorization", "te", "trailer"]
+
+const RESERVED_COOKIE_NAMES = new Set([SESSION_COOKIE_NAME, PREVIEW_COOKIE_NAME])
+
+/** Reserved MemoSync auth cookies must never reach the upstream project
+ * server, and upstream responses must not plant or overwrite them on the
+ * preview origin. */
+function isReservedCookie(cookie: string) {
+  const separator = cookie.indexOf("=")
+  return separator >= 0 && RESERVED_COOKIE_NAMES.has(cookie.slice(0, separator).trim())
+}
 
 function rootRelativeUrl(url: string, targetPort: number) {
   const base = pathProxyBase(targetPort)
@@ -80,7 +112,8 @@ function rewriteJavaScriptUrls(body: string, targetPort: number, upstreamPathnam
   const routerIdentifiers = browserRouterIdentifiers(body)
   let rewritten = rewriteTargetOrigin(body, targetPort)
 
-
+  // Only ECMAScript module specifiers are rewritten. The old implementation
+  // changed every quoted root-relative string, including Router defaults.
   rewritten = rewritten.replace(
     /(\b(?:from|import)\s*(?:\(\s*)?)(["'])(\/(?!\/|__memosync\/preview\/)[^"'\r\n]*)(\2)/g,
     (_match, prefix: string, quote: string, url: string) => `${prefix}${quote}${rootRelativeUrl(url, targetPort)}${quote}`,
@@ -90,13 +123,14 @@ function rewriteJavaScriptUrls(body: string, targetPort: number, upstreamPathnam
     (_match, prefix: string, quote: string, url: string) => `${prefix}${quote}${rootRelativeUrl(url, targetPort)}${quote}`,
   )
 
-
+  // Vite turns imported static assets into tiny URL modules.
   rewritten = rewritten.replace(
     /(\bexport\s+default\s+)(["'])(\/(?!\/|__memosync\/preview\/)[^"'\r\n]*)(\2)/g,
     (_match, prefix: string, quote: string, url: string) => `${prefix}${quote}${rootRelativeUrl(url, targetPort)}${quote}`,
   )
 
-
+  // BrowserRouter must know the public mount point. Adapt the application call
+  // site rather than changing its route literals or dependency source.
   if (!upstreamPathname.includes("/node_modules/") && !upstreamPathname.startsWith("/@")) {
     for (const identifier of routerIdentifiers) {
       const escapedIdentifier = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
@@ -269,8 +303,11 @@ function rewritePathProxyText(body: string, targetPort: number, contentType: str
     } else {
       rewritten = `${headContent}${rewritten}`
     }
-
-
+    // Keep anchor href values untouched until hydration. Rewriting those in
+    // server HTML makes frameworks such as Next compare a prefixed server href
+    // with their original client prop. The capture listener above protects a
+    // native anchor navigation; URL-bearing asset/form attributes are safe to
+    // adapt before the framework starts.
     rewritten = rewritten.replace(
       /(\b(?:src|action|poster)\s*=\s*["'])\/(?!\/|__memosync\/preview\/)/gi,
       `$1${base}`,
@@ -312,8 +349,13 @@ export async function proxyPreviewRequest(
   const pathProxy = isPathProxyRequest(url, targetPort)
   const upstreamPathname = pathProxy ? stripPathProxyPrefix(url.pathname, targetPort) : url.pathname
   const headers = new Headers(req.headers)
+  const projectCookies = (headers.get("cookie") ?? "").split(";")
+    .filter((cookie) => cookie.trim() && !isReservedCookie(cookie))
+    .join(";").trim()
+  if (projectCookies) headers.set("cookie", projectCookies)
+  else headers.delete("cookie")
   headers.set("host", `localhost:${targetPort}`)
-
+  // fetch decodes the body; forwarding the original encoding headers would lie.
   headers.delete("accept-encoding")
   for (const h of HOP_BY_HOP) headers.delete(h)
   try {
@@ -329,16 +371,22 @@ export async function proxyPreviewRequest(
       signal: upstreamSignal,
     })
     const out = new Headers(res.headers)
-
-
+    out.delete("set-cookie")
+    for (const cookie of res.headers.getSetCookie()) {
+      if (!isReservedCookie(cookie)) out.append("set-cookie", cookie)
+    }
+    // The pane iframes this from another origin — frame-blocking headers from
+    // the dev server would blank it. This is a local dev preview, not a
+    // hosting surface.
     out.delete("x-frame-options")
     out.delete("content-security-policy")
-
+    // Body arrives decoded/re-chunked from fetch; drop stale envelope headers.
     out.delete("content-encoding")
     out.delete("content-length")
     for (const h of HOP_BY_HOP) out.delete(h)
-
-
+    // A dev server redirecting to its own absolute localhost URL would escape
+    // the proxy — rewrite to origin-relative so the browser stays on the
+    // proxy origin.
     const location = out.get("location")
     if (location) {
       if (pathProxy) {

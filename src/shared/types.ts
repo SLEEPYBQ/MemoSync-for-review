@@ -1,7 +1,7 @@
 export const STORE_VERSION = 2 as const
 export const PROTOCOL_VERSION = 1 as const
 
-export type AgentProvider = "claude" | "codex"
+export type AgentProvider = "claude" | "codex" | "pi"
 export type LlmProviderKind = "openai" | "openrouter" | "custom"
 export type AppThemePreference = "light" | "dark" | "system"
 export type ChatSoundPreference = "never" | "unfocused" | "always"
@@ -86,6 +86,7 @@ export interface StandaloneTranscriptBundle {
   theme: StandaloneTranscriptTheme
   attachmentMode: StandaloneTranscriptAttachmentMode
   messages: TranscriptEntry[]
+  textAttachmentPreviews?: Record<string, { content: string; truncated: boolean }>
 }
 
 export interface StandaloneTranscriptExportResult {
@@ -124,8 +125,9 @@ export interface ProviderModelOption {
   aliases?: readonly string[]
   contextWindowOptions?: readonly ProviderContextWindowOption[]
   supportsMaxReasoningEffort?: boolean
-
-
+  /** Vendor shown on the composer's provider chip when this model is picked
+   * (the Claude-engine catalog now spans vendors: DeepSeek + GLM). Absent =
+   * the provider's own label. */
   vendor?: string
 }
 
@@ -139,7 +141,7 @@ export interface ProviderContextWindowOption {
   label: string
 }
 
-
+// DeepSeek thinking only distinguishes high and max — no lower tiers.
 export const CLAUDE_REASONING_OPTIONS = [
   { id: "high", label: "High" },
   { id: "max", label: "Max" },
@@ -153,8 +155,20 @@ export const CODEX_REASONING_OPTIONS = [
   { id: "xhigh", label: "XHigh" },
 ] as const satisfies readonly ProviderEffortOption[]
 
+export const PI_REASONING_OPTIONS = [
+  { id: "default", label: "Provider default" },
+  { id: "off", label: "Off" },
+  { id: "minimal", label: "Minimal" },
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium" },
+  { id: "high", label: "High" },
+  { id: "xhigh", label: "Extra High" },
+  { id: "max", label: "Max" },
+] as const satisfies readonly ProviderEffortOption[]
+
 export type ClaudeReasoningEffort = (typeof CLAUDE_REASONING_OPTIONS)[number]["id"]
 export type CodexReasoningEffort = (typeof CODEX_REASONING_OPTIONS)[number]["id"]
+export type PiReasoningEffort = (typeof PI_REASONING_OPTIONS)[number]["id"]
 export type ClaudeContextWindow = "200k" | "1m"
 export type ServiceTier = "fast"
 
@@ -168,9 +182,14 @@ export interface CodexModelOptions {
   fastMode: boolean
 }
 
+export interface PiModelOptions {
+  reasoningEffort: PiReasoningEffort
+}
+
 export interface ProviderModelOptionsByProvider {
   claude: ClaudeModelOptions
   codex: CodexModelOptions
+  pi: PiModelOptions
 }
 
 export interface ProviderPreference<TModelOptions> {
@@ -182,6 +201,7 @@ export interface ProviderPreference<TModelOptions> {
 export type ChatProviderPreferences = {
   claude: ProviderPreference<ClaudeModelOptions>
   codex: ProviderPreference<CodexModelOptions>
+  pi: ProviderPreference<PiModelOptions>
 }
 
 export type ModelOptions = Partial<{
@@ -190,8 +210,9 @@ export type ModelOptions = Partial<{
 
 export const DEFAULT_CLAUDE_MODEL_OPTIONS = {
   reasoningEffort: "high",
-
-
+  // DeepSeek V4 models carry a 1M-token context window (docs.deepseek.com);
+  // "200k" only applies to real Anthropic models, which this catalog no
+  // longer lists directly.
   contextWindow: "1m",
 } as const satisfies ClaudeModelOptions
 
@@ -200,12 +221,34 @@ export const DEFAULT_CODEX_MODEL_OPTIONS = {
   fastMode: false,
 } as const satisfies CodexModelOptions
 
+// Pi runs in-process against the Model Registry, so any non-empty registry
+// model id is a valid choice; the catalog entries are only suggestions.
+export const DEFAULT_PI_MODEL = "anthropic/claude-sonnet-4-6"
+
+export const DEFAULT_PI_MODEL_OPTIONS = {
+  reasoningEffort: "medium",
+} as const satisfies PiModelOptions
+
 export function isClaudeReasoningEffort(value: unknown): value is ClaudeReasoningEffort {
   return CLAUDE_REASONING_OPTIONS.some((option) => option.id === value)
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
   return CODEX_REASONING_OPTIONS.some((option) => option.id === value)
+}
+
+export function isPiReasoningEffort(value: unknown): value is PiReasoningEffort {
+  return PI_REASONING_OPTIONS.some((option) => option.id === value)
+}
+
+export function normalizePiReasoningEffort(effort?: unknown): PiReasoningEffort {
+  return isPiReasoningEffort(effort) ? effort : DEFAULT_PI_MODEL_OPTIONS.reasoningEffort
+}
+
+export function normalizePiModelOptions(options?: Partial<PiModelOptions> | null): PiModelOptions {
+  return {
+    reasoningEffort: normalizePiReasoningEffort(options?.reasoningEffort),
+  }
 }
 
 export const CLAUDE_CONTEXT_WINDOW_OPTIONS = [
@@ -265,8 +308,9 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
         supportsMaxReasoningEffort: true,
       },
       {
-
-
+        // GLM-5.3-Flash ("牛来", 智谱 2026-08-26): 1M-native multimodal, routed
+        // per-chat to its own endpoint+key (see server/chat-providers.ts).
+        // Memory branches inherit the same provider as the main session.
         id: "glm-5.3-flash",
         label: "GLM-5.3 Flash",
         supportsEffort: true,
@@ -307,6 +351,23 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
     ],
     efforts: [],
   },
+  {
+    // Pi (pi-coding-agent) runs in-process against the Model Registry.
+    // Any registry model id remains valid (see normalizePiModelId) — these
+    // entries are picker suggestions only.
+    id: "pi",
+    label: "Pi",
+    defaultModel: DEFAULT_PI_MODEL,
+    defaultEffort: "medium",
+    supportsPlanMode: false,
+    models: [
+      { id: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet", supportsEffort: true },
+      { id: "anthropic/claude-opus-4-8", label: "Claude Opus", supportsEffort: true },
+      { id: "openai/gpt-5.5", label: "GPT-5.5", supportsEffort: true },
+      { id: "google/gemini-3-flash", label: "Gemini Flash", supportsEffort: true },
+    ],
+    efforts: [...PI_REASONING_OPTIONS],
+  },
 ]
 
 export function getProviderCatalog(provider: AgentProvider): ProviderCatalogEntry {
@@ -340,9 +401,15 @@ export function normalizeClaudeModelId(modelId?: string, fallbackModelId = DEFAU
 }
 
 export function normalizeCodexModelId(modelId?: string, fallbackModelId = "gpt-5.5"): string {
-
-
+  // Custom Responses providers supply their model catalog at runtime. Preserve
+  // those IDs in preferences; the server validates them against its catalog.
   return getProviderModelMatch("codex", modelId)?.id ?? (modelId?.trim() || fallbackModelId)
+}
+
+// Pi accepts any non-empty Model Registry model id verbatim — the catalog is
+// only suggestions, never a clamp.
+export function normalizePiModelId(modelId?: string, fallbackModelId = DEFAULT_PI_MODEL): string {
+  return getProviderModelMatch("pi", modelId)?.id ?? (modelId?.trim() || fallbackModelId)
 }
 
 export function getProviderModelOption(provider: AgentProvider, modelId: string): ProviderModelOption | undefined {
@@ -365,16 +432,17 @@ export function getClaudeContextWindowOptions(modelId: string): readonly Provide
 export function normalizeClaudeContextWindow(modelId: string, contextWindow?: unknown): ClaudeContextWindow {
   const options = getClaudeContextWindowOptions(modelId)
   if (options.length === 0) return DEFAULT_CLAUDE_MODEL_OPTIONS.contextWindow
-
-
+  // Fall back to the MODEL's first option, not the global default — a stored
+  // "200k" from before the catalog carried real windows must coerce to what
+  // the model actually has.
   return options.some((option) => option.id === contextWindow)
     ? contextWindow as ClaudeContextWindow
     : options[0].id
 }
 
 export function resolveClaudeApiModelId(modelId: string, contextWindow?: ClaudeContextWindow): string {
-
-
+  // Catalog vendors (DeepSeek, GLM) keep their bare id; the server decides
+  // per-vendor whether the `[1m]` selector applies (buildClaudeSdkRuntimeOptions).
   if (modelId.startsWith("deepseek-") || modelId.startsWith("glm-")) return modelId
   return contextWindow === "1m" ? `${modelId}[1m]` : modelId
 }
@@ -392,7 +460,7 @@ export function resolveClaudeContextWindowTokens(contextWindow: ClaudeContextWin
 export type ChatActivityStatus =
   | "idle"
   | "starting"
-
+  /** The pre-turn memory-preview LLM pass is in flight (memosync arm). */
   | "previewing_memory"
   | "running"
   | "waiting_for_user"
@@ -454,11 +522,11 @@ export interface LocalProjectsSnapshot {
   projects: LocalProjectSummary[]
 }
 
-
+/** Memory-preview gate behavior (STUDY_PLAN §2.4 — a system setting, not a study manipulation). */
 export interface MemoryPreviewSettings {
-
+  /** Master switch for the per-turn preview gate. */
   enabled: boolean
-
+  /** Auto-proceed (logged as an automatic go_on) when the plan involves no memories. */
   autoProceedWhenEmpty: boolean
 }
 
@@ -493,6 +561,7 @@ export interface AppSettingsPatch {
   providerDefaults?: {
     claude?: Partial<ProviderPreference<ClaudeModelOptions>>
     codex?: Partial<ProviderPreference<CodexModelOptions>>
+    pi?: Partial<ProviderPreference<PiModelOptions>>
   }
   memoryPreview?: Partial<MemoryPreviewSettings>
 }
@@ -507,7 +576,7 @@ export interface LlmProviderFile {
 export interface LlmProviderSnapshot {
   provider: LlmProviderKind
   apiKey: string
-
+  /** Public settings responses mask apiKey and expose only this presence bit. */
   hasApiKey?: boolean
   model: string
   baseUrl: string
@@ -706,7 +775,7 @@ export interface ToolResultEntry extends TranscriptEntryBase {
 export interface UserPromptEntry extends TranscriptEntryBase {
   kind: "user_prompt"
   content: string
-
+  /** Exact participant-authored text when `content` carries a provider wrapper. */
   participantContent?: string
   attachments?: ChatAttachment[]
   steered?: boolean
@@ -943,22 +1012,30 @@ export interface ContextClearedEntry extends TranscriptEntryBase {
 
 export interface InterruptedEntry extends TranscriptEntryBase {
   kind: "interrupted"
-
-
+  /** Durable tombstone for an Auto queue row stopped before delivery. Internal
+   * queue recovery metadata; omitted from ordinary active-turn interruptions. */
   cancelledQueuedMessageId?: string
 }
 
-
+/** One memory candidate surfaced by the forced capture hook (MemoSync SPEC §4.1). */
 export interface MemoryCandidateSnapshot {
   id: string
-
-
+  /** True when this card RE-SURFACES an earlier, still-unreviewed proposal
+   * (a re-proposal collapsed into it) — the card says so instead of
+   * pretending to be new. */
   resurfaced?: boolean
-
-
+  /**
+   * True when delegating/Auto mode applied this proposal without asking.
+   * The card then shows an "auto" badge + one-click Revert instead of the
+   * Accept/Dismiss pair — control moved to the agent, monitoring stayed on.
+   */
   auto?: boolean
-
-
+  /**
+   * Candidate content is resolved from the memory database at render time.
+   * These optional fields only keep older transcript rows readable; new rows
+   * deliberately persist the id alone so rejected secrets are not duplicated
+   * into append-only chat history.
+   */
   content?: string
   detail?: string
   type?: string
@@ -968,14 +1045,14 @@ export interface MemoryCandidateSnapshot {
   sensitive?: boolean
 }
 
-
+/** Review cards for capture-surfaced memory candidates, appended after a turn. */
 export interface MemoryCandidatesEntry extends TranscriptEntryBase {
   kind: "memory_candidates"
   candidates: MemoryCandidateSnapshot[]
   turn?: number
 }
 
-
+/** Post-turn audit (4.2.4 Auditing Memory Use): each in-play memory labeled by the audit pass. */
 export interface MemoryTraceEntry extends TranscriptEntryBase {
   kind: "memory_trace"
   labels: Array<{
@@ -983,137 +1060,168 @@ export interface MemoryTraceEntry extends TranscriptEntryBase {
     label: "operational" | "injected_without_effect" | "violated" | "not_applicable"
     note?: string
     quote?: string
-
+    /** Validated current-turn tool call/result that supplies the audit evidence. */
     toolId?: string
-
+    /** Not-applicable only: the absent object/opportunity the audit named. */
     missing?: string
-
+    /** Violated only: whether the violation visibly hurt the outcome. */
     impact?: "negative" | "none"
-
+    /** Violated only: what the audit diagnosed — drives the two follow-up actions. */
     cause?: "not_followed" | "memory_conflict"
-
+    /** True when the reply itself cited this id inline (self-report); absent = the audit found it post hoc. */
     cited?: boolean
   }>
-
-
+  /** Terminal state for the post-turn pass. "pending" = the audit is still
+   * running (skeleton entry, superseded by the final entry for the same turn).
+   * "empty" = no memory was in play this turn, so there was nothing to audit
+   * (explicit terminal so the record settles instead of waiting forever). */
   status?: "ok" | "failed" | "discarded" | "pending" | "empty"
-
+  /** Error class only; raw provider messages are kept out of the durable transcript. */
   errorClass?: string
-
+  /** Verdicts intentionally omitted because the underlying memory changed before commit. */
   dropped?: number
-
+  /** One-sentence turn recap with [M-NN] citations for the memories that mattered (timeline anchor). */
   summary?: string
   turn?: number
 }
 
 export type MemoryPreviewDecision = "go_on" | "dismiss" | "without_memory"
 
-
+/**
+ * Per-turn Preview (SPEC §4.10b), appended BEFORE the engine acts: which
+ * memories the turn brings, the expected outcome, and whether they changed the
+ * plan. Pending until a matching MemoryPreviewDecisionEntry is appended
+ * (append-only log; the hydrated message folds the decision in).
+ */
+/**
+ * A maintenance signal riding the gate — at most one per preview, visually
+ * secondary. conflict = superseded by a newer memory; revision = a drafted
+ * replacement is waiting for a decision; stale = 过期, no reference for
+ * `sessionsQuiet` prior sessions (paper's "three commits", session units).
+ */
 export interface PreviewAttention {
   kind: "conflict" | "revision" | "redundant" | "stale" | "promotion"
   memoryId: string
   content: string
   proposalId?: string
   sessionsQuiet?: number
-
+  /** 'redundant' only: the other half of the near-duplicate pair. */
   otherMemoryId?: string
   otherContent?: string
-
+  /** 'promotion' only: the wider scope this memory has earned. */
   promoteTo?: "project" | "personal"
-
+  /** 'promotion' only: uses + re-observations backing the suggestion. */
   evidenceCount?: number
 }
 
-
+/**
+ * The injection receipt: exactly which memories this turn carries, straight
+ * from the injection plan — nothing predicted, nothing judged.
+ */
 export interface MemoryPreviewEntry extends TranscriptEntryBase {
   kind: "memory_preview"
   previewId: string
-
+  /** Formal-study task that owned this preview; durable late-evidence lineage. */
   taskId?: string
   turn?: number
-
+  /** User task used by the turn-scoped Use Planner. */
   task?: string
   memories: Array<{ id: string; content: string; scope: string }>
-
+  /** Injected items landed by THIS turn's transfer stage (incl. reinforce-merges). */
   transferredIds?: string[]
-
+  /** Back-compat single item (first of `attentions`). */
   attention?: PreviewAttention
-
+  /** EVERY open attention item, priority-ordered (user decision 2026-08-05). */
   attentions?: PreviewAttention[]
-
-
+  /** True when a relevance prediction was kicked off for this preview — the
+   * gate card shows a "picking likely-relevant…" state until the
+   * memory_preview_relevance entry lands (possibly with an empty list). */
   relevancePending?: boolean
-
-
+  /** Redesign 2026-08-07: ids the user marked "pay attention" on a previous
+   * audit — they seed the injected list with their own source label. */
   attentionIds?: string[]
 }
 
-
+/** A turn-scoped instruction that is both reviewed in the UI and injected. */
 export interface ExpectedMemoryUse {
   id: string
   expectedUse: string
 }
 
-
+/**
+ * The user's go-on / dismiss / proceed-without-memory decision for a preview.
+ * "expired" is system-recorded, never user-requested: a parked gate lost to a
+ * server restart resolves as expired when the user tries to decide it.
+ */
 export interface MemoryPreviewDecisionEntry extends TranscriptEntryBase {
   kind: "memory_preview_decision"
   previewId: string
   decision: MemoryPreviewDecision | "expired"
-
+  /** True when the system auto-proceeded (empty injected set + setting on). */
   auto?: boolean
-
+  /** Present when the user EDITED the gate: only these ids injected this turn. */
   selectedIds?: string[]
-
+  /** Exact turn-scoped instructions shown in the UI and sent to Claude. */
   expectedUses?: ExpectedMemoryUse[]
 }
 
-
+/**
+ * Per-memory interrupt (2026-08-19 C1/C2): the participant stopped the turn
+ * because they identified a problem involving one working-memory item. Appended right after the
+ * cancellation; the client renders it as the inline recovery card. Pending
+ * until a matching MemoryInterruptResolutionEntry is appended.
+ */
 export interface MemoryInterruptEntry extends TranscriptEntryBase {
   kind: "memory_interrupt"
   interruptId: string
-
+  /** The memory the participant flagged by clicking its citation chip. */
   memoryId: string
-
+  /** The streamed sentence the participant stopped at — the recovery card's anchor quote. */
   quote?: string
-
+  /** The interrupted turn's original user prompt; resume re-dispatches it. */
   prompt: string
-
+  /** The interrupted turn's working memory, with per-item cited-so-far state in first-mention order. */
   workingSet: Array<{ id: string; cited: boolean }>
   turn?: number
 }
 
-
+/** The participant's recovery decision for one interrupt. */
 export interface MemoryInterruptResolutionEntry extends TranscriptEntryBase {
   kind: "memory_interrupt_resolution"
   interruptId: string
-
+  /** Participant-authored, turn-local correction sent with the resumed run. */
   correction?: string
-
+  /** Read compatibility for transcripts written before recovery used one composer. */
   action?: "content_fixed" | "usage_correction" | "removed_only"
-
+  /** The working-memory ids the resumed turn actually carries. */
   selectedIds: string[]
-
+  /** The flagged memory was hard-locked into this resumed run only. */
   enforced?: boolean
 }
 
-
+/**
+ * The sidecar relevance PREDICTION for a preview (REDESIGN D6) — appended
+ * when the LLM pass lands (usually ~1-2s after the receipt). A model guess,
+ * never a system fact: the card renders it as "likely relevant", visually
+ * apart from the injected/cited facts.
+ */
 export interface MemoryPreviewRelevanceEntry extends TranscriptEntryBase {
   kind: "memory_preview_relevance"
   previewId: string
-
+  /** Preview regeneration number; omitted by older transcripts (= 0). */
   revision?: number
   relevant: Array<{ id: string; why: string }>
-
+  /** Use Planner output for the initially selected relevant/attention items. */
   expectedUses?: ExpectedMemoryUse[]
-
+  /** A failed selection is distinct from a successful empty selection. */
   error?: string
 }
 
-
+/** Replaces a parked preview's contents after an earlier review is reopened. */
 export interface MemoryPreviewUpdateEntry extends TranscriptEntryBase {
   kind: "memory_preview_update"
   previewId: string
-
+  /** Formal-study task that owned this regenerated preview revision. */
   taskId?: string
   revision: number
   memories: Array<{ id: string; content: string; scope: string }>
@@ -1121,33 +1229,46 @@ export interface MemoryPreviewUpdateEntry extends TranscriptEntryBase {
   attentionIds?: string[]
 }
 
-
+/**
+ * Step-one container 1 (redesign 2026-08-07 §3): this conversation's pending
+ * proposed memory changes — last turn's captures plus the fresh prompt parse —
+ * parked at the turn's start for review BEFORE the agent boots. Candidate
+ * content resolves from the memory DB at render time (id-only persistence,
+ * same discipline as MemoryCandidatesEntry).
+ */
 export interface MemoryProposalsEntry extends TranscriptEntryBase {
   kind: "memory_proposals"
   proposalsId: string
-
+  /** Durable opening-Board claim that owns this otherwise ordinary gate. */
   openingReviewId?: string
   turn?: number
-
+  /** True while the prompt-side capture pass is still running. */
   pending?: boolean
   candidates: MemoryCandidateSnapshot[]
 }
 
-
+/** Settles the Step 1 skeleton with the candidate ids found by the pass. */
 export interface MemoryProposalsResultEntry extends TranscriptEntryBase {
   kind: "memory_proposals_result"
   proposalsId: string
   candidates: MemoryCandidateSnapshot[]
 }
 
-
+/**
+ * Settles a memory_proposals gate. "reviewed" = the user worked the container
+ * and continued; "skipped" = the user explicitly skipped; "cancelled" = Stop
+ * killed the turn while parked; "expired" = system-recorded for a gate lost
+ * to a server restart (never a user choice); "empty" = system-recorded, the
+ * step ran and found nothing to review (the card renders as one quiet line
+ * so the user still SEES that Step 1 happened).
+ */
 export interface MemoryProposalsDecisionEntry extends TranscriptEntryBase {
   kind: "memory_proposals_decision"
   proposalsId: string
   decision: "reviewed" | "skipped" | "cancelled" | "expired" | "empty"
 }
 
-
+/** One checkup suggestion as persisted on the transcript (content resolves from the DB at render). */
 export type MemoryCheckupKind = "conflict" | "redundancy" | "staleness"
 
 export interface MemoryCheckupSuggestionSnapshot {
@@ -1158,7 +1279,12 @@ export interface MemoryCheckupSuggestionSnapshot {
   reason: string
 }
 
-
+/**
+ * Step-one container 2 (redesign 2026-08-07 §3): the library checkup.
+ * Appended with `pending: true` while the four queries run (the container
+ * renders as a skeleton with status words); the matching result entry
+ * settles it.
+ */
 export interface MemoryCheckupEntry extends TranscriptEntryBase {
   kind: "memory_checkup"
   checkupId: string
@@ -1171,70 +1297,91 @@ export interface MemoryCheckupResultEntry extends TranscriptEntryBase {
   kind: "memory_checkup_result"
   checkupId: string
   suggestions: MemoryCheckupSuggestionSnapshot[]
-
+  /** Absent on historical and complete results; present when sidecar lanes failed. */
   failedKinds?: MemoryCheckupKind[]
 }
 
-
+/**
+ * Settles a checkup gate (same vocabulary as the proposals gate). "empty" =
+ * every requested check completed and found nothing to review. "failed" =
+ * one or more checks did not complete and no suggestion gate was needed.
+ * Both are system-recorded because an undecided memory step is an open gate
+ * to the client and would suppress the streaming footer for the whole turn.
+ */
 export interface MemoryCheckupDecisionEntry extends TranscriptEntryBase {
   kind: "memory_checkup_decision"
   checkupId: string
   decision: "handled" | "skipped" | "cancelled" | "expired" | "empty" | "failed"
 }
 
-
+/**
+ * One Transfer suggestion snapshot: source identity/version, a reusable
+ * source-prepared rule, and this prompt's task-local materialization. The
+ * transcript persists the review evidence verbatim until the user acts.
+ */
 export interface MemoryTransferSuggestionSnapshot {
   sourceId: string
   sourceContent: string
   sourceScope: "personal" | "project" | "session"
-
+  /** CAS guard: accept only applies while the live source still matches. */
   sourceVersion: number
-
+  /** First-segment label: a project title, or the conversation shelf. */
   sourceLabel: string
-
-
+  /** @deprecated Historical transcript compatibility only. New Transfer
+   * suggestions never set this field, and the client renders `true` rows as
+   * passive retired receipts with no scope-changing action. */
   widening?: boolean
-
-
+  /** Legacy (pre-2026-08-09): the detector's justification — no longer
+   * produced or rendered; old transcripts still carry it. */
   reason?: string
-
-
+  /** The middle representation (metadata, never a standalone memory item).
+   * Absent while the live search is still encoding this row — the card shows
+   * the shared scan skeleton in its place. */
   rule?: string
   applicability?: string
-
+  /** Source values the encoder stripped as source-local (chipped on the card). */
   stripped?: string[]
-
-
+  /** The localized form, editable before accepting. Absent while the live
+   * search is still decoding this row. */
   content?: string
-
+  /** Content values the decoder bound from the target/task (chipped on the card). */
   bound?: string[]
   detail?: string
   abstractionLevel?: "concrete" | "contextual" | "general"
-
+  /** Preset for the card's landing ScopeControl. */
   suggestedScope?: "personal" | "project" | "session"
   landing?: {
     route: "new" | "reinforces" | "conflicts"
     targetId?: string
     targetContent?: string
-
+    /** Automatic-card CAS for the target snapshot used by Decode. */
     targetVersion?: number
   }
   note?: string
 }
 
-
+/**
+ * The Transfer card (Transfer design 2026-08-08): between Step 1 and Step 2 —
+ * memories from OUTSIDE this conversation's context worth bringing in. A
+ * turn-end source preparation never publishes a card by itself; every prompt
+ * runs fresh relevance and current-task materialization first.
+ */
 export interface MemoryTransferEntry extends TranscriptEntryBase {
   kind: "memory_transfer"
   transferId: string
   openingReviewId?: string
   turn?: number
-
-
+  /** True while a live cold-start detection is still running (the card
+   * renders as a scan skeleton); the matching result entry settles it. */
   pending?: boolean
   suggestions: MemoryTransferSuggestionSnapshot[]
 }
 
-
+/**
+ * Streams a live detection into the card: each entry carries the cumulative
+ * suggestions materialized so far; `done` marks the final one (the pending
+ * scan state clears only then).
+ */
 export interface MemoryTransferResultEntry extends TranscriptEntryBase {
   kind: "memory_transfer_result"
   transferId: string
@@ -1242,25 +1389,32 @@ export interface MemoryTransferResultEntry extends TranscriptEntryBase {
   done?: boolean
 }
 
-
+/**
+ * Settles a Transfer card. "empty" is system-recorded: a VISIBLE live search
+ * ran and found nothing — the skeleton settles into one quiet line. A search
+ * that finishes empty before its shell becomes visible publishes no card.
+ */
 export interface MemoryTransferDecisionEntry extends TranscriptEntryBase {
   kind: "memory_transfer_decision"
   transferId: string
   decision: "handled" | "skipped" | "cancelled" | "expired" | "empty"
 }
 
-
+/**
+ * Append-only reset marker for returning to Step 1 or Step 2 before the agent
+ * starts. The parser clears the selected step and every dependent result.
+ */
 export interface MemoryPreparationResetEntry extends TranscriptEntryBase {
   kind: "memory_preparation_reset"
-
+  /** Durable opening preparation lineage; absent for ordinary in-chat Review again. */
   openingReviewId?: string
-
+  /** Present after the injected-set preview exists; absent when Step 1 is reopened from Step 2. */
   previewId?: string
   revision: number
   from: "proposals" | "checkup" | "transfer"
   proposalsId?: string
   transferId?: string
-
+  /** Absent when Step 1 is reopened before any checkup exists (mid-transfer). */
   checkupId?: string
 }
 
@@ -1434,8 +1588,12 @@ export interface ChatRuntime {
   provider: AgentProvider | null
   planMode: boolean
   sessionToken: string | null
-
-
+  /**
+   * The in-flight assistant reply, accumulated from engine text deltas while
+   * the turn runs. Presentation-only: never persisted — the transcript gets
+   * the final assistant_text entry and this resets to null in the same
+   * broadcast, so a snapshot never shows both.
+   */
   streamingText: string | null
 }
 
@@ -1449,8 +1607,8 @@ export interface ChatSnapshot {
   runtime: ChatRuntime
   queuedMessages: QueuedChatMessage[]
   messages: TranscriptEntry[]
-
-
+  /** Compact, full-history input for the Memory Record. Unlike `messages`,
+   * this is not clipped to the recent-chat window. */
   memoryRecordMessages?: TranscriptEntry[]
   history: ChatHistorySnapshot
   availableProviders: ProviderCatalogEntry[]

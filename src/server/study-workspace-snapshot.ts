@@ -45,7 +45,7 @@ export interface StudyWorkspaceSnapshotMetadata {
     title: string
   }
   frozenAt: string
-
+  /** POSIX path relative to the participant data root, suitable for export. */
   exportedPath: string
   treeHash: string
   fileCount: number
@@ -60,7 +60,7 @@ export interface SnapshotStudyWorkspaceInput {
   snapshotId: string
   project: StudyWorkspaceSnapshotMetadata["project"]
   frozenAt: string
-
+  /** Diagnostic hook used by concurrency tests and optional runtime telemetry. */
   onAttemptCopied?: (attempt: number) => void | Promise<void>
   maxAttempts?: number
 }
@@ -346,7 +346,7 @@ async function describeTree(
   }
 }
 
-
+/** Read-only scoreable workspace state used by the server-owned Finish gate. */
 export async function describeStudyWorkspace(sourceDir: string): Promise<StudyWorkspaceTreeState> {
   const sourceStat = await lstat(sourceDir)
   if (!sourceStat.isDirectory()) throw new Error(`Study project workspace is not a directory: ${sourceDir}`)
@@ -371,7 +371,12 @@ function sameMetadata(
     && actual.exclusions.every((entry, index) => entry === expected.exclusions[index])
 }
 
-
+/**
+ * Verify a snapshot against metadata loaded from the authoritative study
+ * database before copying it to an evaluator or grading it. The manifest
+ * inside the snapshot is not trusted as the authority because a process with
+ * filesystem write access could alter both the tree and that manifest.
+ */
 export async function verifyStudyWorkspaceSnapshot(
   dataDir: string,
   expected: StudyWorkspaceSnapshotMetadata,

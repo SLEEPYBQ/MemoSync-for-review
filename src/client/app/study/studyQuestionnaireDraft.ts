@@ -76,7 +76,8 @@ export function parseStudyQuestionnairePayload(raw: unknown): StudyQuestionnaire
   }
 }
 
-
+/** Questionnaire v2 draft (2026-08-20 ledger §3.3): ordinal ratings plus the
+ * explicit out-of-scale states. There is no not_intended and no Q3 unsure. */
 export interface StudyQuestionnaireDraft {
   probeId: string
   snapshotId: string
@@ -96,17 +97,17 @@ export type StudyQuizQuestionField =
   | "believedScope"
   | "execution"
 
-
+/** Radio fields plus the two conditional free-text follow-ups. */
 export type StudyQuizDraftField = StudyQuizQuestionField | "correctedContent" | "believedContentText"
 
 export function shouldShowStudyQuestion(
   draft: Partial<Pick<StudyQuestionnaireDraft, "desiredRating" | "assessedRating">>,
   field: StudyQuizQuestionField
 ): boolean {
-
+  // Every Q1 rating requires a desired scope; the question waits for a rating.
   if (field === "desiredScope") return draft.desiredRating !== undefined
-
-
+  // Q2 scope applies only when the participant believes something is held
+  // (ratings 2..5); absent (1) and the unknown state have no scope.
   if (field === "believedScope") {
     return typeof draft.assessedRating === "number" && draft.assessedRating >= 2
   }
@@ -118,7 +119,11 @@ function parseOrdinal(value: string): StudyOrdinalRating | null {
   return Number.isInteger(rating) && rating >= 1 && rating <= 5 ? (rating as StudyOrdinalRating) : null
 }
 
-
+/**
+ * One pure reducer for every questionnaire input, shared by the production
+ * quiz page and the Guide practice so their conditional-clearing rules can
+ * never drift apart.
+ */
 export function applyStudyQuestionnaireField(
   draft: StudyQuestionnaireDraft,
   field: StudyQuizDraftField,

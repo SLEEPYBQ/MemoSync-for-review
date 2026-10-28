@@ -1,47 +1,56 @@
-# Memory Branch Execution
+# MemoSync memory branches
 
-Memory reasoning uses the selected coding CLI. Results are reviewed and validated before they affect the memory store or coding turn.
+The MemoSync application uses the selected coding CLI for memory reasoning. It does not require a DeepSeek sidecar key.
 
-## Lifecycle
+## Turn lifecycle
 
-1. C extracts and routes candidates. T analyzes applicability, abstraction, localization, and transfer landing. M checks conflicts, redundancy, and staleness. They start concurrently against the same parent conversation and project snapshot.
-2. Candidate, Transfer, and Change reviews proceed sequentially. Candidate decisions continue T and M; transfer decisions continue M. The existing child conversations return stable-ID proposal deltas. Invalid collection shapes and unknown removal identities are rejected.
-3. Review routes persist approved changes. Version and dependency checks reject obsolete results. W then selects from the updated store and provides an expected-use instruction per selected item. Manual planning and natural-language adjustments continue W.
-4. Confirmed items form the main Memory Block. Claude receives a selected snapshot and later deltas. Codex receives the selected block, expected uses, and enforced items through per-turn developer instructions. Detail tools are restricted to the current confirmed IDs.
-5. A forks the completed main session and audits every injected item against its delivered snapshot and this turn's reply and tool evidence. Verdicts are Shaped, Not applicable, No visible effect, and Violated. Not applicable requires a separate missing-opportunity field. A violation requires cause and impact fields. Invalid or incomplete output remains a failed audit.
-6. Validated tool IDs and quotes support Where used navigation. A violated item can be enforced for the next turn. Interruption and correction preserve the main coding conversation.
+1. `AgentCoordinator` starts C (candidate extraction and routing), T (portable-rule extraction, relevance, localization and landing), and M (conflict, redundancy and staleness) together against the same main-session handle and project snapshot.
+2. The UI presents Candidate, Transfer and Change reviews sequentially. Candidate decisions continue both T and M. Transfer decisions continue M. Follow-ups resume each original child session and merge stable-ID proposal deltas, including accepted edits, discarded candidates, acknowledged relations and declined transfers.
+3. Approved changes are persisted by the existing memory store and review routes. Version and dependency checks reject obsolete results. A separate W conversation selects working memory from the updated store and supplies each item's expected use. Manual planning and natural-language adjustments continue W. Provider failure is displayed as a failed selection with retry controls.
+4. Confirmed memories form the main Memory Block. Claude receives a selected boot snapshot and later deltas; Codex receives the selected block, expected uses and enforced items in per-turn `developer_instructions`. Pi has no developer-instructions channel, so it receives the same block, expected uses and enforced items prepended to the prompt. Detail tools are restricted to that turn's confirmed IDs. Memory reasoning never enters the main transcript.
+5. After successful execution, A forks the completed main session. It audits every injected item against the actual delivered memory snapshot and this turn's reply, tool calls and results. The existing persisted labels map to **Shaped**, **Not applicable**, **No visible effect**, and **Violated**. Malformed or incomplete audit output is a failed audit, not a fabricated verdict. Version checks discard verdicts for memories edited during auditing.
+6. A tool-based verdict may contain a validated `toolId` and quote. **Where used** reveals the virtualized transcript row, expands its tool group and body, and highlights that evidence. The citation parser and citation rendering are unchanged. Enforce-next-turn and interruption/correction work with all normal-deployment engines (Claude, Codex and Pi); controlled-study provider restrictions remain unchanged.
 
-The Memory Board stores item content, scopes, versions, relations, and history. The Memory Record presents per-turn activity. Branch reasoning is not appended to the main coding transcript.
+Read-only branches retain file search and file reading; Claude branches also get bounded read-only shell inspection, while Pi branches expose read-only file tools with no shell at all. They cannot edit the project or commit speculative memory changes. Claude branches load no inherited MCP servers, hooks or plugins. Codex branches read the effective configuration, disable each configured MCP server through per-thread overrides, and disable native subagents and web search; failure to establish these restrictions blocks startup. These overrides do not edit the user's CLI configuration. Cancelling preparation aborts the provider calls and prevents late branch results from advancing a cancelled turn.
 
-## Context and limits
+## Analysis budgets
 
-Claude uses `query()` with `resume` and `forkSession: true`, then resumes the returned child session. Codex forks a thread and continues later requests on that child.
+Each branch request has a 120-second deadline and a bounded allowance. These limits apply to C/T/M/W/A and auxiliary memory analysis, independently of the main coding agent.
 
-Before the first main turn is persisted, there is no session to fork. Initial branches start with empty conversation history, the current task, and project tools. Later branches fork the available parent history. Invalid existing parent handles are reported as errors. Actual provider cache reuse and latency savings are not guaranteed.
-
-Each request has a default 120-second deadline:
-
-| Request | Model turns or visible steps | Read-tool allowance |
+| Request | Model/visible step limit | Read-tool allowance |
 | --- | ---: | ---: |
 | Initial analysis | 6 | 4 |
 | Review or working-memory adjustment | 3 | 1 |
-| One schema correction | 2 | 0 |
+| One schema-only correction | 2 | 0 |
 
-Claude checks its SDK model-turn limit and each read call, including parallel calls. Structured-output completion does not consume the read allowance. Codex counts observable tool calls and completed assistant messages. This does not expose internal model turns or provider retries, and a native command may already have started when its event arrives. Read-only restrictions and the deadline remain active.
+Claude enforces the model-turn limit through SDK `maxTurns` and checks every read call before permission, including parallel calls. Its `StructuredOutput` completion tool does not consume the read allowance. Codex has no native model-turn limit in the app-server interface: MemoSync counts distinct streamed tool calls and completed assistant messages as visible steps, then interrupts and closes on overflow. A native Codex command may already have started when its event arrives, and hidden provider retries are not visible to this counter. The read-only sandbox and deadline remain in force.
 
-One schema-only correction may run in the same child conversation. A second invalid result fails. Cancelling preparation aborts requests and prevents late results from advancing the turn.
+Review messages reuse saved analysis rather than restarting project exploration. Only one schema correction is permitted; a second malformed result fails. Budget or provider failures remain visible instead of producing fabricated empty proposals or audit verdicts. Structured output is checked locally against its JSON schema for every engine. A single unambiguous JSON object can be recovered from surrounding prose or a code fence; multiple competing objects fail. A format failure gets one correction in the same child session with two model turns, no read allowance, and the original deadline. Pi also requests native JSON-schema output when the registry advertises support. Transfer schemas restrict source IDs and versions to their snapshot; an empty source set admits no suggestions. These checks do not guarantee factual correctness of free-text model judgments.
 
-## Isolation
+## Runtime boundary
 
-Branches inspect files and run bounded read-only commands. They cannot edit project files or persist speculative memory changes. Inherited hooks, plugins, external tool servers, and unsupported agent capabilities are restricted at the branch boundary.
+Claude branches use SDK `query({resume, forkSession: true})` once, then `resume` the returned child session. Codex uses `thread/fork` once and subsequent turns on that child. Pi branches run through the in-process `PiAgentManager` (`src/server/pi-agent.ts`): the first ask forks the persisted parent session file via `SessionManager.forkFrom` (or starts empty-history before the first persisted turn), and later asks resume the branch's own session file on read-only built-ins (`read`, `grep`, `find`, `ls`). A returned parent or changed branch token is rejected. All three keep the parent unchanged.
 
-`MEMOSYNC_ISOLATE_CLI=1` creates separate engine profiles. Main sessions and branches use the same selected provider configuration. Credentials remain in the reviewer's local environment and are not inserted into model prompts or source files.
+Before the first main turn, there is no persisted Claude session to fork. Even SDK initialization on an empty asynchronous prompt queue creates no session JSONL. These initial branches start with the same empty history, project tools and new-task input; the `memory.branch` event explicitly records `mode: "empty-history"`. Later branches record `mode: "fork"`. Missing or invalid existing parent handles produce an error rather than silently starting a fresh conversation. No synthetic warm-up turn or fabricated SDK transcript is inserted into the main conversation.
 
-## Offline validation
+Session forking preserves available parent history. Actual prompt-cache reuse and latency depend on provider/runtime behavior and are not guaranteed by this implementation.
+
+## Isolation and verification
+
+`MEMOSYNC_ISOLATE_CLI=1` uses separate app-specific `CLAUDE_CONFIG_DIR` and `CODEX_HOME` directories. Credentials are explicitly supplied to child processes; inherited OAuth/provider settings are removed. The profile must be outside personal Claude/Codex configuration directories. The GLM key stays in the local environment and is never a source-code constant or a model prompt.
 
 ```bash
 bun run check
-bun test src/ --timeout 30000
+bun test
+bun run scripts/smoke-isolated-branches.ts
+bun run scripts/smoke-memosync-pipeline.ts claude
+bun run scripts/smoke-memosync-pipeline.ts codex
 ```
 
-These checks validate types, frontend builds, and behavior through mocked CLI transports without model API calls. See [Development](../README.md#development) for the local development command.
+The transport smoke creates temporary profiles, verifies inherited context and real project reads across three concurrent branches, resumes a review in its original branch, checks W/A, and proves that branch-only review content does not reach the resumed main conversation. The application smoke exercises the real coordinator, memory services and parsers over two turns with a forbidden sidecar caller. It automatically reviews only the temporary test memories. Offline integration tests cover both engines, cancellation, failed selection/retry, audit evidence and interruption/resume.
+
+The audit evidence navigation was also checked in Chromium against the actual virtualized transcript components, including a previously unmounted row inside a collapsed tool group. This verifies navigation behavior, not a redesign of visual styling.
+
+Validation on 2026-09-10: `bun run check` passed; the full suite reported 2,194 passing tests, 4 skipped, and no failures. GLM transport checks passed for both CLI engines. Both two-turn application smokes passed with 10 branch conversations, 6 real forks, and zero sidecar calls per engine; every request used the budgets above. A separate real Codex startup check used a dummy key and no model turn to confirm that a configured MCP server was not started under the branch overrides. Temporary CLI profiles and test projects were removed after verification.
+
+Primary references: [Claude SDK sessions](https://code.claude.com/docs/en/agent-sdk/sessions), [Claude SDK TypeScript options](https://code.claude.com/docs/en/agent-sdk/typescript), [Codex app-server](https://developers.openai.com/codex/app-server/), [Codex configuration](https://learn.chatgpt.com/docs/config-file/config-reference), and [GLM Coding Plan models and endpoints](https://docs.bigmodel.cn/cn/coding-plan/latest-model).

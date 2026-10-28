@@ -4,9 +4,9 @@ import { Loader2 } from "lucide-react"
 import { useConditionPolicyResolved } from "../../lib/conditionApi"
 import { canSkipGuide, completeStudyGuide, markGuideSeen } from "../../lib/guideState"
 import { GuideTour } from "./GuideTour"
-import { buildAutoSteps, buildMemoSyncSteps, buildStaticSteps } from "./guideJourneySteps"
+import { buildMemoSyncSteps } from "./guideJourneySteps"
 
-
+/** MemoSync walkthrough, reachable from the sidebar and study onboarding. */
 export function GuidePage() {
   const navigate = useNavigate()
   const policy = useConditionPolicyResolved()
@@ -30,8 +30,6 @@ export function GuidePage() {
 
   const tour = useMemo(() => {
     if (policy === null) return null
-    if (policy.condition === "auto") return { brandName: "Agent", steps: buildAutoSteps() }
-    if (policy.condition === "static") return { brandName: "Agent", steps: buildStaticSteps() }
     return { brandName: "MemoSync", steps: buildMemoSyncSteps() }
   }, [policy])
 

@@ -99,7 +99,7 @@ Options:
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
-
+  // .env's PORT is the documented override for `bun run start`; --port wins.
   let port = Number(process.env.PORT) || PROD_SERVER_PORT
   let host = "127.0.0.1"
   let openBrowser = true

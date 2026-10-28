@@ -116,6 +116,6 @@ describe('createDeepSeekJsonCaller', () => {
     const err = fakeFetch(() => ({ status: 500, body: { error: 'boom' } }));
     const call = createDeepSeekJsonCaller({ apiKey: 'k', fetchImpl: err.impl, maxRetries: 2, retryDelayMs: 0 })!;
     await expect(call({ system: 's', user: 'u' })).rejects.toThrow();
-    expect(err.calls).toHaveLength(3);
+    expect(err.calls).toHaveLength(3); // 1 + 2 retries
   });
 });

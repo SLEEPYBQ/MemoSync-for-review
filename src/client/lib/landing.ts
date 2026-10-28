@@ -1,5 +1,5 @@
-
-
+// Pure logic for the landing page (LocalDev connected view): which project the
+// composer targets, what the hero headline says, and the memory-card counts.
 import type { MemoryItem } from "./memoriesApi"
 import { isMemoryScope } from "./memoryCitations"
 

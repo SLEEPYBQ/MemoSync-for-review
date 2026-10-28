@@ -1,5 +1,8 @@
-
-
+// Per-item version + usage timeline with rollback (SPEC §4.11, option 乙).
+// Fetches memoriesApi.history(id) and renders one row per event, oldest
+// first (newest last): version events (create/edit/rescope/promote/status/
+// revert) show a before→after diff and a two-step "roll back" action; `use`
+// events are quiet citation rows, grouped and folded by default.
 import { useCallback, useEffect, useState } from "react"
 import { Activity, ChevronDown, ChevronRight, Eye, Flag, Pencil, Plus, RotateCcw, Sparkles, TrendingUp, ArrowLeftRight, CalendarPlus } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
@@ -83,7 +86,10 @@ function ActorChip({ actor }: { actor: EventActor }) {
 
 type TimelineRow = { type: "event"; event: MemoryEvent } | { type: "uses"; key: string; events: MemoryEvent[] }
 
-
+/**
+ * Group consecutive `use`/`trace` events between version events into one
+ * foldable row — both are high-volume per-turn activity, not versions.
+ */
 function buildTimeline(events: MemoryEvent[]): TimelineRow[] {
   const rows: TimelineRow[] = []
   let buffer: MemoryEvent[] = []
@@ -231,7 +237,7 @@ function VersionEventRow({
 
 interface MemoryHistoryPanelProps {
   itemId: string
-
+  /** Called with the memory returned by a successful rollback, so the caller can refresh the item + store. */
   onReverted: (item: MemoryItem) => void
   surface?: MemoryControlSurface
 }

@@ -1,5 +1,5 @@
-
-
+// Model work belongs to a provider conversation branch. These functions only
+// construct prompts and validate proposals; they never call a second model.
 import { CANDIDATE_FIELD_SPEC, validateCandidate, type ValidatedCandidate } from './capture';
 import { coerceTraceOutcome, type TraceInput, type TraceOutcome } from './trace';
 import type { ExpectedMemoryUse } from '../../shared/types';
@@ -105,7 +105,7 @@ export function buildTransferBranchPrompt(input: TransferBranchInput): string {
     `TARGET PROJECT:\n${JSON.stringify({ projectId: input.projectId, projectTitle: input.projectTitle })}`,
     `TARGET STORE:\n${JSON.stringify(input.memories)}`,
     `SOURCE MEMORIES AND PROFILES:\n${JSON.stringify(input.sources)}`,
-    'JSON: {"suggestions":[{"proposalId":"T:M-3","sourceId":"M-3","sourceVersion":1,"encoding":{"rule":"...","portable":true,"applicability":"...","stripped":[],"note":"..."},"decoding":{"content":"...","detail":"...","abstractionLevel":"contextual","suggestedScope":"project","bound":[],"landing":{"route":"new"},"note":"..."}}]}',
+    input.sources.length ? 'JSON: {"suggestions":[{"proposalId":"T:M-3","sourceId":"M-3","sourceVersion":1,"encoding":{"rule":"...","portable":true,"applicability":"...","stripped":[],"note":"..."},"decoding":{"content":"...","detail":"...","abstractionLevel":"contextual","suggestedScope":"project","bound":[],"landing":{"route":"new"},"note":"..."}}]}' : 'There are no source memories. Do not invent sources or carry out the target task. Return exactly {"suggestions":[]}.',
   ].join('\n\n');
 }
 
@@ -273,7 +273,7 @@ export function parseAuditBranchResult(raw: Record<string, unknown>, input: Audi
 
 const UPDATE_KEYS = ['candidates', 'suggestions', 'conflicts', 'redundancy', 'staleness'] as const;
 
-
+/** Stable identities are provider-independent and cannot move a finding to a different pair. */
 function proposalKey(collection: string, value: unknown): string {
   const row = object(value);
   if (!row) throw new MemoryBranchResultError('Invalid branch proposal');
@@ -293,7 +293,7 @@ function proposalKey(collection: string, value: unknown): string {
   return `${collection}:${otherMemoryId ? [memoryId, otherMemoryId].sort().join(':') : memoryId}`;
 }
 
-
+/** Apply a brief branch follow-up without rerunning or losing unaffected proposals. */
 export function mergeMemoryBranchUpdate(previous: Record<string, unknown>, update: Record<string, unknown>): Record<string, unknown> {
   const collections = UPDATE_KEYS.filter((key) => Object.hasOwn(previous, key));
   if (!collections.length || collections.some((key) => !Array.isArray(previous[key]))) {
@@ -303,6 +303,9 @@ export function mergeMemoryBranchUpdate(previous: Record<string, unknown>, updat
   if (!Object.hasOwn(update, 'upsert') && !Object.hasOwn(update, 'remove')) {
     if (Object.keys(update).some((key) => !allowed.has(key)) || collections.some((key) => !Array.isArray(update[key]))) {
       throw new MemoryBranchResultError('Branch replacement must contain every original proposal collection and no unknown keys');
+    }
+    for (const key of collections) {
+      for (const value of update[key] as unknown[]) proposalKey(key, value);
     }
     return update;
   }
@@ -316,18 +319,23 @@ export function mergeMemoryBranchUpdate(previous: Record<string, unknown>, updat
   }
   const result = { ...previous };
   for (const key of collections) {
-    if (!Object.hasOwn(upsert, key) && !Object.hasOwn(remove, key)) continue;
     const old = previous[key];
     const added = Object.hasOwn(upsert, key) ? upsert[key] : [];
     const removed = Object.hasOwn(remove, key) ? remove[key] : [];
     if (!Array.isArray(old) || !Array.isArray(added) || !Array.isArray(removed) || removed.some((id) => typeof id !== 'string' || !id.trim())) {
       throw new MemoryBranchResultError('Malformed memory branch delta');
     }
-    const byId = new Map(old.map((value) => [proposalKey(key, value), value]));
-    if (removed.some((id) => !byId.has(id))) {
+    // An explicitly discarded old transfer may have an invalid source identity.
+    // Only its declared proposalId can identify it for removal, not for upsert.
+    const removalIds = old.map((value) => key === 'suggestions' ? object(value)?.proposalId : proposalKey(key, value));
+    if (removed.some((id) => !removalIds.includes(id))) {
       throw new MemoryBranchResultError('Branch delta references an unknown proposal removal identity');
     }
-    for (const id of removed) byId.delete(id);
+    if (removed.some((id) => removalIds.filter((oldId) => oldId === id).length !== 1)) {
+      throw new MemoryBranchResultError('Branch delta references an ambiguous proposal removal identity');
+    }
+    const survivors = old.filter((_, index) => !removed.includes(removalIds[index]));
+    const byId = new Map(survivors.map((value) => [proposalKey(key, value), value]));
     for (const value of added) byId.set(proposalKey(key, value), value);
     result[key] = [...byId.values()];
   }

@@ -25,8 +25,8 @@ describe("study Memory Board route admission", () => {
       claimed: true,
       reviewId: "opening-review-1",
     })
-
-
+    // boardReview() returns a freshly allocated status object, but React must
+    // not turn that render into another immediate prepare/GET cycle.
     expect(claims.claim(held, undefined, nextReviewId)).toEqual({
       claimed: false,
       reviewId: "opening-review-1",

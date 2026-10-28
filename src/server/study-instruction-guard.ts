@@ -24,7 +24,8 @@ function overlapMetrics(prompt: readonly string[], reference: readonly string[])
     return { longestContiguousRun: 0, lcsLength: 0, lcsRatio: 0 }
   }
 
-
+  // Both DPs retain one reference-sized row. Briefs are short, while a user
+  // prompt can be long; memory therefore stays bounded by instruction size.
   let contiguousPrevious = new Uint32Array(reference.length + 1)
   let contiguousCurrent = new Uint32Array(reference.length + 1)
   let lcsPrevious = new Uint32Array(reference.length + 1)

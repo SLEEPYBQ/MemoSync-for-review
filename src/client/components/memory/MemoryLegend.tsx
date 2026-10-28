@@ -1,5 +1,11 @@
-
-
+// A legend for MemoSync's visual vocabulary: what the scope colors, per-card
+// status dot, and freshness marks mean. Rendered inline or in
+// a popover next to the surfaces that use those marks — the Board (§4.9) and
+// the in-chat capture cards (§4.1). The review flagged that the marks (notably
+// the red status dot, which reads as "recently updated" but actually means
+// "violated") were unlabeled and being misread; this names each one against the
+// exact swatch the cards render, drawing both from memoryVocab so they cannot
+// drift.
 import { type ReactNode } from "react"
 import { Info } from "lucide-react"
 import { cn } from "../../lib/utils"
@@ -36,7 +42,7 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   )
 }
 
-
+/** The legend body. `sections` picks which vocabulary groups to show. */
 export function MemoryLegend({
   sections = ALL_SECTIONS,
   className,
@@ -80,7 +86,7 @@ export function MemoryLegend({
   )
 }
 
-
+/** A quiet "Legend" trigger that opens {@link MemoryLegend} in a popover. */
 export function MemoryLegendButton({
   sections,
   label = "Legend",

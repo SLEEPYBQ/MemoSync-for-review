@@ -1,28 +1,24 @@
-
-
-export type ExperimentConditionName = "memosync" | "static" | "auto"
+export type ExperimentConditionName = "memosync"
 
 export interface ConditionPolicy {
   condition: ExperimentConditionName
-
-  capture: "review" | "silent" | "off"
+  capture: "review"
   preview: boolean
   trace: boolean
   boardVisible: boolean
   boardWritable: boolean
   bringIn: boolean
-
-
-  injection: "skills" | "plain" | "file"
-
+  injection: "skills"
   memoryTools: boolean
-
-
+  /** Explicit MemoSync study mode isolates workspace settings from memory injection. */
   studyMode: boolean
 }
 
-const POLICIES: Record<ExperimentConditionName, Omit<ConditionPolicy, "studyMode">> = {
-  memosync: {
+export function resolveConditionPolicy(condition = process.env.EXPERIMENT_CONDITION): ConditionPolicy {
+  if (condition && condition !== "memosync") {
+    console.warn(`[experiment] unsupported EXPERIMENT_CONDITION "${condition}" — using MemoSync`)
+  }
+  return {
     condition: "memosync",
     capture: "review",
     preview: true,
@@ -32,37 +28,6 @@ const POLICIES: Record<ExperimentConditionName, Omit<ConditionPolicy, "studyMode
     bringIn: true,
     injection: "skills",
     memoryTools: true,
-  },
-  auto: {
-    condition: "auto",
-    capture: "silent",
-    preview: false,
-    trace: false,
-    boardVisible: false,
-    boardWritable: false,
-    bringIn: false,
-    injection: "plain",
-    memoryTools: false,
-  },
-  static: {
-    condition: "static",
-    capture: "off",
-    preview: false,
-    trace: false,
-    boardVisible: false,
-    boardWritable: false,
-    bringIn: false,
-    injection: "file",
-    memoryTools: false,
-  },
-}
-
-export function resolveConditionPolicy(condition = process.env.EXPERIMENT_CONDITION): ConditionPolicy {
-  if (condition === "auto" || condition === "static" || condition === "memosync") {
-    return { ...POLICIES[condition], studyMode: true }
+    studyMode: condition === "memosync",
   }
-  if (condition && condition !== "memosync") {
-    console.warn(`[experiment] unknown EXPERIMENT_CONDITION "${condition}" — falling back to memosync`)
-  }
-  return { ...POLICIES.memosync, studyMode: false }
 }

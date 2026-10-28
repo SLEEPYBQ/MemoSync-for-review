@@ -11,7 +11,7 @@ function isMissingProcess(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "ESRCH")
 }
 
-
+/** Stop dev servers from the previous assigned project before the next one runs. */
 export async function stopOtherStudyProjectServers(args: {
   currentProjectPath: string
   rawStudyProjects: string | undefined
@@ -38,8 +38,9 @@ export async function stopOtherStudyProjectServers(args: {
     const owners = [...new Map(
       entries.flatMap((entry) => entry.owners).map((owner) => [owner.pid, owner]),
     ).values()].filter((owner) => !killedPids.has(owner.pid))
-
-
+    // /proc lookups are independently bounded. Resolve them concurrently so
+    // a busy participant container cannot multiply the Claude-start delay by
+    // its listener count.
     const ownersWithCwd = await Promise.all(owners.map(async (owner) => ({
       owner,
       cwd: await readCwd(owner.pid),

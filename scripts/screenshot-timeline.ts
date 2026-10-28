@@ -1,5 +1,8 @@
-
-
+// Visual QA for the Session Memory Timeline: seed a chat whose transcript
+// exercises every timeline surface (summary + citations, violation row with
+// quote, capture rows incl. auto, no-memory turn), boot the real server over
+// that data dir, and screenshot the Timeline tab in light & dark via
+// Playwright. Usage: `bun run scripts/screenshot-timeline.ts [outDir]`.
 import { mkdirSync, mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -14,7 +17,7 @@ mkdirSync(outDir, { recursive: true })
 const dataDir = mkdtempSync(join(tmpdir(), "memv2-timeline-"))
 const workspace = mkdtempSync(join(tmpdir(), "memv2-timeline-ws-"))
 
-
+// ── Seed the chat + transcript before the server boots ─────────────────────
 const store = new EventStore(dataDir)
 await store.initialize()
 const project = await store.openProject(workspace, "RenderX")
@@ -32,7 +35,7 @@ const memories = [
   { id: "M-03", content: "The flaky login test needs --runInBand to pass", scope: "project" },
 ]
 
-
+// t1: memories injected, trace with summary + operational verdicts.
 await store.appendMessage(chat.id, entry({ kind: "user_prompt", content: "Why is the login test flaky?" }))
 await store.appendMessage(chat.id, entry({ kind: "memory_preview", previewId: "p1", turn: 1, memories }))
 await store.appendMessage(chat.id, entry({ kind: "memory_preview_decision", previewId: "p1", decision: "go_on" }))
@@ -51,7 +54,7 @@ await store.appendMessage(
   }),
 )
 
-
+// t2: a violation with a jumpable quote + a capture.
 await store.appendMessage(chat.id, entry({ kind: "user_prompt", content: "Push the fix once tests pass" }))
 await store.appendMessage(chat.id, entry({ kind: "memory_preview", previewId: "p2", turn: 2, memories }))
 await store.appendMessage(chat.id, entry({ kind: "memory_preview_decision", previewId: "p2", decision: "go_on" }))
@@ -79,17 +82,19 @@ await store.appendMessage(
   }),
 )
 
-
+// t3: ran without memory.
 await store.appendMessage(chat.id, entry({ kind: "user_prompt", content: "quick sanity check" }))
 await store.appendMessage(chat.id, entry({ kind: "memory_preview", previewId: "p3", turn: 3, memories: [] }))
 await store.appendMessage(chat.id, entry({ kind: "memory_preview_decision", previewId: "p3", decision: "without_memory" }))
 await store.appendMessage(chat.id, entry({ kind: "assistant_text", text: "All good." }))
 
+// EventStore keeps no open handles that block a same-process server boot
 
+// ── Boot the real server over the seeded data dir ──────────────────────────
 const srv = await startMemoSyncServer({ port: 3922, dataDir, openBrowser: false, discoverProjects: () => [] })
 const base = `http://127.0.0.1:${srv.port}`
 
-
+// Seed the memory store so chips resolve content on hover/labels.
 for (const m of [
   { content: "Only run MainTests (~19s) before pushing", scope: "project", type: "constraint", projectId: project.id },
   { content: "Prefer early returns over deeply nested conditionals", scope: "personal", type: "preference" },
@@ -110,7 +115,7 @@ await page.waitForTimeout(1500)
 await page.screenshot({ path: join(outDir, "debug-chat.png") })
 if (errors.length) console.error("early console errors:", errors)
 
-
+// Open the Session Memories panel, then the Timeline tab.
 await page.locator('button[aria-label="Session memories"]').click()
 await page.waitForTimeout(600)
 await page.getByRole("tab", { name: "Timeline" }).click()

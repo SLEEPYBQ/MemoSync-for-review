@@ -1,5 +1,8 @@
-
-
+// The guide tour's fake workspace: enough of the web-shop project that the
+// REAL side-panel components (FilesPanel, BrowserPanel) render live against
+// it. FilesPanel talks HTTP, so a scoped fetch shim answers its routes for
+// the demo project id only; BrowserPanel talks the app socket, so a stub
+// socket answers its two commands. Nothing here touches real projects.
 import type { LocalHttpServerInfo, ProjectQuickAction } from "../../../shared/protocol"
 import type { AppSocket } from "../socket"
 import {
@@ -12,7 +15,11 @@ import {
 export const GUIDE_CHAT_ID = "guide-demo"
 export const GUIDE_PROJECT_ID = "guide-demo-shop"
 
-
+/**
+ * A self-contained app for the Browser lesson. It runs through iframe srcDoc,
+ * so clicking the real server card, Home, and Refresh exercises the mounted
+ * BrowserPanel without contacting localhost or a participant project.
+ */
 export const GUIDE_BROWSER_DEMO_DOCUMENT = `<!doctype html>
 <html lang="en">
 <head>
@@ -89,7 +96,7 @@ export const GUIDE_BROWSER_DEMO_DOCUMENT = `<!doctype html>
 </body>
 </html>`
 
-
+/** The shop project the demo conversation works on (paths match the scenes). */
 const DEMO_FILES: Record<string, string> = {
   "package.json": `{
   "name": "web-shop",
@@ -200,7 +207,7 @@ interface DemoFileEntry {
   size: number
 }
 
-
+/** Immediate children of `dir` ("" = root), dirs first then files, sorted. */
 function listDemoDir(dir: string): DemoFileEntry[] {
   const prefix = dir ? `${dir}/` : ""
   const dirs = new Set<string>()
@@ -249,7 +256,10 @@ function failClosed(pathname: string): Response {
   )
 }
 
-
+/**
+ * Answer FilesPanel's routes for the demo project; every other request falls
+ * through to the real fetch untouched. Returns the uninstaller.
+ */
 export interface GuideFetchShimController {
   (): void
   setBoardDemo(demo: GuideBoardDemo): void
@@ -261,29 +271,6 @@ export function installGuideFetchShim(): GuideFetchShimController {
   const realFetch = window.fetch.bind(window)
   const boardDemo = createGuideBoardDemoController(GUIDE_BOARD_PENDING_DEMO)
   const filesPrefix = `/api/projects/${GUIDE_PROJECT_ID}/files`
-  const memoryFilePath = `/api/projects/${GUIDE_PROJECT_ID}/memory-file`
-  let memoryFileContent = [
-    "# Memory",
-    "",
-    "## Project facts",
-    "- Cart state lives in `client/src/cart/CartContext.tsx`.",
-    "",
-    "## Preferences",
-    "- Ask for confirmation before destructive actions.",
-  ].join("\n")
-  let memoryFileMtime = 1_723_280_400_000
-  const summary = {
-    text: [
-      "## Project",
-      "The cart is managed through `CartContext`, and product prices use the shared `formatPrice` helper.",
-      "",
-      "## Preferences",
-      "Ask for confirmation before destructive actions and avoid adding dependencies when the repository already has what is needed.",
-    ].join("\n"),
-    updatedAt: "2026-08-10T09:00:00.000Z",
-    stale: false,
-  }
-
   window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
     const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
     const url = new URL(raw, window.location.origin)
@@ -300,8 +287,9 @@ export function installGuideFetchShim(): GuideFetchShimController {
         return {}
       }
     }
-
-
+    // Study surfaces (tour contract steps): the REAL StudyIndexPage / StudyDock
+    // and the protected brief render against this demo study state — one
+    // session done, one active, two locked behind the serial gate.
     if (url.pathname === "/api/study/progress") {
       return Promise.resolve(
         json({
@@ -343,8 +331,9 @@ export function installGuideFetchShim(): GuideFetchShimController {
     if (url.pathname === "/api/study/instruction-guard-event") {
       return Promise.resolve(json({ recorded: true }))
     }
-
-
+    // Production Board components run in the Guide, but every read is served
+    // from tutorial-owned fixtures. No request in these namespaces may fall
+    // through to a participant's memory or workspace backend.
     if (url.pathname === "/api/memories" && method === "GET") {
       return Promise.resolve(json(boardDemo.snapshot().items))
     }
@@ -463,38 +452,6 @@ export function installGuideFetchShim(): GuideFetchShimController {
       }
       return Promise.resolve(json({ queued: id }))
     }
-    if (url.pathname === "/api/memories/summary") {
-      return Promise.resolve(json(summary))
-    }
-    if (url.pathname === "/api/memories/summary/refresh") {
-      return Promise.resolve(json(summary))
-    }
-    if (url.pathname === "/api/memories/summary/chat") {
-      return Promise.resolve(json({
-        reply: "In the live panel, the assistant would confirm the requested memory update here.",
-        applied: 0,
-        summary,
-      }))
-    }
-    if (url.pathname === memoryFilePath) {
-      if (method === "PUT") {
-        try {
-          const body = typeof init?.body === "string" ? JSON.parse(init.body) as { content?: unknown } : null
-          if (typeof body?.content === "string") memoryFileContent = body.content
-        } catch {
-
-
-        }
-        memoryFileMtime += 1
-        return Promise.resolve(json({ path: "MEMORY.md", mtimeMs: memoryFileMtime }))
-      }
-      return Promise.resolve(json({
-        path: "MEMORY.md",
-        content: memoryFileContent,
-        mtimeMs: memoryFileMtime,
-        exists: true,
-      }))
-    }
     if (!url.pathname.startsWith(filesPrefix)) {
       if (
         url.pathname === "/api/memories"
@@ -519,7 +476,7 @@ export function installGuideFetchShim(): GuideFetchShimController {
       return Promise.resolve(json(searchDemoFiles(url.searchParams.get("q") ?? "")))
     }
     if (rest === "/op") {
-
+      // Tree edits have nowhere to land in a demo; succeed as a no-op.
       return Promise.resolve(json({ ok: true }))
     }
     const contentMatch = rest.match(/^\/(.+)\/content$/)
@@ -570,7 +527,7 @@ const DEMO_QUICK_ACTIONS: ProjectQuickAction[] = [
   { id: "guide-qa-client", label: "bun client", command: "bun client" },
 ]
 
-
+/** Enough of AppSocket for BrowserPanel's two read commands. */
 export const guideDemoSocket = {
   command: async (command: { type: string }) => {
     if (command.type === "browser.listLocalHttpServers") return DEMO_SERVERS

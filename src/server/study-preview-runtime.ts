@@ -26,7 +26,7 @@ export interface StudyPreviewSnapshot {
   readyPorts: number[]
   exitCode: number | null
   degradedReason: StudyPreviewDegradedReason | null
-
+  /** Bounded recent child output, available to the agent through preview_status. */
   recentLog: string
   lastError: string | null
 }
@@ -95,13 +95,13 @@ async function defaultListProcessGroupMembers(processGroupId: number): Promise<S
     .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
     .map(async (entry) => {
       try {
-
-
+        // /proc/PID/stat's command may contain spaces. Fields after the last
+        // ')' begin with state, ppid, then pgrp (the detached child PID).
         const stat = await readFile(`/proc/${entry.name}/stat`, "utf8")
         const tail = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/)
         if (tail[0] !== "Z" && Number(tail[2]) === processGroupId) members.add(Number(entry.name))
       } catch {
-
+        // The process may exit while /proc is being scanned.
       }
     }))
   return members
@@ -148,10 +148,11 @@ export function studyPreviewSubprocessEnv(
 ): NodeJS.ProcessEnv {
   return {
     ...studyProjectSubprocessEnv(baseEnv, projectPath, rawStudyProjects),
-
+    // Nest reads PORT while Next receives its own explicit CLI port below.
     PORT: String(STUDY_PREVIEW_BACKEND_PORT),
-
-
+    // The canonical starter uses Next/Watchpack and Nest/TypeScript watch.
+    // Polling avoids consuming thousands of inotify watches per participant
+    // while keeping the same managed path in all three study conditions.
     WATCHPACK_POLLING: "true",
     WATCHPACK_POLLING_INTERVAL: "1000",
     TSC_WATCHFILE: "DynamicPriorityPolling",
@@ -173,8 +174,9 @@ export function studyPreviewLaunchSpec(
       "--kill-others",
       "--names", "backend,frontend",
       "npm --prefix backend run start:dev",
-
-
+      // Next 15 uses webpack unless --turbopack is supplied. Invoke Next
+      // directly from the frontend directory so the starter's Turbopack
+      // package script cannot override it and Next resolves the app root there.
       `cd frontend && exec ./node_modules/.bin/next dev --port ${STUDY_PREVIEW_FRONTEND_PORT}`,
     ],
     cwd: target,
@@ -210,7 +212,7 @@ function defaultSpawnPreview(projectPath: string): PreviewProcess {
   }
 }
 
-
+/** Owns exactly one fixed-port study preview process group per participant container. */
 export class StudyPreviewRuntime implements StudyPreviewRuntimeController {
   private readonly spawnPreview: NonNullable<StudyPreviewRuntimeDeps["spawnPreview"]>
   private readonly signalProcessGroup: NonNullable<StudyPreviewRuntimeDeps["signalProcessGroup"]>
@@ -225,9 +227,9 @@ export class StudyPreviewRuntime implements StudyPreviewRuntimeController {
   private readonly restartCooldownMs: number
   private readonly now: () => number
   private current: ManagedPreview | null = null
-
+  /** Set synchronously by stop so a queued Browser heal cannot resurrect a frozen project. */
   private readonly autoHealBlocked = new Set<string>()
-
+  /** At most one automatic respawn until that project reaches ready again. */
   private readonly autoRecoveryAttempted = new Set<string>()
   private readonly lastManualRestartAt = new Map<string, number>()
   private transition: Promise<StudyPreviewSnapshot> = Promise.resolve(this.stoppedSnapshot())
@@ -305,7 +307,7 @@ export class StudyPreviewRuntime implements StudyPreviewRuntimeController {
     })
   }
 
-
+  /** Browser-only recovery. The admission check and restart share the runtime transition. */
   recover(projectPath: string, isStillAllowed: () => boolean) {
     const target = resolve(projectPath)
     return this.serialize(async () => {
@@ -321,8 +323,9 @@ export class StudyPreviewRuntime implements StudyPreviewRuntimeController {
       if (this.autoRecoveryAttempted.has(target)) return snapshot
       this.autoRecoveryAttempted.add(target)
       await this.stopCurrent()
-
-
+      // stop() marks the project synchronously before its serialized work. A
+      // freeze racing this await therefore wins even if its transition queues
+      // behind this one.
       if (this.autoHealBlocked.has(target) || !isStillAllowed()) return this.stoppedSnapshot(target)
       return this.snapshot(await this.startAfterPortReconciliation(target))
     })

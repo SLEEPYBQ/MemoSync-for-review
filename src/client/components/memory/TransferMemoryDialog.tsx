@@ -1,5 +1,9 @@
-
-
+// Cross-context transfer instrument (DG3 / the title's "Across Context"):
+// moving a memory across a scope or project boundary goes through a judged,
+// mixed-initiative step — the LLM says as-is / rewrite / context-bound and
+// proposes the adapted form; the developer edits and decides. Commit derives
+// a NEW memory linked to the source (the source keeps serving its own
+// context unless "archive original" is checked).
 import { useEffect, useMemo, useState } from "react"
 import { ArrowDown, ArrowRight, GitMerge, Loader2, TriangleAlert } from "lucide-react"
 import {
@@ -20,6 +24,7 @@ import {
   type MemoryControlSurface,
   type MemoryItem,
   type TransferProposal,
+  type TransferTargetBody,
 } from "../../lib/memoriesApi"
 import { workspaceApi } from "../../lib/workspaceApi"
 import { useMemoryStore } from "../../stores/memoryStore"
@@ -33,7 +38,11 @@ const VERDICT_META: Record<TransferProposal["verdict"], { label: string; classNa
   context_bound: { label: "context-bound — not recommended", className: "bg-red-500/10 text-red-700 dark:text-red-300" },
 }
 
-
+/**
+ * A concrete transfer destination, e.g. from a Board drag onto a column or a
+ * scope group. A session target is always fixed (dropped onto one session's
+ * group) — there is no session picker in this dialog.
+ */
 export type TransferInitialTarget =
   | { scope: "personal" }
   | { scope: "project"; projectId?: string }
@@ -43,12 +52,39 @@ interface TransferMemoryDialogProps {
   item: MemoryItem
   open: boolean
   onOpenChange: (open: boolean) => void
-
+  /** Preselected target (e.g. from a Board drag). */
   initialTarget?: TransferInitialTarget
-
+  /** Drags mean "move" (archive source); hover/panel default to "copy". */
   defaultArchiveOriginal?: boolean
   onDone?: (created: MemoryItem) => void
   surface?: MemoryControlSurface
+}
+
+export function buildManualTransferCommitBody(input: {
+  proposal: TransferProposal
+  target: Pick<TransferTargetBody, "targetScope" | "targetProjectId" | "targetSessionId">
+  content: string
+  archiveOriginal: boolean
+  surface?: MemoryControlSurface
+}): Parameters<typeof memoriesApi.transfer>[1] {
+  const { proposal, target, archiveOriginal, surface } = input
+  const content = input.content.trim()
+  return {
+    ...target,
+    sourceVersion: proposal.sourceVersion,
+    content,
+    detail: proposal.detail,
+    abstractionLevel: proposal.abstractionLevel,
+    verdict: proposal.verdict,
+    edited: content !== proposal.content,
+    archiveOriginal,
+    landingRoute: proposal.landing.route,
+    landingTargetId: proposal.landing.targetId,
+    landingTargetVersion: proposal.landing.targetVersion,
+    rule: proposal.portable,
+    applicability: proposal.applicability,
+    surface,
+  }
 }
 
 export function TransferMemoryDialog({
@@ -68,13 +104,14 @@ export function TransferMemoryDialog({
   const [targetProjectId, setTargetProjectId] = useState<string | undefined>(
     initialTarget?.scope === "project" ? initialTarget.projectId : undefined,
   )
-
-
+  // Session targets are fixed by the drop (one session's group); there is no
+  // way to pick a different session here, so scope is locked when set.
   const [targetSessionId, setTargetSessionId] = useState<string | undefined>(
     initialTarget?.scope === "session" ? initialTarget.sessionId : undefined,
   )
   const sessionLabel = initialTarget?.scope === "session" ? initialTarget.sessionLabel : undefined
   const [proposal, setProposal] = useState<TransferProposal | null>(null)
+  const [proposalTargetKey, setProposalTargetKey] = useState<string | null>(null)
   const [loadingProposal, setLoadingProposal] = useState(false)
   const [content, setContent] = useState("")
   const [archiveOriginal, setArchiveOriginal] = useState(defaultArchiveOriginal)
@@ -82,10 +119,12 @@ export function TransferMemoryDialog({
   const [error, setError] = useState<string | null>(null)
 
   const scope = isMemoryScope(item.scope) ? item.scope : "session"
+  const targetKey = JSON.stringify([targetScope, targetProjectId ?? null, targetSessionId ?? null])
   const projectOptions = useMemo(() => {
     const opts = Object.entries(projects).filter(([id]) => !(item.scope === "project" && item.projectId === id))
-
-
+    // A project preselected by a drop must be selectable even if the titles
+    // fetch hasn't caught up (or failed) — otherwise the picker silently
+    // resets to "choose project…" and the target reads as unset.
     if (targetProjectId && !opts.some(([id]) => id === targetProjectId)) {
       opts.push([targetProjectId, projects[targetProjectId] ?? targetProjectId])
     }
@@ -97,29 +136,35 @@ export function TransferMemoryDialog({
     setTargetScope(initialTarget?.scope ?? defaultTransferScope(item.scope))
     setTargetProjectId(initialTarget?.scope === "project" ? initialTarget.projectId : undefined)
     setTargetSessionId(initialTarget?.scope === "session" ? initialTarget.sessionId : undefined)
+    setProposal(null)
+    setProposalTargetKey(null)
     setArchiveOriginal(defaultArchiveOriginal)
     setError(null)
     workspaceApi
       .projectTitles()
       .then(setProjects)
       .catch(() => setProjects({}))
-
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, item.id])
 
-
+  // Re-judge whenever the target changes.
   useEffect(() => {
     if (!open) return
     if (targetScope === "project" && !targetProjectId) {
       setProposal(null)
+      setProposalTargetKey(null)
       return
     }
     if (targetScope === "session" && !targetSessionId) {
       setProposal(null)
+      setProposalTargetKey(null)
       return
     }
     let cancelled = false
+    const requestedTargetKey = targetKey
     setLoadingProposal(true)
     setProposal(null)
+    setProposalTargetKey(null)
     memoriesApi
       .transferPreview(item.id, {
         targetScope,
@@ -131,6 +176,7 @@ export function TransferMemoryDialog({
       .then((p) => {
         if (cancelled) return
         setProposal(p)
+        setProposalTargetKey(requestedTargetKey)
         setContent(p.content)
       })
       .catch((err) => {
@@ -142,33 +188,31 @@ export function TransferMemoryDialog({
     return () => {
       cancelled = true
     }
-
-  }, [open, item.id, targetScope, targetProjectId, targetSessionId])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, item.id, targetKey])
 
   const landing = proposal?.landing
   const reinforcing = landing?.route === "reinforces"
 
   async function handleConfirm() {
-    if (!proposal || (!reinforcing && !content.trim())) return
+    if (!proposal || proposalTargetKey !== targetKey || (!reinforcing && !content.trim())) return
     setSubmitting(true)
     setError(null)
     try {
-      const created = await memoriesApi.transfer(item.id, {
-        targetScope,
-        targetProjectId: targetScope === "project" ? targetProjectId : undefined,
-        targetSessionId: targetScope === "session" ? targetSessionId : undefined,
-        content: content.trim(),
-        detail: proposal.detail,
-        abstractionLevel: proposal.abstractionLevel,
-        verdict: proposal.verdict,
-        edited: content.trim() !== proposal.content,
-        archiveOriginal,
-        landingRoute: proposal.landing.route,
-        landingTargetId: proposal.landing.targetId,
-        rule: proposal.portable,
-        applicability: proposal.applicability,
-        surface,
-      })
+      const created = await memoriesApi.transfer(
+        item.id,
+        buildManualTransferCommitBody({
+          proposal,
+          target: {
+            targetScope,
+            targetProjectId: targetScope === "project" ? targetProjectId : undefined,
+            targetSessionId: targetScope === "session" ? targetSessionId : undefined,
+          },
+          content,
+          archiveOriginal,
+          surface,
+        }),
+      )
       await loadAll()
       onDone?.(created)
       onOpenChange(false)
@@ -217,7 +261,7 @@ export function TransferMemoryDialog({
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">to</span>
             {targetScope === "session" ? (
-
+              // The session is fixed by the drop — no picker, just name it.
               <span
                 className={cn(
                   "inline-flex items-center rounded-full border px-2 py-0.5 text-sm",
@@ -267,7 +311,7 @@ export function TransferMemoryDialog({
             <p className="flex items-center gap-2 py-1 text-sm text-muted-foreground">
               <Loader2 className="h-3.5 w-3.5 animate-spin" /> Abstracting and re-instantiating…
             </p>
-          ) : proposal ? (
+          ) : proposal && proposalTargetKey === targetKey ? (
             <div className="flex flex-col gap-2">
               <span
                 className={cn(
@@ -278,7 +322,11 @@ export function TransferMemoryDialog({
                 {VERDICT_META[proposal.verdict].label}
               </span>
 
-
+              {/* The encode → decode pipeline (Transfer design 2026-08-08):
+                  show the abstract rule the source was encoded to (dashed =
+                  metadata, never a standalone item), then the localized form
+                  the developer edits. Skipped for as_is (the two coincide) —
+                  the item just moves verbatim. */}
               {proposal.verdict !== "as_is" && proposal.portable !== proposal.content ? (
                 <div className="flex flex-col gap-1.5">
                   <div className="rounded-lg border border-dashed border-border bg-muted/20 px-2.5 py-1.5">
@@ -308,7 +356,8 @@ export function TransferMemoryDialog({
               </div>
               {proposal.note ? <p className="text-xs text-muted-foreground">{proposal.note}</p> : null}
 
-
+              {/* Landing: how the instantiated form meets what already lives
+                  in the target context (same vocabulary as capture). */}
               {landing?.route === "reinforces" ? (
                 <div className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-2.5 py-2 text-xs">
                   <GitMerge className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
@@ -360,6 +409,7 @@ export function TransferMemoryDialog({
               submitting ||
               loadingProposal ||
               !proposal ||
+              proposalTargetKey !== targetKey ||
               (!reinforcing && !content.trim()) ||
               (targetScope === "project" && !targetProjectId) ||
               (targetScope === "session" && !targetSessionId)

@@ -284,11 +284,11 @@ describe('MemoryStore', () => {
       const stale = store.create({ content: 'bun test', scope: 'project', type: 'constraint', projectId: 'P1' }, { actor: 'user' });
       const fresh = store.create({ content: 'bun test --coverage', scope: 'project', type: 'constraint', projectId: 'P1' }, { actor: 'agent' });
       store.addRelation(fresh.id, stale.id, 'conflicts_with');
-
+      // No project filter (what the Board actually sends) must still surface it.
       expect(store.listConflicted().map((m) => m.id)).toContain(stale.id);
-
+      // With the matching project filter too.
       expect(store.listConflicted('P1').map((m) => m.id)).toContain(stale.id);
-
+      // A different project's conflict is excluded when a filter is given.
       expect(store.listConflicted('OTHER').map((m) => m.id)).not.toContain(stale.id);
     });
 
@@ -297,7 +297,7 @@ describe('MemoryStore', () => {
       const fresh = store.create({ content: 'new rule', scope: 'personal', type: 'constraint', status: 'candidate' }, { actor: 'agent' });
       store.addRelation(fresh.id, stale.id, 'conflicts_with');
       expect(store.listConflicted().map((m) => m.id)).toContain(stale.id);
-
+      // User dismisses (discards) the superseding candidate → conflict resolved.
       store.archive(fresh.id, { actor: 'user' });
       expect(store.listConflicted().map((m) => m.id)).not.toContain(stale.id);
     });
@@ -347,6 +347,17 @@ describe('MemoryStore', () => {
   });
 
   describe('version/usage event log (option 乙)', () => {
+    it.each(['project', 'session'] as const)('versions %s binding changes but not no-ops or status changes', (scope) => {
+      const binding = scope === 'project' ? 'projectId' : 'sessionId';
+      const item = store.create({ content: 'Context rule', scope, type: 'fact', [binding]: 'A' }, { actor: 'user' });
+      const moved = store.update(item.id, { [binding]: 'B' }, { actor: 'user' });
+      expect(moved.version).toBe(item.version + 1);
+      const events = store.getEvents(item.id);
+      expect(store.update(item.id, { [binding]: 'B' }, { actor: 'user' })).toEqual(moved);
+      expect(store.getEvents(item.id)).toEqual(events);
+      expect(store.archive(item.id, { actor: 'user' }).version).toBe(moved.version);
+    });
+
     it('logs a create event with actor + session + full snapshot', () => {
       const m = store.create(
         { content: 'x', scope: 'session', type: 'lesson', sessionId: 's-9' },
@@ -395,8 +406,8 @@ describe('MemoryStore', () => {
       const m = store.create({ content: 'x', scope: 'personal', type: 'fact' }, { actor: 'user' });
       store.recordUse(m.id, { actor: 'agent', sessionId: 's2', via: 'citation' });
       store.recordUse(m.id, { actor: 'agent', sessionId: 's2', via: 'detail_load', detailLoaded: true });
-
-
+      // usage_count means "cited N×" — the hover card's number. Detail loads
+      // are recorded in the event log but do not inflate the counter.
       expect(store.getById(m.id)!.usageCount).toBe(1);
       const events = store.getEvents(m.id);
       expect(events.map((e) => e.kind)).toEqual(['create', 'use', 'use']);
@@ -404,7 +415,7 @@ describe('MemoryStore', () => {
       expect(events[1].meta?.via).toBe('citation');
       expect(events[2].meta?.via).toBe('detail_load');
       expect(events[2].meta?.detailLoaded).toBe(true);
-
+      // a use is not a version: updatedAt untouched
       expect(store.getById(m.id)!.updatedAt).toBe(m.updatedAt);
     });
 
@@ -441,7 +452,7 @@ describe('MemoryStore', () => {
       const rolledBack = store.rollback(m.id, createSeq, { actor: 'user' });
       expect(rolledBack.content).toBe('v1');
       expect(rolledBack.topic).toBeUndefined();
-
+      // usage survives rollback (it is history, not versioned state)
       expect(rolledBack.usageCount).toBe(1);
 
       const events = store.getEvents(m.id);
@@ -494,7 +505,7 @@ describe('MemoryStore', () => {
       expect(store.getSessionExclusions('chat-1')).toEqual([a.id, b.id]);
       store.setSessionExclusions('chat-1', [b.id]);
       expect(store.getSessionExclusions('chat-1')).toEqual([b.id]);
-
+      // Clearing restores the all-in default; other sessions are untouched.
       store.setSessionExclusions('chat-1', []);
       expect(store.getSessionExclusions('chat-1')).toEqual([]);
       expect(store.getSessionExclusions('chat-2')).toEqual([]);
@@ -504,7 +515,7 @@ describe('MemoryStore', () => {
   describe('schema migration', () => {
     it('adds new columns to a legacy v1 database and defaults existing rows', () => {
       const db = new Database(':memory:');
-
+      // The pre-upgrade schema: no detail / abstraction_level, no memory_events.
       db.exec(`CREATE TABLE memories (
         id TEXT PRIMARY KEY, content TEXT NOT NULL, scope TEXT NOT NULL, type TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'active', project_id TEXT, session_id TEXT, topic TEXT,
@@ -519,7 +530,7 @@ describe('MemoryStore', () => {
       expect(m.content).toBe('legacy row');
       expect(m.abstractionLevel).toBe('contextual');
       expect(m.detail).toBeUndefined();
-
+      // the event log works for legacy rows too
       legacyStore.recordUse('M-01', { actor: 'agent' });
       expect(legacyStore.getEvents('M-01').map((e) => e.kind)).toEqual(['use']);
     });
@@ -604,17 +615,17 @@ describe('recentlyDismissedCandidates (capture negative examples)', () => {
 
   it('does NOT count accepted-then-archived, plain-archived, or hard-discarded items', () => {
     const store = freshStore();
-
+    // Accepted: candidate → active → archived (a lifecycle end, not a rejection).
     const accepted = store.create({ content: 'Was accepted once', scope: 'personal', type: 'fact', status: 'candidate' }, { actor: 'agent' });
     store.update(accepted.id, { status: 'active' }, { actor: 'user' });
     store.archive(accepted.id, { actor: 'user' });
-
+    // Born active, then archived — also not a dismissal.
     const active = store.create({ content: 'Born active', scope: 'personal', type: 'fact' }, { actor: 'user' });
     store.archive(active.id, { actor: 'user' });
-
+    // A SENSITIVE dismissal hard-deletes: no text may survive for the gate.
     const secret = store.create({ content: 'token sk-999', scope: 'personal', type: 'fact', status: 'candidate', sensitive: true }, { actor: 'agent' });
     store.discardCandidate(secret.id);
-
+    // A real (non-sensitive) dismissal for contrast.
     const rejected = store.create({ content: 'Rejected candidate', scope: 'personal', type: 'fact', status: 'candidate' }, { actor: 'agent' });
     store.dismissCandidate(rejected.id, { actor: 'user' });
 
@@ -626,11 +637,11 @@ describe('recentlyDismissedCandidates (capture negative examples)', () => {
     const cand = store.create({ content: 'Prefers tabs over spaces', scope: 'personal', type: 'preference', status: 'candidate' }, { actor: 'agent' });
     const dismissed = store.dismissCandidate(cand.id, { actor: 'user', sessionId: 's9' });
     expect(dismissed.status).toBe('discarded');
-
+    // Text retained (negative example / study distractor)…
     expect(store.getById(cand.id)?.content).toBe('Prefers tabs over spaces');
-
+    // …fingerprint written (exact-repeat suppression)…
     expect(store.wasCandidateDismissed('  prefers TABS over spaces ')).toBe(true);
-
+    // …and the resolution is an auditable event.
     const statusEvents = store.getEvents(cand.id).filter((e) => e.kind === 'status');
     expect(statusEvents).toHaveLength(1);
     expect(statusEvents[0]!.changes?.status).toEqual({ before: 'candidate', after: 'discarded' });
@@ -719,8 +730,8 @@ describe('recentlyDismissedCandidates (capture negative examples)', () => {
       { actor: 'agent' },
     );
     store.dismissCandidate(candidate.id, { actor: 'user' });
-
-
+    // Reproduce a row already moved by an older build. The public behavior
+    // under test starts from this persisted legacy state.
     db.query(`UPDATE memories SET status = 'candidate' WHERE id = ?`).run(candidate.id);
 
     expect(() => store.replaceCandidateDraft(
@@ -750,8 +761,9 @@ describe('recentlyDismissedCandidates (capture negative examples)', () => {
       { actor: 'agent' },
     );
     store.dismissCandidate(candidate.id, { actor: 'user' });
-
-
+    // Persist the exact state left by the old bypass after it had already
+    // relabelled the row and erased its item history. The dismissal evidence
+    // table is the only surviving authority at this point.
     db.query(`UPDATE memories SET status = 'candidate', sensitive = 0 WHERE id = ?`).run(candidate.id);
     db.query(`DELETE FROM memory_events WHERE memory_id = ?`).run(candidate.id);
 
@@ -848,7 +860,7 @@ describe('reinforce + revision plumbing (self-evolution)', () => {
     store.addRelation(proposal.id, target.id, 'revises');
     expect(store.hasOpenRevision(target.id)).toBe(true);
     expect(store.revisionTargetOf(proposal.id)?.id).toBe(target.id);
-
+    // Resolving the proposal (accept path archives target; here dismiss) closes it.
     store.dismissCandidate(proposal.id, { actor: 'user' });
     expect(store.hasOpenRevision(target.id)).toBe(false);
   });
@@ -863,10 +875,10 @@ describe('reinforce + revision plumbing (self-evolution)', () => {
     expect(first!.status).toBe('candidate');
     expect(store.revisionTargetOf(first!.id)?.id).toBe(target.id);
 
-
+    // Second concurrent draft for the same target loses (post-await recheck).
     expect(store.createRevisionProposal(input, target.id, { actor: 'system' })).toBeNull();
 
-
+    // Resolving the open proposal reopens the door; an archived target closes it.
     store.dismissCandidate(first!.id, { actor: 'user' });
     store.archive(target.id, { actor: 'user' });
     expect(store.createRevisionProposal(input, target.id, { actor: 'system' })).toBeNull();
@@ -891,7 +903,7 @@ describe('reinforce + revision plumbing (self-evolution)', () => {
     expect(project.projectId).toBe('Other');
     expect(project.sessionId).toBeUndefined();
 
-
+    // Candidate drafts normalize the same way.
     const draft = store.create(
       { content: 'y', scope: 'project', projectId: 'RenderX', type: 'fact', status: 'candidate' },
       { actor: 'agent' },
@@ -905,17 +917,76 @@ describe('reinforce + revision plumbing (self-evolution)', () => {
     const target = store.create({ content: 'Use port 3000', scope: 'personal', type: 'constraint' }, { actor: 'user' });
     const input = { content: 'Use port 4000', scope: 'personal' as const, type: 'constraint' as const };
 
-
+    // The user edits the target while a drafter is writing against the old text.
     store.update(target.id, { content: 'Use port 5000 (user fixed it)' }, { actor: 'user' });
     expect(
       store.createRevisionProposal(input, target.id, { actor: 'system' }, { expectedTargetContent: 'Use port 3000' }),
     ).toBeNull();
 
-
+    // A matching snapshot still proposes.
     expect(
       store.createRevisionProposal(input, target.id, { actor: 'system' }, { expectedTargetContent: 'Use port 5000 (user fixed it)' }),
     ).not.toBeNull();
   });
+
+  it('capture update fallback rejects stale or inactive targets even with an open revision', () => {
+    const store = freshStore();
+    const target = store.create({ content: 'Use port 3000', scope: 'personal', type: 'fact' }, { actor: 'user' });
+    const input = { content: 'Use port 4000', scope: 'personal' as const, type: 'fact' as const };
+    store.createRevisionProposal(input, target.id, { actor: 'agent' });
+    store.update(target.id, { content: 'Use port 443' }, { actor: 'user' });
+    const before = store.list();
+    expect(store.createCaptureUpdateProposal(input, target.id, { actor: 'agent' }, {
+      expectedTargetContent: target.content,
+    })).toBeNull();
+    expect(store.list()).toEqual(before);
+    store.archive(target.id, { actor: 'user' });
+    const archived = store.list();
+    expect(store.createCaptureUpdateProposal(input, target.id, { actor: 'agent' }, {
+      expectedTargetContent: 'Use port 443',
+    })).toBeNull();
+    expect(store.createCaptureUpdateProposal(input, 'M-missing', { actor: 'agent' })).toBeNull();
+    expect(store.list()).toEqual(archived);
+  });
+
+  it('capture update rolls back its candidate and relation if snapshot persistence fails', () => {
+    const db = new Database(':memory:');
+    db.exec('PRAGMA foreign_keys = ON');
+    applySchema(db);
+    const store = new MemoryStore(db);
+    try {
+      const target = store.create({ content: 'Use port 3000', scope: 'personal', type: 'fact' }, { actor: 'user' });
+      db.exec(`CREATE TRIGGER reject_revision_snapshot BEFORE INSERT ON memory_kv
+        BEGIN SELECT RAISE(ABORT, 'snapshot write failed'); END;`);
+      expect(() => store.createCaptureUpdateProposal(
+        { content: 'Use port 4000', scope: 'personal', type: 'fact' }, target.id, { actor: 'agent' },
+      )).toThrow('snapshot write failed');
+      expect(store.list()).toEqual([target]);
+      expect(db.query('SELECT * FROM memory_relations').all()).toEqual([]);
+      expect(db.query('SELECT * FROM memory_kv').all()).toEqual([]);
+      expect(db.query('SELECT * FROM memory_events').all()).toHaveLength(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  for (const patch of [{ content: 'Use port 443' }, { scope: 'project' as const, projectId: 'Other' }]) {
+    it(`competing capture updates reject a changed target (${Object.keys(patch)[0]})`, () => {
+      const store = freshStore();
+      const target = store.create({ content: 'Use port 3000', scope: 'personal', type: 'fact' }, { actor: 'user' });
+      store.createRevisionProposal(
+        { content: 'Use port 4000', scope: 'personal', type: 'fact' }, target.id, { actor: 'agent' },
+      );
+      const proposal = store.createCaptureUpdateProposal(
+        { content: 'Use port 5000', scope: 'personal', type: 'fact' }, target.id, { actor: 'agent' },
+      )!.item;
+      store.update(target.id, patch, { actor: 'user' });
+      const state = () => store.list().map((item) => ({ item, events: store.getEvents(item.id) }));
+      const before = state();
+      expect(() => store.acceptRevision(proposal.id, { actor: 'user' }, { content: 'edited draft' })).toThrow();
+      expect(state()).toEqual(before);
+    });
+  }
 
   it('acceptRevision activates the candidate and archives its target in one act', () => {
     const store = freshStore();
@@ -930,8 +1001,57 @@ describe('reinforce + revision plumbing (self-evolution)', () => {
     expect(updated.status).toBe('active');
     expect(replaced.map((r) => r.id)).toEqual([target.id]);
     expect(store.getById(target.id)!.status).toBe('archived');
-
+    // The proposal keeps its provenance link to the memory it replaced.
     expect(store.revisionTargetOf(proposal.id)?.id).toBe(target.id);
+  });
+
+  it('rejects a stale revision snapshot without mutating the candidate, target, or event histories', () => {
+    const store = freshStore();
+    const target = store.create({ content: 'Use port 3000', scope: 'personal', type: 'constraint' }, { actor: 'user' });
+    const proposal = store.createRevisionProposal(
+      { content: 'Use port 4000', scope: 'personal', type: 'constraint' },
+      target.id,
+      { actor: 'system' },
+    )!;
+    store.update(target.id, { content: 'Use port 5000' }, { actor: 'user' });
+    const ids = [proposal.id, target.id];
+    const before = ids.map((id) => ({ item: store.getById(id), events: store.getEvents(id) }));
+
+    expect(() => store.acceptRevision(proposal.id, { actor: 'user' }, { content: 'edited draft' })).toThrow();
+    expect(ids.map((id) => ({ item: store.getById(id), events: store.getEvents(id) }))).toEqual(before);
+  });
+
+  it('erasing an unseen revision removes its snapshot before the candidate id is reused', () => {
+    const store = freshStore();
+    const target = store.create({ content: 'Use port 3000', scope: 'personal', type: 'constraint' }, { actor: 'user' });
+    const proposal = store.createRevisionProposal(
+      { content: 'Use port 4000', scope: 'personal', type: 'constraint' }, target.id, { actor: 'system' },
+    )!;
+    expect(store.getKv(`revision_targets:${proposal.id}`)).not.toBeNull();
+    store.eraseCandidate(proposal.id);
+    expect(store.getKv(`revision_targets:${proposal.id}`)).toBeNull();
+    const unrelated = store.create(
+      { content: 'Use small commits', scope: 'personal', type: 'preference', status: 'candidate', id: proposal.id },
+      { actor: 'system' },
+    );
+    expect(store.acceptRevision(unrelated.id, { actor: 'user' }).updated.status).toBe('active');
+    expect(store.getById(target.id)!.status).toBe('active');
+  });
+
+  it('rejects a legacy relation-linked revision without a snapshot and leaves state unchanged', () => {
+    const store = freshStore();
+    const target = store.create({ content: 'Use port 3000', scope: 'personal', type: 'constraint' }, { actor: 'user' });
+    const proposal = store.create(
+      { content: 'Use port 4000', scope: 'personal', type: 'constraint', status: 'candidate' },
+      { actor: 'system' },
+    );
+    store.addRelation(proposal.id, target.id, 'revises');
+    const ids = [proposal.id, target.id];
+    const before = ids.map((id) => ({ item: store.getById(id), events: store.getEvents(id) }));
+    expect(store.getKv(`revision_targets:${proposal.id}`)).toBeNull();
+
+    expect(() => store.acceptRevision(proposal.id, { actor: 'user' }, { content: 'edited draft' })).toThrow();
+    expect(ids.map((id) => ({ item: store.getById(id), events: store.getEvents(id) }))).toEqual(before);
   });
 
   it('a MERGE proposal revises BOTH originals; accepting archives the pair (REDESIGN D5)', () => {
@@ -947,7 +1067,7 @@ describe('reinforce + revision plumbing (self-evolution)', () => {
     )!;
     expect(proposal).not.toBeNull();
     expect(store.revisionTargetsOf(proposal.id).map((t) => t.id).sort()).toEqual([a.id, b.id].sort());
-
+    // Both originals now sit behind an open revision (excluded from stale/redundant lanes).
     expect(store.hasOpenRevision(a.id)).toBe(true);
     expect(store.hasOpenRevision(b.id)).toBe(true);
 
@@ -958,11 +1078,29 @@ describe('reinforce + revision plumbing (self-evolution)', () => {
     expect(store.getById(b.id)!.status).toBe('archived');
   });
 
+  it('rejects a stale merge snapshot without mutating the candidate, either target, or event histories', () => {
+    const store = freshStore();
+    const a = store.create({ content: 'Use pnpm, never npm, in this repo', scope: 'personal', type: 'constraint' }, { actor: 'user' });
+    const b = store.create({ content: 'The user wants pnpm instead of npm', scope: 'personal', type: 'preference' }, { actor: 'agent' });
+    const proposal = store.createMergeProposal(
+      { content: 'Use pnpm for this repository', scope: 'personal', type: 'constraint' },
+      [a.id, b.id],
+      { actor: 'system' },
+      { expectedContents: [a.content, b.content] },
+    )!;
+    store.update(b.id, { content: 'The user now prefers Bun' }, { actor: 'user' });
+    const ids = [proposal.id, a.id, b.id];
+    const before = ids.map((id) => ({ item: store.getById(id), events: store.getEvents(id) }));
+
+    expect(() => store.acceptRevision(proposal.id, { actor: 'user' }, { content: 'edited merge draft' })).toThrow();
+    expect(ids.map((id) => ({ item: store.getById(id), events: store.getEvents(id) }))).toEqual(before);
+  });
+
   it('createMergeProposal CAS: a moved original voids the draft', () => {
     const store = freshStore();
     const a = store.create({ content: 'Use pnpm', scope: 'personal', type: 'constraint' }, { actor: 'user' });
     const b = store.create({ content: 'pnpm preferred', scope: 'personal', type: 'preference' }, { actor: 'agent' });
-    store.update(a.id, { content: 'Use bun now' }, { actor: 'user' });
+    store.update(a.id, { content: 'Use bun now' }, { actor: 'user' }); // moved during the draft await
     const proposal = store.createMergeProposal(
       { content: 'merged', scope: 'personal', type: 'constraint' },
       [a.id, b.id],
@@ -1000,7 +1138,7 @@ describe('trace label events', () => {
     store.recordTraceLabel(a.id, 'operational', { actor: 'agent', sessionId: 's1', turn: 2 });
 
     const labels = store.latestTraceLabels();
-    expect(labels.get(a.id)).toBe('operational');
+    expect(labels.get(a.id)).toBe('operational'); // last wins
     expect(labels.get(b.id)).toBe('operational');
 
     const events = store.getEvents(a.id).filter((e) => e.kind === 'trace');
@@ -1026,7 +1164,7 @@ describe('expiry (stale=过期) + renew + open revisions', () => {
     await Bun.sleep(5);
     store.recordUse(used.id, { actor: 'agent', via: 'citation' });
     store.renewMemory(renewed.id, { actor: 'user' });
-
+    // A per-turn trace verdict is passive observation, not a reference.
     store.recordTraceLabel(untouched.id, 'operational', { actor: 'agent', turn: 1 });
 
     expect(store.listExpired({ boundaryTs: boundary }).map((m) => m.id)).toEqual([untouched.id]);
@@ -1043,9 +1181,10 @@ describe('expiry (stale=过期) + renew + open revisions', () => {
     const boundary = new Date().toISOString();
     await Bun.sleep(5);
     store.createRevisionProposal({ content: 't2', scope: 'personal', type: 'fact' }, targeted.id, { actor: 'system' });
-    store.create({ content: 'f', scope: 'personal', type: 'fact' }, { actor: 'user' });
+    store.create({ content: 'f', scope: 'personal', type: 'fact' }, { actor: 'user' }); // fresh: created inside the window
 
-
+    // Only `targeted` predates the boundary without freshness — and its open
+    // revision keeps it out of the stale lane. Nothing may be flagged.
     expect(store.listExpired({ boundaryTs: boundary })).toEqual([]);
   });
 
@@ -1105,7 +1244,7 @@ describe('revertAutoAccept (delegating/Auto mode inverse)', () => {
     const { reverted, restored } = store.revertAutoAccept(c.id, { actor: 'user' });
     expect(reverted.status).toBe('candidate');
     expect(restored).toBeNull();
-
+    // Both status transitions are in the event log — nothing is erased.
     const statusEvents = store.getEvents(c.id).filter((e) => e.kind === 'status');
     expect(statusEvents.length).toBeGreaterThanOrEqual(2);
   });
@@ -1125,7 +1264,7 @@ describe('revertAutoAccept (delegating/Auto mode inverse)', () => {
     expect(reverted.status).toBe('candidate');
     expect(restored?.id).toBe(target.id);
     expect(store.getById(target.id)!.status).toBe('active');
-
+    // The proposal is pending again — the review lane can re-decide it.
     expect(store.hasOpenRevision(target.id)).toBe(true);
   });
 
@@ -1143,7 +1282,7 @@ describe('revertAutoAccept (delegating/Auto mode inverse)', () => {
     store.update(c.id, { content: 'USER_EDIT_AFTER_AUTO' }, { actor: 'user' });
 
     expect(() => store.revertAutoAccept(c.id, { actor: 'user' })).toThrow('edited after the auto-accept');
-
+    // The user's newer text survives untouched.
     expect(store.getById(c.id)!.content).toBe('USER_EDIT_AFTER_AUTO');
     expect(store.getById(c.id)!.status).toBe('active');
   });

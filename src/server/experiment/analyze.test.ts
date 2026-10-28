@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { analyzeEvents } from "./analyze"
 
 const FIXTURE = [
-
+  // session s1: inject → preview(go_on) → cite → capture(2/1/1) → trace
   { ts: "t", condition: "memosync", participant: "P03", type: "memory.inject", sessionId: "s1", engine: "claude", memories: [{ id: "M-01", scope: "personal" }, { id: "M-02", scope: "project" }], tokenEstimate: 300 },
   { ts: "t", condition: "memosync", type: "memory.preview", sessionId: "s1", engine: "claude", turn: 1, memoryIds: ["M-02"], decision: "go_on" },
   { ts: "t", condition: "memosync", type: "memory.cite", sessionId: "s1", citedIds: ["M-02"], countedIds: ["M-02"] },
@@ -11,14 +11,14 @@ const FIXTURE = [
   { ts: "t", condition: "memosync", type: "memory.capture", sessionId: "s1", turn: 1, proposed: 2, surfaced: 1, dropped: 1, sensitive: 0 },
   { ts: "t", condition: "memosync", type: "memory.conflict", sessionId: "s1", turn: 1, newId: "M-09", staleId: "M-02" },
   { ts: "t", condition: "memosync", type: "memory.trace", sessionId: "s1", turn: 1, labels: [{ id: "M-01", label: "injected_without_effect" }, { id: "M-02", label: "operational" }] },
-
+  // session s2: preview dismissed + one auto-proceed (empty plan, setting on)
   { ts: "t", condition: "memosync", type: "memory.preview", sessionId: "s2", engine: "claude", turn: 1, memoryIds: [], decision: "dismiss" },
   { ts: "t", condition: "memosync", type: "memory.preview", sessionId: "s2", engine: "claude", turn: 2, memoryIds: [], decision: "auto_go_on" },
   { ts: "t", condition: "memosync", type: "memory.bringin", sessionId: "s2", ids: ["M-01"] },
-
+  // global UI decisions (no sessionId)
   { ts: "t", condition: "memosync", type: "memory.decision", action: "accept", id: "M-03", via: "ui" },
   { ts: "t", condition: "memosync", type: "memory.decision", action: "dismiss", id: "M-04", via: "ui" },
-
+  // junk line should be skipped
 ]
 
 const lines = [...FIXTURE.map((e) => JSON.stringify(e)), "not json", ""]
@@ -45,7 +45,7 @@ describe("analyzeEvents", () => {
     const s2 = report.sessions["s2"]
     expect(s2.previewDecisions.dismiss).toBe(1)
     expect(s2.participant).toBeUndefined()
-
+    // auto_go_on is its own category (STUDY_PLAN §2.4: distinguish from manual go_on)
     expect(s2.previewDecisions.auto_go_on).toBe(1)
     expect(s2.bringIns).toBe(1)
   })
@@ -54,7 +54,7 @@ describe("analyzeEvents", () => {
     const report = analyzeEvents(lines)
     expect(report.totals.sessions).toBe(2)
     expect(report.totals.events).toBe(FIXTURE.length)
-    expect(report.totals.skippedLines).toBe(1)
+    expect(report.totals.skippedLines).toBe(1) // "not json" (empty lines ignored)
     expect(report.totals.decisions).toEqual({ create: 0, accept: 1, edit: 0, dismiss: 1, rescope: 0, archive: 0, revert: 0 })
     expect(report.totals.acceptRate).toBeCloseTo(0.5)
     expect(report.totals.traceLabels.operational).toBe(1)
@@ -65,7 +65,7 @@ describe("analyzeEvents", () => {
     const csv = report.toCsv()
     const rows = csv.trim().split("\n")
     expect(rows[0]).toContain("sessionId")
-    expect(rows).toHaveLength(3)
+    expect(rows).toHaveLength(3) // header + 2 sessions
     expect(rows.some((r) => r.startsWith("s1,"))).toBe(true)
   })
 
@@ -198,8 +198,8 @@ test("production MemoSync interrupt, resume, and Enforce stay in one task-window
       via: "board",
     },
     {
-
-
+      // Legacy chat-scoped events emitted beside a v2 focus delivery still
+      // belong to the delivery's authoritative task window.
       ts: "t",
       condition: "memosync",
       type: "memory.cite",

@@ -1,58 +1,40 @@
+// Integration tests for the memory preview gate + injection lifecycle at the
+// AgentCoordinator level: park → decide → boot/cancel, queueing while parked,
+// what memory set actually reaches the (fake) Claude engine, and how the
+// MemoSync policy controls injection and session rebuild.
+// Integration tests for the memory preview gate + injection lifecycle at the
+// AgentCoordinator level: park → decide → boot/cancel, queueing while parked,
+// what memory set actually reaches the (fake) Claude engine, and how the
+// MemoSync policy controls injection and session rebuild.
+import { describe, expect, test } from "bun:test";
+
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { AgentCoordinator } from "./agent";
+
+import { MemoryService } from "./memory";
+import { resolveConditionPolicy, type ConditionPolicy } from "./experiment/condition";
+import type { TraceInput, TraceService } from "./memory/trace";
+import { createCaptureService, type CaptureService } from "./memory/capture";
+import type { LlmJsonCaller } from "./memory/deepseek";
+import type { CheckupService } from "./memory/checkup";
+import type { TransferDetectService, TransferSuggestionCard } from "./memory/transfer-detect";
+import type { RelevanceService } from "./memory/relevance";
+import type { UsePlanService } from "./memory/use-plan";
+import type { MemoryToolContext } from "./memory/tools";
+import { type ChatAttachment, type TranscriptEntry } from "../shared/types";
+import { StudyMemoryStore } from "./experiment/study-memory-store";
+import { buildDeliveredStoreFocusEvent } from "./experiment/focus";
 
 
-import { describe, expect, test } from "bun:test"
-import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { AgentCoordinator } from "./agent"
-import { createWsRouter } from "./ws-router"
-import { MemoryService } from "./memory"
-import { resolveConditionPolicy, type ConditionPolicy } from "./experiment/condition"
-import type { TraceInput, TraceService } from "./memory/trace"
-import { createCaptureService, type CaptureService } from "./memory/capture"
-import type { LlmJsonCaller } from "./memory/deepseek"
-import type { CheckupService } from "./memory/checkup"
-import type { TransferDetectService, TransferSuggestionCard } from "./memory/transfer-detect"
-import type { RelevanceService } from "./memory/relevance"
-import type { UsePlanService } from "./memory/use-plan"
-import type { MemoryToolContext } from "./memory/tools"
-import { PROTOCOL_VERSION, type ChatAttachment, type TranscriptEntry } from "../shared/types"
-import { StudyMemoryStore } from "./experiment/study-memory-store"
-import { buildDeliveredStoreFocusEvent } from "./experiment/focus"
-import { MEMORY_ATOM_SPEC_VERSION } from "./memory/atom-spec"
-import {
-  createStaticMemoryExtractor,
-  STATIC_EXTRACTOR_VERSION,
-  type StaticMemoryExtractor,
-} from "./experiment/static-memory-extractor"
-import { buildStaticFocusPayload } from "./memory/static-files"
-import type { StudyPromptGate } from "./study-prompt-gate"
-import {
-  createMemoryBoardBacklogService,
-  type MemoryBoardBacklogService,
-} from "./memory/board-backlog"
-import {
-  captureContainedAttachment,
-  createStudyOpeningAttachmentSnapshotStore,
-  type StudyOpeningAttachmentSnapshotStore,
-} from "./study-opening-attachments"
+
+import type { StudyPromptGate } from "./study-prompt-gate";
+import { createMemoryBoardBacklogService, type MemoryBoardBacklogService } from "./memory/board-backlog";
+import { captureContainedAttachment, createStudyOpeningAttachmentSnapshotStore, type StudyOpeningAttachmentSnapshotStore } from "./study-opening-attachments";
 
 function timestampedKinds(messages: TranscriptEntry[]): string[] {
   return messages.map((m) => m.kind)
-}
-
-class FakeWebSocket {
-  readonly sent: unknown[] = []
-  readonly data = {
-    subscriptions: new Map(),
-    snapshotSignatures: new Map(),
-    protectedDraftChatIds: new Set<string>(),
-  }
-
-  send(message: string) {
-    this.sent.push(JSON.parse(message))
-  }
 }
 
 async function waitFor(condition: () => boolean, timeoutMs = 2000) {
@@ -61,28 +43,6 @@ async function waitFor(condition: () => boolean, timeoutMs = 2000) {
     if (Date.now() - start > timeoutMs) throw new Error("Timed out waiting for condition")
     await new Promise((r) => setTimeout(r, 10))
   }
-}
-
-function createBlockedCapture(afterRelease?: () => void | Promise<void>) {
-  let markStarted!: () => void
-  const started = new Promise<void>((resolve) => { markStarted = resolve })
-  let unblock!: () => void
-  const blocked = new Promise<void>((resolve) => { unblock = resolve })
-  const outcome = () => ({
-    created: [], proposed: 0, surfaced: 0, dropped: 0, conflicts: 0,
-    reinforced: 0, reinforcedIds: [], revisions: 0, pending: [],
-  })
-  const capture: CaptureService = {
-    capture: async () => {
-      markStarted()
-      await blocked
-      await afterRelease?.()
-      return outcome()
-    },
-    routeProposal: async () => outcome(),
-    captureFromPrompt: async () => outcome(),
-  }
-  return { capture, started, release: unblock }
 }
 
 class AsyncEventQueue<T> implements AsyncIterable<T> {
@@ -119,7 +79,7 @@ function createFakeStore(
     id: "chat-1",
     projectId: "project-1",
     title: "New Chat",
-    provider: null as "claude" | "codex" | null,
+    provider: null as "claude" | "codex" | "pi" | null,
     planMode: false,
     sessionToken: null as string | null,
     pendingForkSessionToken: null as string | null,
@@ -139,7 +99,7 @@ function createFakeStore(
     getMessages() {
       return this.messages
     },
-    async setChatProvider(_c: string, provider: "claude" | "codex") {
+    async setChatProvider(_c: string, provider: "claude" | "codex" | "pi") {
       chat.provider = provider
     },
     async setPlanMode(_c: string, planMode: boolean) {
@@ -225,14 +185,16 @@ interface Harness {
   studyMemoryStore: StudyMemoryStore | null
   workspaceDir: string
   sessionStarts: Array<{ memory: MemoryService | null; sessionToken: string | null; policy?: ConditionPolicy; memoryPlan?: import('./memory/injection').MemoryInjectionPlan | null }>
+  claudeSessionCloses: number[]
   prompts: string[]
   promptContexts: Array<ClaudePromptContext | undefined>
+  interrupts: number
   openingBoardBacklog: MemoryBoardBacklogService | null
   finishTurn: () => void
   emitEntry: (entry: Record<string, unknown>) => void
-
+  /** Push a raw harness event (e.g. assistant_delta) onto the live stream. */
   emitEvent: (event: Record<string, unknown>) => void
-
+  /** End the live stream without a result entry — a mid-reply death. */
   closeStream: () => void
   cleanup: () => void
 }
@@ -241,48 +203,47 @@ type ClaudePromptContext = Pick<MemoryToolContext, "turn" | "engine" | "allowedM
 
 function createHarness(
   opts: {
-
+    /** Enable the preview gate (the injection receipt). */
     preview?: boolean
     traceInputs?: TraceInput[]
-
+    /** Full trace-service override (takes precedence over traceInputs). */
     trace?: TraceService | null
-
+    /** Capture service (enables propose_memory + the per-turn capture nudge). */
     capture?: CaptureService | null
-
+    /** Step-one library checkup (container 2); null disables the stage. */
     checkup?: CheckupService | null
-
+    /** Transfer detection (the card between Step 1 and Step 2); null disables. */
     transferDetect?: TransferDetectService | null
-
+    /** Relevance sidecar (REDESIGN D6): highlight prediction on the receipt. */
     relevance?: RelevanceService | null
-
+    /** Turn-scoped explanation injected alongside the selected ids. */
     usePlan?: UsePlanService | null
-
+    /** Fork-trace stub; defaults to "fork unavailable" so sidecar paths stay deterministic. */
     forkTrace?: (input: { sessionToken: string; localPath: string; usedMemories: Array<{ id: string; content: string }> }) => Promise<Record<string, unknown> | null>
-
-    forkCapture?: (input: { sessionToken: string; localPath: string; profile?: 'review' | 'auto-project-copy' }) => Promise<Record<string, unknown> | null>
-
+    /** Fork-capture stub; defaults to "fork unavailable" so sidecar capture stays deterministic. */
+    forkCapture?: (input: { sessionToken: string; localPath: string }) => Promise<Record<string, unknown> | null>
+    /** Current-session Transfer relevance fork; null/failure falls back to the sidecar. */
     forkQuery?: (input: { sessionToken: string; localPath: string; prompt: string }) => Promise<Record<string, unknown> | null>
     experimentEvents?: Array<Record<string, unknown>>
     experimentLogger?: MemoryService["logger"]
-
+    /** Active study task stamped onto delivered focus records. */
     activeStudyTaskId?: string | null
-    staticMemoryExtractor?: StaticMemoryExtractor | null
-
+    /** Hold or inspect the fake Claude queue acknowledgement. */
     onSendPrompt?: (text: string, context?: ClaudePromptContext) => Promise<void>
-
+    /** Hold provider boot before a HarnessTurn exists or activeTurns can own it. */
     beforeClaudeSessionStart?: () => Promise<void>
-
+    /** Provider-boundary failure injection, counted from one. */
     failClaudeSessionStartAttempts?: number[]
-
+    /** Filesystem boundary seam: hold a transcript write before it becomes visible. */
     beforeAppendMessage?: (entry: TranscriptEntry) => Promise<void>
-
+    /** Filesystem seam after shouldAppend authorized delivery but before it completes. */
     afterAppendAuthorized?: (entry: TranscriptEntry) => Promise<void>
     onTurnFailed?: (message: string) => void
     onStateChange?: (chatId?: string) => void
     policy?: ConditionPolicy
     previewSettings?: { enabled: boolean; autoProceedWhenEmpty: boolean }
     claudeSessionFileExists?: (localPath: string, token: string) => boolean
-
+    /** Server-authoritative study admission shared by WS send/enqueue/steer/drain. */
     studyPromptGate?: StudyPromptGate | null
     onParticipantPromptRecorded?: (input: {
       taskId: string
@@ -292,7 +253,7 @@ function createHarness(
       attachments: ChatAttachment[]
       acceptedAt: string
     }) => void
-
+    /** Run the first prompt's Long-term gates behind the durable opening Board barrier. */
     openingBoard?: boolean
     openingAttachmentSnapshots?: StudyOpeningAttachmentSnapshotStore
   } = {},
@@ -315,8 +276,8 @@ function createHarness(
     opts.afterAppendAuthorized,
     opts.onTurnFailed,
   )
-
-
+  // Production wires durable Board-row invalidation back into the coordinator
+  // (server.ts); mirror that bridge so parked gates can be reconciled here.
   let coordinatorRef: AgentCoordinator | null = null
   const openingBoardBacklog = opts.openingBoard
     ? createMemoryBoardBacklogService({
@@ -334,9 +295,11 @@ function createHarness(
       })
     : null
   const sessionStarts: Harness["sessionStarts"] = []
+  const claudeSessionCloses: number[] = []
   const prompts: string[] = []
   const promptContexts: Harness["promptContexts"] = []
-
+  let interrupts = 0
+  // One stream per session: recreation tests must not double-consume a queue.
   const queues: AsyncEventQueue<any>[] = []
 
   const traceStub: TraceService | null = opts.trace
@@ -354,7 +317,6 @@ function createHarness(
     onStateChange: opts.onStateChange ?? (() => {}),
     memory,
     studyMemoryStore,
-    staticMemoryExtractor: opts.staticMemoryExtractor ?? null,
     capture: opts.capture ?? null,
     memoryCheckup: opts.checkup ?? null,
     memoryTransferDetect: opts.transferDetect ?? null,
@@ -371,8 +333,8 @@ function createHarness(
     onParticipantPromptRecorded: opts.onParticipantPromptRecorded,
     openingBoardBacklog,
     getMemoryPreviewSettings: opts.previewSettings ? () => opts.previewSettings! : undefined,
-
-
+    // Default: any token is "stale" (no real ~/.claude in tests). Tests that
+    // need a valid token can override.
     claudeSessionFileExists: opts.claudeSessionFileExists ?? (() => false),
     generateTitle: async () => ({ title: "t", usedFallback: true, failureMessage: null }),
     startClaudeSession: async (args) => {
@@ -389,12 +351,18 @@ function createHarness(
       }
       const events = new AsyncEventQueue<any>()
       queues.push(events)
+      claudeSessionCloses.push(0)
       return {
         provider: "claude",
         stream: events,
         getAccountInfo: async () => null,
-        interrupt: async () => {},
-        close: () => queues[queues.length - 1] === events && events.close(),
+        interrupt: async () => {
+          interrupts += 1
+        },
+        close: () => {
+          claudeSessionCloses[attempt - 1] = (claudeSessionCloses[attempt - 1] ?? 0) + 1
+          events.close()
+        },
         setModel: async () => {},
         setPermissionMode: async () => {},
         sendPrompt: async (text: string, context?: ClaudePromptContext) => {
@@ -415,8 +383,10 @@ function createHarness(
     studyMemoryStore,
     workspaceDir,
     sessionStarts,
+    claudeSessionCloses,
     prompts,
     promptContexts,
+    get interrupts() { return interrupts },
     openingBoardBacklog,
     finishTurn: () =>
       queues[queues.length - 1]?.push({
@@ -941,8 +911,9 @@ describe("memory preview gate (coordinator)", () => {
   })
 
   test("opening Continue completes after the participant skips this opening's own Checkup row (no self-reopening loop)", async () => {
-
-
+    // P20 (pilot 2026-08-22): Skip remaining & continue on the opening Checkup
+    // created a durable skipped row that the same opening counted as pending,
+    // rolled long_term_ready back to preparing, and reran the whole pipeline.
     const emptyCapture = {
       created: [], proposed: 0, surfaced: 0, dropped: 0, conflicts: 0,
       reinforced: 0, reinforcedIds: [], revisions: 0, pending: [],
@@ -994,12 +965,12 @@ describe("memory preview gate (coordinator)", () => {
         message.kind === "memory_checkup_result" && message.suggestions.length === 1))
       const checkupId = h.store.messages.find((message) => message.kind === "memory_checkup")!.checkupId
 
-
+      // Skip remaining & continue in the opening Board's Step 3 station.
       await h.coordinator.respondMemoryCheckup({ chatId: "chat-1", checkupId, decision: "skipped" })
       await waitFor(() => h.openingBoardBacklog!.reviewState(opening.taskId).openingPrompt?.phase === "long_term_ready")
       expect(h.openingBoardBacklog!.reviewState(opening.taskId).pending).toMatchObject({ checkups: 0, total: 0 })
 
-
+      // Continue with this message: the skipped row belongs to this opening and must not reopen it.
       const completion = h.openingBoardBacklog!.completeOpeningPromptReview(
         h.openingBoardBacklog!.reviewState(opening.taskId).openingPrompt!,
       )
@@ -1010,7 +981,7 @@ describe("memory preview gate (coordinator)", () => {
         message.kind === "memory_preparation_reset" && message.openingReviewId === opening.reviewId)
       expect(openingResets).toHaveLength(0)
       expect(h.store.messages.filter((message) => message.kind === "memory_checkup_decision")).toHaveLength(1)
-
+      // The skip still means "later": the next task's opening sees the row.
       expect(h.openingBoardBacklog!.reviewState("038-S2").pending).toMatchObject({ checkups: 1 })
     } finally {
       h.cleanup()
@@ -1018,8 +989,8 @@ describe("memory preview gate (coordinator)", () => {
   })
 
   test("invalidating a durable Checkup row recomputes the parked opening gate instead of leaving it waiting", async () => {
-
-
+    // P20 03:06:34 / P39 05:59:32: the durable backlog row was cleared from
+    // another chat while the owner chat's in-process gate kept waiting.
     const emptyCapture = {
       created: [], proposed: 0, surfaced: 0, dropped: 0, conflicts: 0,
       reinforced: 0, reinforcedIds: [], revisions: 0, pending: [],
@@ -1075,7 +1046,8 @@ describe("memory preview gate (coordinator)", () => {
       await h.coordinator.respondMemoryCheckup({ chatId: "chat-1", checkupId, decision: "skipped" })
       await waitFor(() => h.openingBoardBacklog!.reviewState(opening.taskId).openingPrompt?.phase === "long_term_ready")
 
-
+      // A genuine external pool mutation after ready forces the CAS rollback and a rerun
+      // that re-parks the same Checkup gate while the old skipped row stays durable.
       h.memory.store.create(
         { content: "Deploy previews from the main branch", scope: "project", projectId: "project-1", type: "constraint" },
         { actor: "user" },
@@ -1089,7 +1061,8 @@ describe("memory preview gate (coordinator)", () => {
         message.kind === "memory_checkup_result" && message.suggestions.length === 1).length >= 2)
       expect(h.openingBoardBacklog!.reviewState(opening.taskId).openingPrompt?.phase).toBe("preparing")
 
-
+      // From another surface the participant archives one memory of the pair; the
+      // next durable read invalidates the row and must wake the parked gate.
       h.memory.store.archive(pair.b.id, { actor: "user" })
       const runsBeforeInvalidation = checkupRuns
       expect(h.openingBoardBacklog!.reviewState(opening.taskId).pending).toMatchObject({ checkups: 0 })
@@ -1611,6 +1584,68 @@ describe("memory preview gate (coordinator)", () => {
       expect(h.store.messages.filter((message) => message.kind === "user_prompt")).toHaveLength(1)
       expect(h.store.turnStartedCount).toBe(1)
     } finally {
+      h.cleanup()
+    }
+  })
+
+  test.each(["stop", "recover again"] as const)("restored preview provider startup remains owned during %s", async (action) => {
+    let entered!: () => void
+    let release!: () => void
+    const starting = new Promise<void>((resolve) => { entered = resolve })
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const h = createHarness({
+      preview: true, openingBoard: true, activeStudyTaskId: "038-S1",
+      policy: resolveConditionPolicy("memosync"),
+      beforeClaudeSessionStart: async () => { entered(); await gate },
+    })
+    const opening = {
+      taskId: "038-S1", chatId: "chat-1", reviewId: `restored-startup-${action}`,
+      content: "Build the dashboard", attachments: [],
+    }
+    const previewId = "restored-startup-preview"
+    try {
+      const prepared = h.openingBoardBacklog!.prepareOpeningPrompt(opening)
+      h.openingBoardBacklog!.claimOpeningPromptDispatch(opening)
+      h.openingBoardBacklog!.markOpeningPromptLongTermReady(prepared)
+      h.openingBoardBacklog!.completeOpeningPromptReview(prepared)
+      h.store.messages.push({
+        _id: opening.reviewId, createdAt: 1, kind: "user_prompt",
+        content: opening.content, attachments: [],
+      }, {
+        _id: previewId, createdAt: 2, kind: "memory_preview", previewId,
+        turn: 1, task: opening.content, memories: [],
+      })
+      h.store.turnStartedCount = 1
+      h.coordinator.resumeOpeningBoardPreparation()
+      await waitFor(() => h.coordinator.pendingPreviews.has(opening.chatId))
+      await h.coordinator.respondMemoryPreview({ chatId: opening.chatId, previewId, decision: "go_on" })
+      await starting
+      expect(h.coordinator.getActiveStatuses().has(opening.chatId)).toBe(true)
+      if (action === "stop") {
+        await h.coordinator.cancel(opening.chatId)
+        release()
+        await waitFor(() => h.claudeSessionCloses[0] === 1)
+        expect(h.prompts).toEqual([])
+        expect(h.store.turnCancelledCount).toBe(1)
+        expect(h.store.messages.filter((entry) => entry.kind === "interrupted")).toHaveLength(1)
+        h.coordinator.resumeOpeningBoardPreparation()
+        await Bun.sleep(20)
+        expect(h.prompts).toEqual([])
+        expect(h.sessionStarts).toHaveLength(1)
+      } else {
+        h.coordinator.resumeOpeningBoardPreparation()
+        h.coordinator.resumeOpeningBoardPreparation()
+        await Bun.sleep(20)
+        expect(h.sessionStarts).toHaveLength(1)
+        release()
+        await waitFor(() => h.prompts.length === 1)
+        expect(h.sessionStarts).toHaveLength(1)
+        expect(h.store.messages.filter((entry) => entry.kind === "memory_preview_decision")).toHaveLength(1)
+      }
+    } finally {
+      release()
+      await h.coordinator.cancel(opening.chatId)
+      await h.coordinator.shutdownStudyRuntime()
       h.cleanup()
     }
   })
@@ -2242,7 +2277,8 @@ describe("memory preview gate (coordinator)", () => {
 
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "push my changes" })
 
-
+      // send() resolved while the gate is parked — the deadlock regression.
+      // (The detached continuation appends the card a few microtasks later.)
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview"))
       expect(timestampedKinds(h.store.messages)).toEqual(["user_prompt", "memory_preview"])
       expect(h.sessionStarts).toHaveLength(0)
@@ -2434,7 +2470,230 @@ describe("memory preview gate (coordinator)", () => {
     }
   })
 
-  test("Start keeps the preview claim through provider boot until active-turn ownership is installed", async () => {
+  test("Stop orders a delayed canceled prompt before a later turn", async () => {
+    let promptWriteStarted!: () => void
+    const started = new Promise<void>((resolve) => { promptWriteStarted = resolve })
+    let releasePromptWrite!: () => void
+    const promptWrite = new Promise<void>((resolve) => { releasePromptWrite = resolve })
+    const h = createHarness({
+      beforeAppendMessage: async (entry) => {
+        if (entry.kind === "user_prompt" && entry.content === "cancel this startup") {
+          promptWriteStarted()
+          await promptWrite
+        }
+      },
+    })
+    const first = h.coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "claude", content: "cancel this startup",
+    })
+    let stopping: Promise<void> | undefined
+    try {
+      await started
+      stopping = h.coordinator.cancel("chat-1")
+
+      const queued = await h.coordinator.send({
+        type: "chat.send", chatId: "chat-1", provider: "claude", content: "fresh turn",
+      })
+      expect(queued).toMatchObject({ queued: true })
+      expect(h.prompts).toEqual([])
+      expect(h.store.messages.filter((message) => message.kind === "user_prompt")).toEqual([])
+
+      releasePromptWrite()
+      await stopping
+      await first
+      await waitFor(() => h.prompts.some((prompt) => prompt.startsWith("fresh turn")))
+      expect(h.store.messages.filter((message) => message.kind === "user_prompt").map((message) => message.content)).toEqual([
+        "cancel this startup",
+        "fresh turn",
+      ])
+      expect(h.store.messages.slice(0, 2).map((message) => message.kind)).toEqual(["user_prompt", "interrupted"])
+      expect(h.store.turnCancelledCount).toBe(1)
+
+      expect(h.prompts.map((prompt) => prompt.split("\n")[0])).toEqual(["fresh turn"])
+      expect(h.store.queuedMessages).toHaveLength(0)
+      expect(h.promptContexts.map((context) => context?.turn)).toEqual([2])
+    } finally {
+      releasePromptWrite()
+      await stopping?.catch(() => {})
+      await first.catch(() => {})
+      if (h.coordinator.activeTurns.has("chat-1")) await h.coordinator.cancel("chat-1")
+      h.cleanup()
+    }
+  })
+
+  test("late Claude startup closes its session without replacing the fresh owner", async () => {
+    let firstBootStarted!: () => void
+    const started = new Promise<void>((resolve) => { firstBootStarted = resolve })
+    let releaseFirstBoot!: () => void
+    const firstBoot = new Promise<void>((resolve) => { releaseFirstBoot = resolve })
+    let bootCount = 0
+    const h = createHarness({
+      beforeClaudeSessionStart: async () => {
+        bootCount += 1
+        if (bootCount === 1) {
+          firstBootStarted()
+          await firstBoot
+        }
+      },
+    })
+    const first = h.coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "claude", content: "stale startup",
+    })
+    try {
+      await started
+      await h.coordinator.cancel("chat-1")
+      await h.coordinator.send({
+        type: "chat.send", chatId: "chat-1", provider: "claude", content: "fresh owner",
+      })
+      await waitFor(() => h.prompts.some((prompt) => prompt.startsWith("fresh owner")))
+      const freshSessionId = h.coordinator.claudeSessions.get("chat-1")?.id
+      expect(freshSessionId).toBeDefined()
+
+      releaseFirstBoot()
+      await first
+      expect(h.coordinator.claudeSessions.get("chat-1")?.id).toBe(freshSessionId)
+      expect(h.claudeSessionCloses).toEqual([1, 0])
+      expect(h.prompts.map((prompt) => prompt.split("\n")[0])).toEqual(["fresh owner"])
+    } finally {
+      releaseFirstBoot()
+      await first.catch(() => {})
+      if (h.coordinator.activeTurns.has("chat-1")) await h.coordinator.cancel("chat-1")
+      h.cleanup()
+    }
+  })
+
+  test("settled startup reservations do not accumulate across chats", async () => {
+    let holdNextBoot = false
+    let deletedBootStarted!: () => void
+    const bootStarted = new Promise<void>((resolve) => { deletedBootStarted = resolve })
+    let releaseDeletedBoot!: () => void
+    const deletedBoot = new Promise<void>((resolve) => { releaseDeletedBoot = resolve })
+    const h = createHarness({
+      beforeClaudeSessionStart: async () => {
+        if (!holdNextBoot) return
+        holdNextBoot = false
+        deletedBootStarted()
+        await deletedBoot
+      },
+    })
+    const reservations = (h.coordinator as unknown as { startupReservations: Map<string, unknown> }).startupReservations
+    try {
+      for (const [index, chatId] of ["chat-1", "chat-2", "chat-3"].entries()) {
+        await h.coordinator.send({
+          type: "chat.send", chatId, provider: "claude", content: `turn ${index + 1}`,
+        })
+        await waitFor(() => h.prompts.length === index + 1)
+        expect(reservations.has(chatId)).toBe(false)
+        await h.coordinator.cancel(chatId)
+        await h.coordinator.closeChat(chatId)
+      }
+      expect(reservations.size).toBe(0)
+
+      holdNextBoot = true
+      const pendingDelete = h.coordinator.send({
+        type: "chat.send", chatId: "chat-deleted", provider: "claude", content: "deleted during boot",
+      })
+      await bootStarted
+      expect(reservations.has("chat-deleted")).toBe(true)
+      await h.coordinator.cancel("chat-deleted")
+      await h.coordinator.closeChat("chat-deleted")
+      expect(reservations.has("chat-deleted")).toBe(false)
+      releaseDeletedBoot()
+      await pendingDelete
+      await waitFor(() => h.claudeSessionCloses.length === 4)
+      expect(h.claudeSessionCloses[3]).toBe(1)
+      expect(reservations.size).toBe(0)
+    } finally {
+      releaseDeletedBoot()
+      for (const chatId of ["chat-1", "chat-2", "chat-3"]) {
+        if (h.coordinator.activeTurns.has(chatId)) await h.coordinator.cancel(chatId)
+      }
+      if (h.coordinator.activeTurns.has("chat-deleted")) await h.coordinator.cancel("chat-deleted")
+      h.cleanup()
+    }
+  })
+
+  test("Stop during Claude sendPrompt interrupts the active owner and permits a new turn", async () => {
+    let promptStarted!: () => void
+    const started = new Promise<void>((resolve) => { promptStarted = resolve })
+    let releasePrompt!: () => void
+    const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve })
+    const h = createHarness({
+      onSendPrompt: async (text) => {
+        if (text.startsWith("slow prompt")) {
+          promptStarted()
+          await promptGate
+        }
+      },
+    })
+    const first = h.coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "claude", content: "slow prompt",
+    })
+    try {
+      await started
+      await h.coordinator.cancel("chat-1")
+      expect(h.interrupts).toBe(1)
+      expect(h.store.turnCancelledCount).toBe(1)
+
+      const later = await h.coordinator.send({
+        type: "chat.send", chatId: "chat-1", provider: "claude", content: "after stop",
+      })
+      expect(later).not.toMatchObject({ queued: true })
+      await waitFor(() => h.prompts.some((prompt) => prompt.startsWith("after stop")))
+      expect(h.coordinator.activeTurns.has("chat-1")).toBe(true)
+      releasePrompt()
+      await first
+      expect(h.prompts.map((prompt) => prompt.split("\n")[0])).toEqual(["slow prompt", "after stop"])
+      expect(h.store.turnCancelledCount).toBe(1)
+      expect(h.coordinator.activeTurns.has("chat-1")).toBe(true)
+    } finally {
+      releasePrompt()
+      await first.catch(() => {})
+      if (h.coordinator.activeTurns.has("chat-1")) await h.coordinator.cancel("chat-1")
+      h.cleanup()
+    }
+  })
+
+  test("repeated concurrent Stop during startup records one terminal cancellation", async () => {
+    let promptWriteStarted!: () => void
+    const started = new Promise<void>((resolve) => { promptWriteStarted = resolve })
+    let releasePromptWrite!: () => void
+    const promptWrite = new Promise<void>((resolve) => { releasePromptWrite = resolve })
+    const h = createHarness({
+      beforeAppendMessage: async (entry) => {
+        if (entry.kind === "user_prompt") {
+          promptWriteStarted()
+          await promptWrite
+        }
+      },
+    })
+    const first = h.coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "claude", content: "cancel repeatedly",
+    })
+    try {
+      await started
+      const stopping = Promise.all([
+        h.coordinator.cancel("chat-1"),
+        h.coordinator.cancel("chat-1"),
+        h.coordinator.cancel("chat-1"),
+      ])
+      await Promise.resolve()
+      expect(h.store.messages.filter((message) => message.kind === "interrupted")).toHaveLength(0)
+      releasePromptWrite()
+      await stopping
+      expect(h.store.messages.filter((message) => message.kind === "interrupted")).toHaveLength(1)
+      expect(h.store.turnCancelledCount).toBe(1)
+      expect(h.store.messages.slice(0, 2).map((message) => message.kind)).toEqual(["user_prompt", "interrupted"])
+      await first
+      expect(h.sessionStarts).toHaveLength(0)
+    } finally {
+      releasePromptWrite()
+      await first.catch(() => {})
+      h.cleanup()
+    }
+  })
+
+  const runStartKeepsPreviewClaim = async (activeStudyTaskId: string | null) => {
     let providerBootStarted!: () => void
     const bootStarted = new Promise<void>((resolve) => {
       providerBootStarted = resolve
@@ -2445,7 +2704,7 @@ describe("memory preview gate (coordinator)", () => {
     })
     const h = createHarness({
       preview: true,
-      activeStudyTaskId: "038-S1",
+      activeStudyTaskId,
       policy: resolveConditionPolicy("memosync"),
       beforeClaudeSessionStart: async () => {
         providerBootStarted()
@@ -2476,12 +2735,12 @@ describe("memory preview gate (coordinator)", () => {
         operationId: "control:working-memory:start:provider-gap",
       })
       await bootStarted
-      await waitFor(() => !(h.coordinator as unknown as { startingChats: Map<string, string> })
-        .startingChats.has("chat-1"))
+      expect(h.coordinator.getActiveStatuses().get("chat-1")).toBe("starting")
       expect((h.coordinator as unknown as { activeTurns: Map<string, unknown> })
         .activeTurns.has("chat-1")).toBe(false)
 
-
+      // The decision is durable, but bootEngineTurn has not installed the
+      // active turn yet. The preview claim must still own both public gates.
       expect((h.coordinator as unknown as { claimedPreviewResponses: Map<string, string> })
         .claimedPreviewResponses.get("chat-1")).toBe(preview.previewId)
       expect(h.coordinator.studyFreezeBlocker()).not.toBeNull()
@@ -2500,7 +2759,15 @@ describe("memory preview gate (coordinator)", () => {
       releaseProviderBoot()
       h.cleanup()
     }
-  })
+  }
+
+  test.each([
+    ["without an active study task", null],
+    ["with active study task 038-S1", "038-S1"],
+  ] as const)(
+    "Start keeps the preview claim through provider boot until active-turn ownership is installed (%s)",
+    (_scenario, activeStudyTaskId) => runStartKeepsPreviewClaim(activeStudyTaskId),
+  )
 
   test("does not append a Start decision or dispatch Claude when the durable attempted claim fails", async () => {
     let attemptedCalls = 0
@@ -2802,7 +3069,7 @@ describe("memory preview gate (coordinator)", () => {
     const h = createHarness({ preview: true })
     try {
       h.memory.store.create({ content: "Only run MainTests", scope: "personal", type: "constraint" }, { actor: "system" })
-
+      // Hang the memory_preview append so Stop lands while the card is unpublished.
       let releaseAppend!: () => void
       const appendGate = new Promise<void>((r) => (releaseAppend = r))
       const originalAppend = h.store.appendMessage.bind(h.store)
@@ -2817,7 +3084,8 @@ describe("memory preview gate (coordinator)", () => {
       releaseAppend()
       await waitFor(() => h.store.turnCancelledCount === 1)
 
-
+      // The gate unwound: no dismiss decision referencing an unpublished card,
+      // and the engine never boots for the cancelled turn.
       expect(h.store.messages.some((m) => m.kind === "memory_preview_decision")).toBe(false)
       expect(h.sessionStarts).toHaveLength(0)
       expect(h.coordinator.pendingPreviews.has("chat-1")).toBe(false)
@@ -2845,8 +3113,8 @@ describe("memory preview gate (coordinator)", () => {
   })
 
   test("two concurrent sends during the gate-setup window start exactly ONE turn (busy-guard race)", async () => {
-
-
+    // Holding the memory_preview append models the async window between the
+    // busy guard and pendingPreviews being published.
     let releaseAppend!: () => void
     const appendGate = new Promise<void>((r) => (releaseAppend = r))
     const h = createHarness({ preview: true })
@@ -2859,13 +3127,13 @@ describe("memory preview gate (coordinator)", () => {
       }
       const first = h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "one" })
       await waitFor(() => h.store.messages.some((m) => m.kind === "user_prompt"))
-
+      // Second send lands during that window — must be queued, not a duplicate.
       const r2 = await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "two" })
       expect((r2 as any).queued).toBe(true)
       releaseAppend()
       await first
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview"))
-
+      // Exactly one preview parked → exactly one turn in flight.
       expect(h.store.messages.filter((m) => m.kind === "memory_preview")).toHaveLength(1)
       expect(h.store.messages.filter((m) => m.kind === "user_prompt")).toHaveLength(1)
     } finally {
@@ -2899,15 +3167,16 @@ describe("memory preview gate (coordinator)", () => {
   })
 
   test("engine boot recreates a missing project directory (container-rebuild cwd loss)", async () => {
-
-
+    // The project dir lives on the container FS, not the /data volume — after
+    // a rebuild the recorded project points at a missing path and the engine
+    // spawn dies as a misleading posix_spawn ENOENT (QA BUG-001/002/004).
     const h = createHarness({})
     try {
       expect(existsSync(h.workspaceDir)).toBe(false)
       h.memory.store.create({ content: "x", scope: "personal", type: "fact" }, { actor: "system" })
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
       await waitFor(() => h.prompts.length === 1)
-      expect(existsSync(h.workspaceDir)).toBe(true)
+      expect(existsSync(h.workspaceDir)).toBe(true) // dir ensured before boot
     } finally {
       h.cleanup()
     }
@@ -2916,14 +3185,14 @@ describe("memory preview gate (coordinator)", () => {
   test("a stale resume token (recreated container) falls back to a FRESH session instead of a dead chat", async () => {
     const h = createHarness({})
     try {
-
-
+      // The chat carries a token whose session file no longer exists — the
+      // harness's claudeSessionFileExists override says "missing".
       h.store.chat.sessionToken = "stale-token-from-old-container"
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
       await waitFor(() => h.prompts.length === 1)
       expect(h.sessionStarts).toHaveLength(1)
-      expect(h.sessionStarts[0].sessionToken).toBeNull()
-      expect(h.store.chat.sessionToken).toBeNull()
+      expect(h.sessionStarts[0].sessionToken).toBeNull() // fresh boot, no resume
+      expect(h.store.chat.sessionToken).toBeNull() // stale token cleared in the store
     } finally {
       h.cleanup()
     }
@@ -2939,7 +3208,9 @@ describe("memory preview gate (coordinator)", () => {
       h.finishTurn()
       await waitFor(() => h.store.turnFinishedCount === 1)
 
-
+      // Quiet turn: session reused, prompt carries NO delta block. (The cite
+      // nudge rides every memory-bearing turn — a stable string, so the cache
+      // cost is a constant few tokens, never a rebuild.)
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 2" })
       await waitFor(() => h.prompts.length === 2)
       expect(h.sessionStarts).toHaveLength(1)
@@ -2948,7 +3219,9 @@ describe("memory preview gate (coordinator)", () => {
       h.finishTurn()
       await waitFor(() => h.store.turnFinishedCount === 2)
 
-
+      // A mid-session memory change (e.g. an accepted candidate) must reach the
+      // NEXT turn — as a delta note on the prompt, with the session REUSED (the
+      // whole point: the prompt cache survives the change).
       h.memory.store.create({ content: "newly accepted constraint", scope: "personal", type: "constraint" }, { actor: "user" })
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 3" })
       await waitFor(() => h.prompts.length === 3)
@@ -2957,7 +3230,7 @@ describe("memory preview gate (coordinator)", () => {
       expect(h.prompts[2]).toContain("(added)")
       expect(h.prompts[2]).toContain("newly accepted constraint")
 
-
+      // An EDIT (same id, changed content) also rides the delta, versioned.
       h.finishTurn()
       await waitFor(() => h.store.turnFinishedCount === 3)
       const all = h.memory.store.list({ status: "active" })
@@ -2969,7 +3242,8 @@ describe("memory preview gate (coordinator)", () => {
       expect(h.prompts[3]).toContain(`[${seed.id} v2] (edited, v1→v2)`)
       expect(h.prompts[3]).toContain("seed (edited)")
 
-
+      // And the delta is one-shot: the next quiet turn carries no delta again
+      // (the standing cite nudge is the only reminder left).
       h.finishTurn()
       await waitFor(() => h.store.turnFinishedCount === 4)
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 5" })
@@ -3003,9 +3277,9 @@ describe("memory preview gate (coordinator)", () => {
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "sync to the prod server" })
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview"))
       const preview = h.store.messages.find((m) => m.kind === "memory_preview") as Extract<TranscriptEntry, { kind: "memory_preview" }>
-
+      // The receipt itself stays a pure plan readout (nothing predicted on it)…
       expect(preview.memories.map((m) => m.id)).toContain(ssh.id)
-
+      // …and the prediction arrives as its OWN entry, tied to the preview.
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview_relevance"))
       const rel = h.store.messages.find((m) => m.kind === "memory_preview_relevance") as Extract<
         TranscriptEntry,
@@ -3018,7 +3292,7 @@ describe("memory preview gate (coordinator)", () => {
         expectedUse: "Use the SSH key path when deploying to production.",
       }])
 
-
+      // Going on: Claude receives the exact sentence shown in the preview.
       h.coordinator.respondMemoryPreview({ chatId: "chat-1", previewId: preview.previewId, decision: "go_on" })
       await waitFor(() => h.prompts.length === 1)
       expect(h.prompts[0]).toContain("How the selected memories are expected to guide this turn")
@@ -3041,10 +3315,10 @@ describe("memory preview gate (coordinator)", () => {
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview"))
       const preview = h.store.messages.find((m) => m.kind === "memory_preview") as Extract<TranscriptEntry, { kind: "memory_preview" }>
-
+      // The gate announced a prediction was coming…
       expect(preview.relevancePending).toBe(true)
-
-
+      // …so the failure still settles it: an EMPTY relevance entry ends the
+      // card's "picking…" state, and no hint ever reaches the prompt.
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview_relevance"))
       const rel = h.store.messages.find((m) => m.kind === "memory_preview_relevance") as Extract<
         TranscriptEntry,
@@ -3081,7 +3355,7 @@ describe("memory preview gate (coordinator)", () => {
       h.memory.store.create({ content: "seed", scope: "personal", type: "fact" }, { actor: "system" })
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 1" })
       await waitFor(() => h.prompts.length === 1)
-
+      // Quiet turn memory-wise, but the nudge still rides the reminder envelope.
       expect(h.prompts[0]).toContain("<system-reminder>")
       expect(h.prompts[0]).toContain("call propose_memory")
       expect(h.prompts[0]).not.toContain("Memory changes since last turn")
@@ -3162,10 +3436,11 @@ describe("memory preview gate (coordinator)", () => {
       h.finishTurn()
       await waitFor(() => h.store.turnFinishedCount === 1)
       await waitFor(() => h.store.messages.some((msg) => msg.kind === "result"))
-
+      // Give the detached post-turn passes a beat to settle.
       await new Promise((r) => setTimeout(r, 50))
 
-
+      // No verdict or per-memory history is persisted because the model judged
+      // stale text. A terminal marker still makes the discarded pass auditable.
       expect(h.store.messages.filter((msg) => msg.kind === "memory_trace").at(-1)).toMatchObject({
         kind: "memory_trace",
         status: "discarded",
@@ -3222,8 +3497,9 @@ describe("memory preview gate (coordinator)", () => {
   })
 
   test("a turn with no memory in play persists one empty audit terminal (2026-08-19 revision)", async () => {
-
-
+    // Zero injected + zero cited must NOT silently skip the trace pass: the
+    // chat needs a nothing-to-audit card and the Memory Record needs a settled
+    // state instead of an eternal "running…" row.
     const experimentEvents: Array<Record<string, unknown>> = []
     const h = createHarness({
       experimentEvents,
@@ -3234,8 +3510,8 @@ describe("memory preview gate (coordinator)", () => {
       },
     })
     try {
-
-
+      // Empty memory library: nothing can be injected, the scripted reply
+      // cites nothing.
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
       await waitFor(() => h.prompts.length === 1)
       h.finishTurn()
@@ -3267,7 +3543,8 @@ describe("memory preview gate (coordinator)", () => {
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 1" })
       await waitFor(() => h.prompts.length === 1)
 
-
+      // Mid-turn: a new memory becomes active (e.g. user accepts a candidate
+      // on the Board while the engine is still working).
       const m2 = h.memory.store.create({ content: "mid turn", scope: "personal", type: "fact" }, { actor: "user" })
 
       h.finishTurn()
@@ -3294,7 +3571,7 @@ describe("memory preview gate (coordinator)", () => {
 
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "你好" })
       await waitFor(() => h.prompts.length === 1)
-
+      // The reply follows the memory but never writes an [M-NN] marker.
       h.emitEntry({ kind: "assistant_text", text: "Hello! How can I help?" })
       h.finishTurn()
 
@@ -3319,10 +3596,10 @@ describe("memory preview gate (coordinator)", () => {
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "你好" })
       await waitFor(() => h.prompts.length === 1)
       h.emitEntry({ kind: "assistant_text", text: `Hello! Per [${m.id}] I reply in English.` })
-      await waitFor(() => h.memory.store.getById(m.id)!.usageCount === 1)
+      await waitFor(() => h.memory.store.getById(m.id)!.usageCount === 1) // citation bump
       h.finishTurn()
 
-
+      // Give the post-turn passes time to run — the count must stay at 1.
       await new Promise((r) => setTimeout(r, 150))
       expect(h.memory.store.getById(m.id)!.usageCount).toBe(1)
     } finally {
@@ -3346,19 +3623,19 @@ describe("memory preview gate (coordinator)", () => {
       }
 
       const sendPromise = h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hi" })
-
-
+      // While the gate is being set up the chat must not read as idle — a
+      // reload during this window used to show nothing at all.
       await waitFor(() => h.coordinator.getActiveStatuses().get("chat-1") === "previewing_memory")
       expect(stateChanges).toContain("chat-1")
 
       releaseAppend()
-
+      // The ack no longer rides on the gate — wait for the park, not the send.
       await sendPromise
       await waitFor(() => h.store.messages.some((m: any) => m.kind === "memory_preview"))
       const preview1 = h.store.messages.find((m: any) => m.kind === "memory_preview") as any
       h.coordinator.respondMemoryPreview({ chatId: "chat-1", previewId: preview1.previewId, decision: "dismiss" })
-
-
+      // The detached continuation releases the reservation after the park —
+      // wait for the status to clear rather than racing its finally block.
       await waitFor(() => h.coordinator.getActiveStatuses().get("chat-1") === undefined)
     } finally {
       h.cleanup()
@@ -3375,18 +3652,18 @@ describe("memory preview gate (coordinator)", () => {
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 1" })
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview"))
       const preview1 = h.store.messages.find((m: any) => m.kind === "memory_preview") as any
-
+      // The user edits the gate: keep m1, drop m2 — for THIS turn only.
       h.coordinator.respondMemoryPreview({ chatId: "chat-1", previewId: preview1.previewId, decision: "go_on", memoryIds: [m1.id] })
       await waitFor(() => h.prompts.length === 1)
       h.finishTurn()
       await waitFor(() => traceInputs.length === 1)
       expect(traceInputs[0].usedMemories.map((m) => m.id)).toEqual([m1.id])
 
-
+      // The decision entry records the selection (control-act ground truth).
       const decision1 = h.store.messages.find((m: any) => m.kind === "memory_preview_decision") as any
       expect(decision1.selectedIds).toEqual([m1.id])
 
-
+      // Next turn: the restriction expired — both memories inject again.
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 2" })
       await waitFor(() => h.store.messages.filter((m: any) => m.kind === "memory_preview").length === 2)
       const preview2 = h.store.messages.filter((m: any) => m.kind === "memory_preview").at(-1) as any
@@ -3425,8 +3702,8 @@ describe("memory preview gate (coordinator)", () => {
         content: "Implement the settings page",
       })
       await waitFor(() => h.prompts.length === 1)
-
-
+      // The provider starts the turn (system_init) before the participant can
+      // interrupt a cited memory; a started turn keeps its persistent Query.
       h.emitEntry({ kind: "system_init", provider: "claude", model: "claude-opus-4-1", tools: [], agents: [], slashCommands: [], mcpServers: [] })
       await waitFor(() => h.store.messages.some((message) => message.kind === "system_init"))
       await h.coordinator.interruptMemory({
@@ -3434,8 +3711,9 @@ describe("memory preview gate (coordinator)", () => {
         memoryId: removed.id,
         quote: "I started deploying before the page was ready.",
       })
-
-
+      // The real Claude stream acknowledges the cancelled prompt before the
+      // continuation result. Mirror that acknowledgement so prompt sequence 1
+      // cannot consume the resumed turn's result in this fake session.
       h.emitEntry({ kind: "interrupted" })
       await waitFor(() => h.store.messages.filter((message) => message.kind === "interrupted").length >= 2)
       const interruption = h.store.messages.find(
@@ -3459,7 +3737,7 @@ describe("memory preview gate (coordinator)", () => {
       await waitFor(() => h.prompts.length === 2)
       expect(h.prompts[1]).toContain(`For this turn only, ignore: [${removed.id}].`)
       expect(h.prompts[1]).toContain("RESUMING AN INTERRUPTED TURN")
-
+      // Resume reuses the same persistent Query instead of rebooting the CLI.
       expect(h.sessionStarts).toHaveLength(1)
       const deliveriesAfterResume = experimentEvents.filter(
         (event) => event.type === "memory.inject" && event.schemaVersion === 2,
@@ -3525,7 +3803,8 @@ describe("memory preview gate (coordinator)", () => {
           message.kind === "memory_interrupt",
       )!
 
-
+      // The recovery card is stale by the time Resume reaches the server: this
+      // active memory now belongs to another project and is no longer visible.
       h.memory.store.update(moved.id, { projectId: "project-elsewhere" }, { actor: "user" })
       await h.coordinator.resumeInterrupted({
         chatId: "chat-1",
@@ -3639,8 +3918,8 @@ describe("memory preview gate (coordinator)", () => {
         chatId: "chat-1",
         interruptId: interruption.interruptId,
         correction: "Keep a visible label associated with every field.",
-
-
+        // Deliberately omit the flagged id: Enforce must lock it back into the
+        // immediately resumed working set, not merely add stronger wording.
         selectedIds: [companion.id],
         enforce: true,
       })
@@ -3711,7 +3990,7 @@ describe("memory preview gate (coordinator)", () => {
           message.kind === "memory_interrupt",
       )!
 
-
+      // Still active, but no longer part of this project/chat's Visible Memory Pool.
       h.memory.store.update(flagged.id, { projectId: "project-elsewhere" }, { actor: "user" })
       await expect(h.coordinator.resumeInterrupted({
         chatId: "chat-1",
@@ -3949,54 +4228,85 @@ describe("memory preview gate (coordinator)", () => {
     }
   })
 
-  test("interrupt and resume reject Auto, Static, and Codex without side effects", async () => {
+  test("MemoSync non-study accepts the per-memory control gate for Pi", async () => {
+    const h = createHarness({ policy: { ...resolveConditionPolicy("memosync"), studyMode: false }, preview: false })
+    try {
+      const memory = h.memory.store.create(
+        { content: "Pi memory", scope: "project", projectId: "project-1", type: "fact" },
+        { actor: "system" },
+      )
+      await h.store.setChatProvider("chat-1", "pi")
+      // The provider gate must let Pi through: without a running turn the
+      // interrupt fails on the active-turn check, not on the engine check.
+      await expect(h.coordinator.interruptMemory({
+        chatId: "chat-1",
+        memoryId: memory.id,
+        quote: "pi interrupt",
+      })).rejects.toThrow("A MemoSync turn must be running before a memory can interrupt it")
+      await expect(h.coordinator.resumeInterrupted({
+        chatId: "chat-1",
+        interruptId: "no-such-interrupt",
+        correction: "Continue.",
+        selectedIds: [],
+      })).rejects.not.toThrow("Per-memory interrupt is only available on a supported MemoSync engine")
+    } finally {
+      h.cleanup()
+    }
+  })
 
+  test("MemoSync study mode still rejects per-memory interrupt for Pi", async () => {
+    const h = createHarness({ policy: resolveConditionPolicy("memosync"), preview: false })
+    try {
+      const memory = h.memory.store.create(
+        { content: "Pi study memory", scope: "project", projectId: "project-1", type: "fact" },
+        { actor: "system" },
+      )
+      await h.store.setChatProvider("chat-1", "pi")
+      await expect(h.coordinator.interruptMemory({
+        chatId: "chat-1",
+        memoryId: memory.id,
+        quote: "unsupported control",
+      })).rejects.toThrow("Per-memory interrupt is only available on a supported MemoSync engine")
+    } finally {
+      h.cleanup()
+    }
+  })
 
-    const unsupported = [
-      { name: "Auto", policy: resolveConditionPolicy("auto"), provider: "claude" as const },
-      { name: "Static", policy: resolveConditionPolicy("static"), provider: "claude" as const },
-      { name: "Codex", policy: resolveConditionPolicy("memosync"), provider: "codex" as const },
-    ]
+  test("MemoSync study mode rejects per-memory interrupt and resume for Codex", async () => {
+    const h = createHarness({ policy: resolveConditionPolicy("memosync"), preview: false })
+    try {
+      const memory = h.memory.store.create(
+        { content: "Codex study memory", scope: "project", projectId: "project-1", type: "fact" },
+        { actor: "system" },
+      )
+      await h.store.setChatProvider("chat-1", "codex")
+      await h.store.appendMessage("chat-1", {
+        _id: crypto.randomUUID(),
+        createdAt: Date.now(),
+        kind: "memory_interrupt",
+        interruptId: "unsupported-codex",
+        memoryId: memory.id,
+        prompt: "unsupported prompt",
+        workingSet: [{ id: memory.id, cited: true }],
+        turn: 1,
+      })
 
-    for (const scenario of unsupported) {
-      const h = createHarness({ policy: scenario.policy, preview: false })
-      try {
-        const memory = h.memory.store.create(
-          { content: `${scenario.name} memory`, scope: "project", projectId: "project-1", type: "fact" },
-          { actor: "system" },
-        )
-        await h.store.setChatProvider("chat-1", scenario.provider)
-        await h.store.appendMessage(
-          "chat-1",
-          {
-            _id: crypto.randomUUID(),
-            createdAt: Date.now(),
-            kind: "memory_interrupt",
-            interruptId: `unsupported-${scenario.name}`,
-            memoryId: memory.id,
-            prompt: "unsupported prompt",
-            workingSet: [{ id: memory.id, cited: true }],
-            turn: 1,
-          },
-        )
-
-        await expect(h.coordinator.interruptMemory({
-          chatId: "chat-1",
-          memoryId: memory.id,
-          quote: "unsupported control",
-        })).rejects.toThrow("Per-memory interrupt is only available on a supported MemoSync engine")
-        await expect(h.coordinator.resumeInterrupted({
-          chatId: "chat-1",
-          interruptId: `unsupported-${scenario.name}`,
-          correction: "Continue with the confirmed working memory.",
-          selectedIds: [],
-        })).rejects.toThrow("Per-memory interrupt is only available on a supported MemoSync engine")
-        expect(h.store.messages.filter((message) => message.kind === "memory_interrupt")).toHaveLength(1)
-        expect(h.store.messages.some((message) => message.kind === "memory_interrupt_resolution")).toBe(false)
-        expect(h.prompts).toHaveLength(0)
-      } finally {
-        h.cleanup()
-      }
+      await expect(h.coordinator.interruptMemory({
+        chatId: "chat-1",
+        memoryId: memory.id,
+        quote: "unsupported control",
+      })).rejects.toThrow("Per-memory interrupt is only available on a supported MemoSync engine")
+      await expect(h.coordinator.resumeInterrupted({
+        chatId: "chat-1",
+        interruptId: "unsupported-codex",
+        correction: "Continue with the confirmed working memory.",
+        selectedIds: [],
+      })).rejects.toThrow("Per-memory interrupt is only available on a supported MemoSync engine")
+      expect(h.store.messages.filter((message) => message.kind === "memory_interrupt")).toHaveLength(1)
+      expect(h.store.messages.some((message) => message.kind === "memory_interrupt_resolution")).toBe(false)
+      expect(h.prompts).toHaveLength(0)
+    } finally {
+      h.cleanup()
     }
   })
 
@@ -4007,8 +4317,8 @@ describe("memory preview gate (coordinator)", () => {
     })
     try {
       await h.store.setChatProvider("chat-1", "claude")
-
-
+      // The gate no longer rejects; with no active turn the method reaches the
+      // "turn must be running" guard instead of the engine-availability error.
       await expect(h.coordinator.interruptMemory({
         chatId: "chat-1",
         memoryId: "M-01",
@@ -4127,7 +4437,9 @@ describe("memory preview gate (coordinator)", () => {
       await waitFor(() => h.store.messages.some((m: any) => m.kind === "memory_preview"))
       const preview = h.store.messages.find((m: any) => m.kind === "memory_preview") as any
 
-
+      // "Restart": a fresh coordinator over the same store — pendingPreviews
+      // is memory-state and did not survive; the transcript still shows the
+      // card as pending.
       const restartedSessionStarts: unknown[] = []
       const restarted = new AgentCoordinator({
         store: h.store as never,
@@ -4149,7 +4461,7 @@ describe("memory preview gate (coordinator)", () => {
       expect(decision.decision).toBe("expired")
       expect(restartedSessionStarts).toHaveLength(0)
 
-
+      // Only the ORPHANED preview self-heals: an unknown previewId still throws.
       await expect(
         restarted.respondMemoryPreview({ chatId: "chat-1", previewId: "nope", decision: "go_on" }),
       ).rejects.toThrow(/No matching pending/)
@@ -4185,7 +4497,8 @@ describe("memory preview gate (coordinator)", () => {
         },
       })
 
-
+      // The card still renders Review again; the click must settle everything
+      // instead of throwing "can only be changed before the agent starts".
       await restarted.reopenMemoryPreparation({ chatId: "chat-1", from: "proposals", stageId: proposals.proposalsId })
 
       const previewDecision = h.store.messages.find(
@@ -4193,8 +4506,8 @@ describe("memory preview gate (coordinator)", () => {
       ) as any
       expect(previewDecision.decision).toBe("expired")
       expect(h.store.turnCancelledCount).toBe(1)
-
-
+      // A busy chat is NOT an orphan: reopen on the live coordinator's next
+      // park must keep throwing only when the stage truly is gone.
       await expect(
         restarted.reopenMemoryPreparation({ chatId: "chat-1", from: "proposals", stageId: proposals.proposalsId }),
       ).rejects.toThrow(/before the agent starts/)
@@ -4239,14 +4552,14 @@ describe("preview settings (coordinator, STUDY_PLAN §2.4)", () => {
       previewSettings: { enabled: true, autoProceedWhenEmpty: true },
     })
     try {
-
+      // No memories in the store — the receipt is empty, so the gate may auto-proceed.
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
       await waitFor(() => h.prompts.length === 1)
       const decision = h.store.messages.find((m) => m.kind === "memory_preview_decision") as any
       expect(decision).toBeDefined()
       expect(decision.decision).toBe("go_on")
       expect(decision.auto).toBe(true)
-
+      // The preview entry is still recorded (research data completeness).
       expect(timestampedKinds(h.store.messages)).toContain("memory_preview")
     } finally {
       h.cleanup()
@@ -4259,7 +4572,7 @@ describe("preview settings (coordinator, STUDY_PLAN §2.4)", () => {
       previewSettings: { enabled: true, autoProceedWhenEmpty: false },
     })
     try {
-
+      // No memories in the store — empty receipt, but the setting says park anyway.
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
       expect(h.sessionStarts).toHaveLength(0)
       expect(timestampedKinds(h.store.messages)).not.toContain("memory_preview_decision")
@@ -4269,969 +4582,16 @@ describe("preview settings (coordinator, STUDY_PLAN §2.4)", () => {
   })
 })
 
-describe("study arms (coordinator, STUDY_PLAN §2.2/§2.3)", () => {
-  test("auto sends the complete current-project text on every Claude turn while reusing the session", async () => {
-    const experimentEvents: Array<Record<string, unknown>> = []
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      experimentEvents,
-    })
-    try {
-      h.memory.store.create(
-        { content: "Use pnpm for package management", scope: "project", projectId: "project-1", type: "preference" },
-        { actor: "system" },
-      )
-      h.memory.store.create(
-        { content: "Car checkout uses a stepper", scope: "project", projectId: "car-project", type: "fact" },
-        { actor: "system" },
-      )
-      h.memory.store.create(
-        { content: "Cancellation requires confirmation", scope: "session", sessionId: "older-chat", type: "constraint" },
-        { actor: "system" },
-      )
+describe("MemoSync policy (coordinator)", () => {
 
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 1" })
-      await waitFor(() => h.prompts.length === 1)
-      expect(h.prompts[0]).toContain("# Notes from previous sessions")
-      expect(h.prompts[0]).toContain("- Use pnpm for package management")
-      expect(h.prompts[0]).not.toContain("- Car checkout uses a stepper")
-      expect(h.prompts[0]).not.toContain("- Cancellation requires confirmation")
-      h.finishTurn()
-      await waitFor(() => h.store.turnFinishedCount === 1)
-
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 2" })
-      await waitFor(() => h.prompts.length === 2)
-      expect(h.prompts[1]).toContain("# Notes from previous sessions")
-      expect(h.prompts[1]).toContain("- Use pnpm for package management")
-      expect(h.prompts[1]).not.toContain("- Car checkout uses a stepper")
-      expect(h.prompts[1]).not.toContain("- Cancellation requires confirmation")
-      expect(h.sessionStarts).toHaveLength(1)
-      const deliveries = experimentEvents.filter(
-        (event) => event.type === "memory.inject" && event.schemaVersion === 2,
-      )
-      expect(deliveries).toHaveLength(2)
-      expect(deliveries.map((event) => event.turn)).toEqual([1, 2])
-      expect(deliveries.every((event) => event.mode === "plain" && event.outcome === "delivered")).toBe(true)
-      expect((deliveries[0]!.memories as Array<{ id: string }>).map(({ id }) => id)).toEqual(["M-01"])
-      expect(deliveries[0]!.focusPayloadHash).toMatch(/^[a-f0-9]{64}$/)
-      expect(deliveries[1]!.focusPayloadHash).toBe(deliveries[0]!.focusPayloadHash)
-    } finally {
-      h.cleanup()
-    }
-  })
-
-  test("Auto acks the next WebSocket send before slow capture, then dispatches it once with the complete block", async () => {
-    let captureStarted!: () => void
-    const started = new Promise<void>((resolve) => { captureStarted = resolve })
-    let releaseCapture!: () => void
-    const released = new Promise<void>((resolve) => { releaseCapture = resolve })
-    let h: Harness | null = null
-    const emptyOutcome = () => ({
-      created: [],
-      proposed: 0,
-      surfaced: 0,
-      dropped: 0,
-      conflicts: 0,
-      reinforced: 0,
-      reinforcedIds: [],
-      revisions: 0,
-      pending: [],
-    })
-    const capture: CaptureService = {
-      capture: async () => {
-        captureStarted()
-        await released
-        h!.memory.store.create(
-          {
-            content: "Apartment filters use URL query parameters",
-            scope: "project",
-            projectId: "project-1",
-            type: "fact",
-          },
-          { actor: "agent", sessionId: "chat-1", turn: 1 },
-        )
-        return emptyOutcome()
-      },
-      routeProposal: async () => emptyOutcome(),
-      captureFromPrompt: async () => emptyOutcome(),
-    }
-    h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-    })
-    const router = createWsRouter({
-      store: h.store as never,
-      agent: h.coordinator,
-      terminals: { getSnapshot: () => null, onEvent: () => () => {} } as never,
-      keybindings: { getSnapshot: () => null, onChange: () => () => {} } as never,
-      refreshDiscovery: async () => [],
-      getDiscoveredProjects: () => [],
-      machineDisplayName: "Test Machine",
-      updateManager: null,
-    })
-    const ws = new FakeWebSocket()
-    let routedSend: Promise<void> | null = null
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "build filters" })
-      await waitFor(() => h!.prompts.length === 1)
-
-      h.finishTurn()
-      await started
-      routedSend = router.handleMessage(ws as never, JSON.stringify({
-        v: PROTOCOL_VERSION,
-        type: "command",
-        id: "auto-turn-2",
-        command: {
-          type: "chat.send",
-          chatId: "chat-1",
-          provider: "claude",
-          content: "now add sorting",
-        },
-      }))
-      const ackedWithinBudget = await Promise.race([
-        routedSend.then(() => true),
-        new Promise<false>((resolve) => setTimeout(() => resolve(false), 100)),
-      ])
-
-      expect(ackedWithinBudget).toBe(true)
-      expect(ws.sent).toEqual([{
-        v: PROTOCOL_VERSION,
-        type: "ack",
-        id: "auto-turn-2",
-        result: expect.objectContaining({ chatId: "chat-1" }),
-      }])
-      expect(h.prompts).toHaveLength(1)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "now add sorting",
-      )).toHaveLength(0)
-
-      releaseCapture()
-      await routedSend
-      await waitFor(() => h!.prompts.length === 2)
-      expect(h.prompts[1]).toContain("- Apartment filters use URL query parameters")
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "now add sorting",
-      )).toHaveLength(1)
-      expect(h.store.queuedMessages).toHaveLength(0)
-    } finally {
-      releaseCapture?.()
-      await routedSend?.catch(() => {})
-      router.dispose()
-      h.cleanup()
-    }
-  })
-
-  test("Stop cancels an Auto message queued while the preceding turn enters post-turn capture", async () => {
-    const { capture, started, release: releaseCapture } = createBlockedCapture()
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-    })
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h.prompts.length === 1)
-
-      const queued = await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "queued before capture starts",
-      })
-      expect(queued).toMatchObject({ queued: true, queuedMessageId: "queued-1" })
-      h.finishTurn()
-      await started
-      await waitFor(() => h.coordinator.getActiveStatuses().get("chat-1") === "starting")
-
-      await h.coordinator.cancel("chat-1")
-      releaseCapture()
-      await waitFor(() => !h.coordinator.getActiveStatuses().has("chat-1"))
-
-      expect(h.prompts).toHaveLength(1)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "queued before capture starts",
-      )).toHaveLength(0)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "result" && message.isError,
-      )).toHaveLength(0)
-      expect(h.store.queuedMessages).toHaveLength(0)
-    } finally {
-      releaseCapture?.()
-      h.cleanup()
-    }
-  })
-
-  test("Stop cancels an Auto send waiting at the capture barrier without a late append or boot", async () => {
-    const { capture, started, release: releaseCapture } = createBlockedCapture()
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-    })
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h.prompts.length === 1)
-      h.finishTurn()
-      await started
-
-      const accepted = await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "cancel this deferred turn",
-      })
-      expect(accepted).toMatchObject({ queued: true })
-      expect(h.coordinator.getActiveStatuses().get("chat-1")).toBe("starting")
-
-      await Promise.race([
-        h.coordinator.cancel("chat-1"),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Stop waited for capture")), 100)),
-      ])
-      expect(h.store.queuedMessages).toHaveLength(0)
-      expect(h.coordinator.getActiveStatuses().has("chat-1")).toBe(false)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "cancel this deferred turn",
-      )).toHaveLength(0)
-
-      releaseCapture()
-      await new Promise((resolve) => setTimeout(resolve, 20))
-      expect(h.prompts).toHaveLength(1)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "cancel this deferred turn",
-      )).toHaveLength(0)
-      expect(h.store.messages.filter((message) => message.kind === "interrupted")).toHaveLength(1)
-    } finally {
-      releaseCapture?.()
-      h.cleanup()
-    }
-  })
-
-  test("barrier Stop persists a queue tombstone even when physical removal fails", async () => {
-    const { capture, started, release: releaseCapture } = createBlockedCapture()
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-    })
-    const removeQueuedMessage = h.store.removeQueuedMessage.bind(h.store)
-    let removalAttempts = 0
-    h.store.removeQueuedMessage = async (chatId: string, queuedMessageId: string) => {
-      if (queuedMessageId === "queued-1" && removalAttempts < 2) {
-        removalAttempts += 1
-        throw new Error("queue storage unavailable")
-      }
-      await removeQueuedMessage(chatId, queuedMessageId)
-    }
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h.prompts.length === 1)
-      h.finishTurn()
-      await started
-
-      await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "barrier row must stay cancelled",
-      })
-      await h.coordinator.cancel("chat-1")
-      await waitFor(() => removalAttempts >= 2)
-
-      expect(h.store.messages).toContainEqual(expect.objectContaining({
-        kind: "interrupted",
-        cancelledQueuedMessageId: "queued-1",
-      }))
-      expect(h.store.queuedMessages.map((message) => message.id)).toEqual(["queued-1"])
-      expect(h.prompts).toHaveLength(1)
-
-      h.store.removeQueuedMessage = removeQueuedMessage
-      await h.coordinator.drainOrphanedQueues()
-      await waitFor(() => h.store.queuedMessages.length === 0 || h.prompts.length > 1)
-      expect(h.prompts).toHaveLength(1)
-      expect(h.store.queuedMessages).toHaveLength(0)
-    } finally {
-      releaseCapture?.()
-      h.cleanup()
-    }
-  })
-
-  test("Stop during deferred Auto queue removal prevents a late append, boot, or error receipt", async () => {
-    const { capture, started, release: releaseCapture } = createBlockedCapture()
-    let removalStarted!: () => void
-    const removing = new Promise<void>((resolve) => { removalStarted = resolve })
-    let releaseRemoval!: () => void
-    const removalReleased = new Promise<void>((resolve) => { releaseRemoval = resolve })
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-    })
-    const removeQueuedMessage = h.store.removeQueuedMessage.bind(h.store)
-    h.store.removeQueuedMessage = async (chatId: string, queuedMessageId: string) => {
-      if (queuedMessageId === "queued-1") {
-        removalStarted()
-        await removalReleased
-      }
-      await removeQueuedMessage(chatId, queuedMessageId)
-    }
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h.prompts.length === 1)
-      h.finishTurn()
-      await started
-
-      const accepted = await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "cancel during dispatch",
-      })
-      expect(accepted).toMatchObject({ queued: true, queuedMessageId: "queued-1" })
-
-      releaseCapture()
-      await removing
-      expect(h.coordinator.getActiveStatuses().get("chat-1")).toBe("starting")
-      await Promise.race([
-        h.coordinator.cancel("chat-1"),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Stop waited for queue removal")), 100)),
-      ])
-
-      releaseRemoval()
-      await waitFor(() => (
-        h.prompts.length > 1
-        || !h.coordinator.getActiveStatuses().has("chat-1")
-      ))
-      expect(h.prompts).toHaveLength(1)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "cancel during dispatch",
-      )).toHaveLength(0)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "result" && message.isError,
-      )).toHaveLength(0)
-      expect(h.store.queuedMessages).toHaveLength(0)
-    } finally {
-      releaseCapture?.()
-      releaseRemoval?.()
-      h.cleanup()
-    }
-  })
-
-  test("a stopped Auto queue row that cannot be removed is never redispatched", async () => {
-    const { capture, started, release: releaseCapture } = createBlockedCapture()
-    let removalStarted!: () => void
-    const removing = new Promise<void>((resolve) => { removalStarted = resolve })
-    let releaseRemoval!: () => void
-    const removalReleased = new Promise<void>((resolve) => { releaseRemoval = resolve })
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-    })
-    const removeQueuedMessage = h.store.removeQueuedMessage.bind(h.store)
-    let removalAttempts = 0
-    h.store.removeQueuedMessage = async (chatId: string, queuedMessageId: string) => {
-      if (queuedMessageId === "queued-1") {
-        removalAttempts += 1
-        if (removalAttempts === 1) {
-          removalStarted()
-          await removalReleased
-          throw new Error("queue storage unavailable")
-        }
-        if (removalAttempts === 2) throw new Error("queue storage still unavailable")
-      }
-      await removeQueuedMessage(chatId, queuedMessageId)
-    }
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h.prompts.length === 1)
-      h.finishTurn()
-      await started
-
-      await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "keep stopped row visible",
-      })
-      releaseCapture()
-      await removing
-      await h.coordinator.cancel("chat-1")
-      releaseRemoval()
-
-      await waitFor(() => (
-        removalAttempts >= 3
-        || (removalAttempts >= 2 && !h.coordinator.getActiveStatuses().has("chat-1"))
-      ))
-      await new Promise((resolve) => setTimeout(resolve, 10))
-      expect(h.prompts).toHaveLength(1)
-      expect(h.store.queuedMessages.map((message) => message.id)).toEqual(["queued-1"])
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "keep stopped row visible",
-      )).toHaveLength(0)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "result" && message.isError,
-      )).toHaveLength(0)
-
-
-      h.store.removeQueuedMessage = removeQueuedMessage
-      await h.coordinator.drainOrphanedQueues()
-      await waitFor(() => h.store.queuedMessages.length === 0 || h.prompts.length > 1)
-      expect(h.prompts).toHaveLength(1)
-      expect(h.store.queuedMessages).toHaveLength(0)
-    } finally {
-      releaseCapture?.()
-      releaseRemoval?.()
-      h.cleanup()
-    }
-  })
-
-  test("Stop while a deferred Auto user prompt waits at the transcript boundary prevents delivery and turn start", async () => {
-    const { capture, started, release: releaseCapture } = createBlockedCapture()
-    let promptAppendStarted!: () => void
-    const appendingPrompt = new Promise<void>((resolve) => { promptAppendStarted = resolve })
-    let releasePromptAppend!: () => void
-    const promptAppendReleased = new Promise<void>((resolve) => { releasePromptAppend = resolve })
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-      beforeAppendMessage: async (entry) => {
-        if (entry.kind !== "user_prompt" || entry.content !== "cancel before transcript delivery") return
-        promptAppendStarted()
-        await promptAppendReleased
-      },
-    })
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h.prompts.length === 1)
-      h.finishTurn()
-      await started
-
-      const accepted = await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "cancel before transcript delivery",
-      })
-      expect(accepted).toMatchObject({ queued: true, queuedMessageId: "queued-1" })
-
-      releaseCapture()
-      await appendingPrompt
-      await Promise.race([
-        h.coordinator.cancel("chat-1"),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Stop waited for transcript delivery")), 100)),
-      ])
-      expect(h.store.turnStartedCount).toBe(1)
-
-      releasePromptAppend()
-      await waitFor(() => !h.coordinator.getActiveStatuses().has("chat-1"))
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "cancel before transcript delivery",
-      )).toHaveLength(0)
-      expect(h.store.turnStartedCount).toBe(1)
-      expect(h.prompts).toHaveLength(1)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "result" && message.isError,
-      )).toHaveLength(0)
-    } finally {
-      releaseCapture?.()
-      releasePromptAppend?.()
-      h.cleanup()
-    }
-  })
-
-  test("Stop after deferred prompt delivery linearizes records the turn before cancelling without booting Claude", async () => {
-    const { capture, started, release: releaseCapture } = createBlockedCapture()
-    let deliveryAuthorized!: () => void
-    const authorized = new Promise<void>((resolve) => { deliveryAuthorized = resolve })
-    let releaseDelivery!: () => void
-    const deliveryReleased = new Promise<void>((resolve) => { releaseDelivery = resolve })
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-      afterAppendAuthorized: async (entry) => {
-        if (entry.kind !== "user_prompt" || entry.content !== "cancel committed delivery") return
-        deliveryAuthorized()
-        await deliveryReleased
-      },
-    })
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h.prompts.length === 1)
-      h.finishTurn()
-      await started
-
-      await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "cancel committed delivery",
-      })
-      releaseCapture()
-      await authorized
-
-      const stopping = h.coordinator.cancel("chat-1")
-      await new Promise((resolve) => setTimeout(resolve, 0))
-      expect(h.store.turnCancelledCount).toBe(0)
-      expect(h.store.turnStartedCount).toBe(1)
-
-      releaseDelivery()
-      await stopping
-      await waitFor(() => !h.coordinator.getActiveStatuses().has("chat-1"))
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "cancel committed delivery",
-      )).toHaveLength(1)
-      expect(h.store.turnStartedCount).toBe(2)
-      expect(h.store.turnCancelledCount).toBe(1)
-      expect(h.prompts).toHaveLength(1)
-      expect(h.store.messages.find((message) => message.kind === "interrupted"))
-        .not.toHaveProperty("cancelledQueuedMessageId")
-      expect(h.store.messages.filter(
-        (message) => message.kind === "result" && message.isError,
-      )).toHaveLength(0)
-    } finally {
-      releaseCapture?.()
-      releaseDelivery?.()
-      h.cleanup()
-    }
-  })
-
-  test("concurrent Stops at the Auto capture barrier share one cancellation operation", async () => {
-    const { capture, started, release: releaseCapture } = createBlockedCapture()
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-    })
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h.prompts.length === 1)
-      h.finishTurn()
-      await started
-
-      await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "cancel once",
-      })
-      await Promise.all([
-        h.coordinator.cancel("chat-1"),
-        h.coordinator.cancel("chat-1"),
-      ])
-
-      expect(h.store.messages.filter((message) => message.kind === "interrupted")).toHaveLength(1)
-      expect(h.store.turnCancelledCount).toBe(1)
-      expect(h.store.queuedMessages).toHaveLength(0)
-      expect(h.prompts).toHaveLength(1)
-    } finally {
-      releaseCapture?.()
-      h.cleanup()
-    }
-  })
-
-  test("deferred Auto dispatch continues with q2 when its original head row was removed", async () => {
-    let captureStarted!: () => void
-    const started = new Promise<void>((resolve) => { captureStarted = resolve })
-    let releaseCapture!: () => void
-    const released = new Promise<void>((resolve) => { releaseCapture = resolve })
-    let h: Harness | null = null
-    const emptyOutcome = {
-      created: [], proposed: 0, surfaced: 0, dropped: 0, conflicts: 0,
-      reinforced: 0, reinforcedIds: [], revisions: 0, pending: [],
-    }
-    const capture: CaptureService = {
-      capture: async () => {
-        captureStarted()
-        await released
-        h!.memory.store.create(
-          {
-            content: "Sorting defaults to newest first",
-            scope: "project",
-            projectId: "project-1",
-            type: "fact",
-          },
-          { actor: "agent", sessionId: "chat-1", turn: 1 },
-        )
-        return emptyOutcome
-      },
-      routeProposal: async () => emptyOutcome,
-      captureFromPrompt: async () => emptyOutcome,
-    }
-    h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-    })
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h!.prompts.length === 1)
-      h.finishTurn()
-      await started
-
-      const q1 = await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "obsolete queued head",
-      })
-      const q2 = await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "dispatch this second row",
-      })
-      expect(q1).toMatchObject({ queued: true, queuedMessageId: "queued-1" })
-      expect(q2).toMatchObject({ queued: true, queuedMessageId: "queued-2" })
-      await h.store.removeQueuedMessage("chat-1", "queued-1")
-      expect(h.store.queuedMessages.map((message) => message.id)).toEqual(["queued-2"])
-
-      releaseCapture()
-      await waitFor(() => (
-        h!.prompts.length === 2
-        || (!h!.coordinator.getActiveStatuses().has("chat-1") && h!.store.queuedMessages.length === 1)
-      ))
-      expect(h.prompts).toHaveLength(2)
-      expect(h.prompts[1]).toContain("- Sorting defaults to newest first")
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "obsolete queued head",
-      )).toHaveLength(0)
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "dispatch this second row",
-      )).toHaveLength(1)
-      expect(h.store.queuedMessages).toHaveLength(0)
-    } finally {
-      releaseCapture?.()
-      h.cleanup()
-    }
-  })
-
-  test("a deferred Auto start failure becomes one visible terminal error after ack", async () => {
-    let captureStarted!: () => void
-    const started = new Promise<void>((resolve) => { captureStarted = resolve })
-    let releaseCapture!: () => void
-    const released = new Promise<void>((resolve) => { releaseCapture = resolve })
-    const emptyOutcome = {
-      created: [], proposed: 0, surfaced: 0, dropped: 0, conflicts: 0,
-      reinforced: 0, reinforcedIds: [], revisions: 0, pending: [],
-    }
-    const capture: CaptureService = {
-      capture: async () => {
-        captureStarted()
-        await released
-        return emptyOutcome
-      },
-      routeProposal: async () => emptyOutcome,
-      captureFromPrompt: async () => emptyOutcome,
-    }
-    const failureMessage = "deferred transcript write failed"
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      activeStudyTaskId: "038-S1",
-      capture,
-      beforeAppendMessage: async (entry) => {
-        if (entry.kind === "user_prompt" && entry.content === "trigger deferred failure") {
-          throw new Error(failureMessage)
-        }
-      },
-    })
-    const recordedFailures: string[] = []
-    h.store.recordTurnFailed = async (_chatId: string, message: string) => {
-      recordedFailures.push(message)
-    }
-    try {
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn one" })
-      await waitFor(() => h.prompts.length === 1)
-      h.finishTurn()
-      await started
-
-      const accepted = await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "trigger deferred failure",
-      })
-      expect(accepted).toMatchObject({ queued: true })
-      releaseCapture()
-
-      await waitFor(() => recordedFailures.length === 1)
-      const visibleErrors = h.store.messages.filter(
-        (message) => message.kind === "result" && message.isError && message.result === failureMessage,
-      )
-      expect(visibleErrors).toHaveLength(1)
-      expect(recordedFailures).toEqual([failureMessage])
-      expect(h.store.messages.filter(
-        (message) => message.kind === "user_prompt" && message.content === "trigger deferred failure",
-      )).toHaveLength(0)
-      expect(h.coordinator.getActiveStatuses().has("chat-1")).toBe(false)
-    } finally {
-      releaseCapture?.()
-      h.cleanup()
-    }
-  })
-
-  test("policy reaches the Claude session boot", async () => {
+  test("a retired condition falls back to MemoSync at Claude session boot", async () => {
     const h = createHarness({ policy: resolveConditionPolicy("auto") })
     try {
       h.memory.store.create({ content: "x", scope: "personal", type: "fact" }, { actor: "system" })
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
       await waitFor(() => h.prompts.length === 1)
-      expect(h.sessionStarts[0].policy?.condition).toBe("auto")
-      expect(h.sessionStarts[0].policy?.injection).toBe("plain")
-    } finally {
-      h.cleanup()
-    }
-  })
-
-  test("static arm: first study boot scaffolds MEMORY.md without SQLite propositions", async () => {
-    const h = createHarness({ policy: resolveConditionPolicy("static") })
-    try {
-      h.memory.store.create({ content: "Seeded constraint", scope: "personal", type: "constraint" }, { actor: "system" })
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
-      await waitFor(() => h.prompts.length === 1)
-      const memoryMd = join(h.workspaceDir, "MEMORY.md")
-      expect(existsSync(memoryMd)).toBe(true)
-      expect(readFileSync(memoryMd, "utf-8")).not.toContain("Seeded constraint")
-      expect(h.prompts[0]).not.toContain("Seeded constraint")
-    } finally {
-      h.cleanup()
-    }
-  })
-
-  test("file mode: gate and trace see the PLAN's injected set (empty), not raw store items", async () => {
-
-
-    const traceInputs: TraceInput[] = []
-    const h = createHarness({
-      policy: resolveConditionPolicy("static"),
-      preview: true,
-      traceInputs,
-    })
-    try {
-      h.memory.store.create({ content: "store item", scope: "personal", type: "constraint" }, { actor: "system" })
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
-      await waitFor(() => h.prompts.length === 1)
-      expect(timestampedKinds(h.store.messages)).not.toContain("memory_preview")
-      h.finishTurn()
-      await waitFor(() => h.store.turnFinishedCount === 1)
-      expect(traceInputs).toHaveLength(0)
-    } finally {
-      h.cleanup()
-    }
-  })
-
-  test("static arm: editing MEMORY.md between turns rebuilds the session; item edits do NOT", async () => {
-    const h = createHarness({ policy: resolveConditionPolicy("static") })
-    try {
-      const item = h.memory.store.create({ content: "x", scope: "personal", type: "fact" }, { actor: "system" })
-      mkdirSync(h.workspaceDir, { recursive: true })
-      writeFileSync(join(h.workspaceDir, "MEMORY.md"), "# Memory\n- participant initial note\n")
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 1" })
-      await waitFor(() => h.prompts.length === 1)
-      expect(h.sessionStarts).toHaveLength(1)
-      expect(h.prompts[0]).toContain("# Memory (workspace notes)")
-      expect(h.prompts[0]).toContain("- participant initial note")
-      expect(h.prompts[0]).not.toContain("- x")
-      h.finishTurn()
-      await waitFor(() => h.store.turnFinishedCount === 1)
-
-
-      h.memory.store.update(item.id, { content: "x (edited)" }, { actor: "user" })
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 2" })
-      await waitFor(() => h.prompts.length === 2)
-      expect(h.sessionStarts).toHaveLength(1)
-      expect(h.prompts[1]).toContain("# Memory (workspace notes)")
-      expect(h.prompts[1]).toContain("- participant initial note")
-      expect(h.prompts[1]).not.toContain("x (edited)")
-      h.finishTurn()
-      await waitFor(() => h.store.turnFinishedCount === 2)
-
-
-      writeFileSync(join(h.workspaceDir, "MEMORY.md"), "# Memory\n- switched to pnpm\n")
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 3" })
-      await waitFor(() => h.prompts.length === 3)
-      expect(h.sessionStarts).toHaveLength(2)
-      expect(h.prompts[2]).toContain("# Memory (workspace notes)")
-      expect(h.prompts[2]).toContain("- switched to pnpm")
-    } finally {
-      h.cleanup()
-    }
-  })
-
-  test("static arm: materializes the exact queued Markdown into durable atomic focus items", async () => {
-    const extractor = createStaticMemoryExtractor({
-      callJson: async () => ({ atoms: [{ content: "Use pnpm." }, { content: "Run tests before release." }] }),
-      modelId: "deepseek-test",
-    })
-    const h = createHarness({
-      policy: resolveConditionPolicy("static"),
-      activeStudyTaskId: "038-S1",
-      staticMemoryExtractor: extractor,
-    })
-    try {
-      mkdirSync(h.workspaceDir, { recursive: true })
-      writeFileSync(join(h.workspaceDir, "MEMORY.md"), "## Tooling\n- Use pnpm and run tests before release.\n")
-
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "ship it" })
-      await waitFor(() => h.prompts.length === 1)
-      await waitFor(() => (h.studyMemoryStore?.listTaskDeliveries("038-S1").length ?? 0) === 1)
-
-      expect(h.prompts[0]).toContain("- Use pnpm and run tests before release.")
-      expect(h.studyMemoryStore?.listTaskDeliveries("038-S1")[0]).toMatchObject({
-        condition: "static",
-        mode: "file",
-        items: [
-          { identity: { scheme: "static", id: expect.any(String) }, content: "Use pnpm.", version: 1 },
-          { identity: { scheme: "static", id: expect.any(String) }, content: "Run tests before release.", version: 1 },
-        ],
-      })
-    } finally {
-      h.cleanup()
-    }
-  })
-
-  test("static arm: reserves the exact queued payload before slow extraction completes", async () => {
-    let releaseExtraction!: () => void
-    const extractionReleased = new Promise<void>((resolve) => { releaseExtraction = resolve })
-    const h = createHarness({
-      policy: resolveConditionPolicy("static"),
-      activeStudyTaskId: "038-S1",
-      staticMemoryExtractor: {
-        extract: async (payload) => {
-          await extractionReleased
-          return {
-            atomSpecVersion: MEMORY_ATOM_SPEC_VERSION,
-            extractorVersion: STATIC_EXTRACTOR_VERSION,
-            payloadHash: createHash("sha256").update(payload.text, "utf8").digest("hex"),
-            atoms: [],
-            qualityFlags: [],
-          }
-        },
-      },
-    })
-    try {
-      mkdirSync(h.workspaceDir, { recursive: true })
-      const exactSource = ` \r\n- Use pnpm. ${"x".repeat(30_000)}  \r\n\r\n`
-      writeFileSync(join(h.workspaceDir, "MEMORY.md"), exactSource)
-      mkdirSync(join(h.workspaceDir, "memory"))
-      for (let index = 0; index < 21; index += 1) {
-        writeFileSync(
-          join(h.workspaceDir, "memory", `topic-${String(index).padStart(2, "0")}.md`),
-          `  topic ${index}\r\n`,
-        )
-      }
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "ship it" })
-      await waitFor(() => (h.studyMemoryStore?.listPendingStaticFocusDeliveries({ taskId: "038-S1" }).length ?? 0) === 1)
-
-      const pending = h.studyMemoryStore!.listPendingStaticFocusDeliveries({ taskId: "038-S1" })[0]!
-      expect(pending.payload.text).toContain("- Use pnpm.")
-      expect(pending.payload.sources).toHaveLength(22)
-      expect(pending.payload.sources[0]!.injectedContent).toBe(exactSource)
-      expect(pending.payload.text.slice(
-        pending.payload.sources[0]!.start,
-        pending.payload.sources[0]!.end,
-      )).toBe(exactSource)
-      expect(pending.payload.sources.at(-1)).toMatchObject({
-        relPath: "memory/topic-20.md",
-        injectedContent: "  topic 20\r\n",
-      })
-      expect(h.prompts[0]).toContain("  topic 20\r\n")
-      expect(h.studyMemoryStore!.listTaskDeliveries("038-S1")).toEqual([])
-
-      releaseExtraction()
-      expect(await h.coordinator.awaitStudyMemorySettled("038-S1")).toEqual([])
-      expect(h.studyMemoryStore!.listPendingStaticFocusDeliveries({ taskId: "038-S1" })).toEqual([])
-      expect(h.studyMemoryStore!.listTaskDeliveries("038-S1")).toHaveLength(1)
-    } finally {
-      releaseExtraction()
-      h.cleanup()
-    }
-  })
-
-  test("static arm: resumes a durable queued payload after restart before freeze", async () => {
-    const h = createHarness({
-      policy: resolveConditionPolicy("static"),
-      activeStudyTaskId: "038-S1",
-      staticMemoryExtractor: createStaticMemoryExtractor({
-        callJson: async () => ({ atoms: [{ content: "Use pnpm." }] }),
-        modelId: "restart-test",
-      }),
-    })
-    try {
-      const payload = buildStaticFocusPayload([{ relPath: "MEMORY.md", content: "- Use pnpm.\n" }])
-      h.studyMemoryStore!.reserveStaticFocusDelivery({
-        injectionId: "static-before-restart",
-        taskId: "038-S1",
-        namespace: "project-1",
-        chatId: "chat-1",
-        turnId: "turn-before-restart",
-        turn: 1,
-        focusedAt: "2026-08-15T10:00:00.000Z",
-        deliveryHash: "queued-prompt-hash",
-        payload,
-      })
-
-      h.coordinator.resumePendingStaticFocusMaterializations()
-      expect(await h.coordinator.awaitStudyMemorySettled("038-S1")).toEqual([])
-      expect(h.studyMemoryStore!.listTaskDeliveries("038-S1")[0]).toMatchObject({
-        injectionId: "static-before-restart",
-        items: [{ content: "Use pnpm.", version: 1 }],
-      })
-    } finally {
-      h.cleanup()
-    }
-  })
-
-  test("static arm: a later freeze retry can recover a transient extraction failure", async () => {
-    let attempts = 0
-    const h = createHarness({
-      policy: resolveConditionPolicy("static"),
-      activeStudyTaskId: "038-S1",
-      staticMemoryExtractor: {
-        extract: async (payload) => {
-          attempts += 1
-          if (attempts === 1) throw new Error("temporary extractor outage")
-          return createStaticMemoryExtractor({
-            callJson: async () => ({ atoms: [{ content: "Use pnpm." }] }),
-            modelId: "retry-test",
-          }).extract(payload)
-        },
-      },
-    })
-    try {
-      mkdirSync(h.workspaceDir, { recursive: true })
-      writeFileSync(join(h.workspaceDir, "MEMORY.md"), "- Use pnpm.\n")
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "ship it" })
-
-      expect(await h.coordinator.awaitStudyMemorySettled("038-S1")).toEqual([
-        expect.objectContaining({ code: "static_extraction_failed", blocking: true }),
-      ])
-      expect(await h.coordinator.awaitStudyMemorySettled("038-S1")).toEqual([])
-      expect(attempts).toBe(2)
-      expect(h.studyMemoryStore!.listTaskDeliveries("038-S1")).toHaveLength(1)
-    } finally {
-      h.cleanup()
-    }
-  })
-
-  test("static arm: extraction failure is blocking measurement state, not a false zero-item turn", async () => {
-    const h = createHarness({
-      policy: resolveConditionPolicy("static"),
-      activeStudyTaskId: "038-S1",
-      staticMemoryExtractor: { extract: async () => { throw new Error("malformed atom output") } },
-    })
-    try {
-      mkdirSync(h.workspaceDir, { recursive: true })
-      writeFileSync(join(h.workspaceDir, "MEMORY.md"), "- Use pnpm.\n")
-      await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "ship it" })
-
-      expect(await h.coordinator.awaitStudyMemorySettled("038-S1")).toEqual([
-        expect.objectContaining({ code: "static_extraction_failed", blocking: true, turnId: expect.any(String) }),
-      ])
-      expect(h.studyMemoryStore?.listTaskDeliveries("038-S1")).toEqual([])
+      expect(h.sessionStarts[0].policy?.condition).toBe("memosync")
+      expect(h.sessionStarts[0].policy?.injection).toBe("skills")
     } finally {
       h.cleanup()
     }
@@ -5253,15 +4613,15 @@ describe("fork-based trace (user design 2026-08-05)", () => {
       h.memory.store.create({ content: "seed", scope: "personal", type: "fact" }, { actor: "system" })
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "do the thing" })
       await waitFor(() => h.prompts.length === 1)
-
-
+      // Boot clears an unverifiable resume token — set it the way a live
+      // engine would, after the session is up and before the result lands.
       h.store.chat.sessionToken = "tok-fork"
       h.finishTurn()
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_trace" && m.status !== "pending"))
       const trace = h.store.messages.filter((m) => m.kind === "memory_trace").at(-1) as Extract<TranscriptEntry, { kind: "memory_trace" }>
       expect(trace.status).toBe("ok")
       expect(trace.labels[0]!.label).toBe("operational")
-
+      // The sidecar was never consulted.
       expect(traceInputs).toHaveLength(0)
     } finally {
       h.cleanup()
@@ -5275,8 +4635,8 @@ describe("fork-based trace (user design 2026-08-05)", () => {
       h.memory.store.create({ content: "seed", scope: "personal", type: "fact" }, { actor: "system" })
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "do the thing" })
       await waitFor(() => h.prompts.length === 1)
-
-
+      // Boot clears an unverifiable resume token — set it the way a live
+      // engine would, after the session is up and before the result lands.
       h.store.chat.sessionToken = "tok-fork"
       h.finishTurn()
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_trace"))
@@ -5314,8 +4674,8 @@ describe("step-one proposals gate (redesign 2026-08-07)", () => {
     const h = createHarness({ preview: true, capture, experimentEvents: events })
     try {
       h.memory.store.create({ content: "active seed", scope: "personal", type: "fact" }, { actor: "system" })
-
-
+      // Last turn's capture parked this candidate for chat-1 — no card was
+      // shown at that turn's end; it waits for THIS gate.
       const cand = h.memory.store.create(
         {
           content: "Staging password lives in 2Password",
@@ -5340,11 +4700,11 @@ describe("step-one proposals gate (redesign 2026-08-07)", () => {
         { kind: "memory_proposals_result" }
       >
       expect(proposalResult.candidates.map((c) => c.id)).toEqual([cand.id])
-
+      // Parked: no injection receipt, no engine boot.
       expect(h.store.messages.some((m) => m.kind === "memory_preview")).toBe(false)
       expect(h.sessionStarts).toHaveLength(0)
 
-
+      // The user accepts the candidate (host action), then settles the stage.
       h.memory.store.update(cand.id, { status: "active" }, { actor: "user" })
       await h.coordinator.respondMemoryProposals({ chatId: "chat-1", proposalsId: gate.proposalsId, decision: "reviewed" })
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview"))
@@ -5354,7 +4714,7 @@ describe("step-one proposals gate (redesign 2026-08-07)", () => {
         { kind: "memory_proposals_decision" }
       >
       expect(decisionEntry.decision).toBe("reviewed")
-
+      // The causal chain: what was just accepted rides this same turn.
       const preview = h.store.messages.find((m) => m.kind === "memory_preview") as Extract<
         TranscriptEntry,
         { kind: "memory_preview" }
@@ -5403,7 +4763,7 @@ describe("step-one proposals gate (redesign 2026-08-07)", () => {
 
       await h.coordinator.respondMemoryProposals({ chatId: "chat-1", proposalsId: gate.proposalsId, decision: "skipped" })
       await waitFor(() => h!.store.messages.some((m) => m.kind === "memory_preview"))
-
+      // Skipped, not resolved: the candidate stays pending for the next gate.
       expect(h.memory.store.getById(proposalResult.candidates[0]!.id)!.status).toBe("candidate")
     } finally {
       h.cleanup()
@@ -5421,8 +4781,8 @@ describe("step-one proposals gate (redesign 2026-08-07)", () => {
       h.memory.store.create({ content: "seed", scope: "personal", type: "fact" }, { actor: "system" })
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "hello" })
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview"))
-
-
+      // The step still announces itself: an empty entry settled as "empty",
+      // no parking, no boot delay.
       const emptyGate = h.store.messages.find((m) => m.kind === "memory_proposals") as Extract<
         TranscriptEntry,
         { kind: "memory_proposals" }
@@ -5492,7 +4852,7 @@ describe("step-one proposals gate (redesign 2026-08-07)", () => {
     try {
       h.memory.store.create({ content: "seed", scope: "personal", type: "fact" }, { actor: "system" })
 
-
+      // Turn 1: no gate (nothing pending yet), user goes on, turn finishes.
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 1" })
       await waitFor(() => h!.store.messages.some((m) => m.kind === "memory_preview"))
       const preview1 = h.store.messages.find((m) => m.kind === "memory_preview") as Extract<
@@ -5503,11 +4863,12 @@ describe("step-one proposals gate (redesign 2026-08-07)", () => {
       await waitFor(() => h!.prompts.length === 1)
       h.emitEntry({ kind: "assistant_text", text: "done", messageId: "m1" })
       h.finishTurn()
-
+      // Capture ran, parked a candidate, and did NOT card it at the turn's end.
       await waitFor(() => h!.memory.store.list({ status: "candidate" }).length === 1)
       expect(h.store.messages.some((m) => m.kind === "memory_candidates")).toBe(false)
 
-
+      // Turn 2: the parked candidate greets the user at the gate. (Turn 1
+      // already emitted an EMPTY step-one entry — take the latest.)
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "turn 2" })
       await waitFor(() => h!.store.messages.filter((m) => m.kind === "memory_proposals_result").length >= 2)
       const gate = h.store.messages.filter((m) => m.kind === "memory_proposals").at(-1) as Extract<
@@ -5552,7 +4913,7 @@ describe("step-one checkup gate (redesign 2026-08-07)", () => {
         { kind: "memory_checkup_result" }
       >
       expect(result.suggestions).toHaveLength(1)
-
+      // Parked: no injection receipt yet, no boot.
       expect(h.store.messages.some((m) => m.kind === "memory_preview")).toBe(false)
       expect(h.sessionStarts).toHaveLength(0)
 
@@ -5579,8 +4940,9 @@ describe("step-one checkup gate (redesign 2026-08-07)", () => {
       h.memory.store.create({ content: "seed", scope: "personal", type: "fact" }, { actor: "system" })
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "task" })
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview"))
-
-
+      // Skeleton + empty result, settled with an "empty" decision (nothing
+      // parked). An undecided checkup would read as an open gate to the
+      // client, suppressing the streaming footer for the whole turn.
       expect(h.store.messages.some((m) => m.kind === "memory_checkup")).toBe(true)
       const result = h.store.messages.find((m) => m.kind === "memory_checkup_result") as Extract<
         TranscriptEntry,
@@ -6260,50 +5622,6 @@ describe("study freeze settlement (Claude only)", () => {
 })
 
 describe("fork-first capture (2026-08-08 option A)", () => {
-  test("Auto selects the broad Project Copy extraction profile for the finished-session fork", async () => {
-    const forkProfiles: Array<string | undefined> = []
-    const routedProfiles: Array<string | undefined> = []
-    const zero = {
-      created: [], proposed: 0, surfaced: 0, dropped: 0, conflicts: 0,
-      reinforced: 0, reinforcedIds: [], revisions: 0, pending: [],
-    }
-    const capture: CaptureService = {
-      capture: async () => zero,
-      routeProposal: async () => zero,
-      captureFromPrompt: async () => zero,
-      captureFromExtraction: async (_raw, input) => {
-        routedProfiles.push(input.profile)
-        return zero
-      },
-    }
-    const h = createHarness({
-      policy: resolveConditionPolicy("auto"),
-      capture,
-      forkCapture: async (input) => {
-        forkProfiles.push(input.profile)
-        return { candidates: [] }
-      },
-      claudeSessionFileExists: () => true,
-    })
-    try {
-      await h.coordinator.send({
-        type: "chat.send",
-        chatId: "chat-1",
-        provider: "claude",
-        content: "Implement the booking and cancellation flows from the task specification.",
-      })
-      await waitFor(() => h.prompts.length === 1)
-      await h.store.setSessionToken("chat-1", "tok-auto")
-      h.emitEntry({ kind: "assistant_text", text: "Implemented both flows and added confirmation before cancellation.", messageId: "m1" })
-      h.finishTurn()
-      await waitFor(() => forkProfiles.length === 1)
-
-      expect(forkProfiles).toEqual(["auto-project-copy"])
-      expect(routedProfiles).toEqual(["auto-project-copy"])
-    } finally {
-      h.cleanup()
-    }
-  })
 
   test("the fork's extraction routes through captureFromExtraction; the sidecar pass never runs", async () => {
     const sidecarCalls: string[] = []
@@ -6337,7 +5655,7 @@ describe("fork-first capture (2026-08-08 option A)", () => {
       const preview = h.store.messages.find((m: any) => m.kind === "memory_preview") as any
       h.coordinator.respondMemoryPreview({ chatId: "chat-1", previewId: preview.previewId, decision: "go_on" })
       await waitFor(() => h.prompts.length === 1)
-
+      // Give the session a resume token so the fork path is eligible.
       await h.store.setSessionToken("chat-1", "tok-1")
       h.emitEntry({ kind: "assistant_text", text: "done", messageId: "m1" })
       h.finishTurn()
@@ -6412,7 +5730,7 @@ describe("fork-first capture (2026-08-08 option A)", () => {
     const capture: CaptureService = {
       capture: (input) => realCapture!.capture(input),
       routeProposal: (raw, input) => realCapture!.routeProposal(raw, input),
-
+      // Keep turn-start Prompt Parse out of this post-turn fallback test.
       captureFromPrompt: async () => zero,
       captureFromExtraction: (raw, input) => realCapture!.captureFromExtraction!(raw, input),
     }
@@ -6630,7 +5948,7 @@ describe("turn-end memory preparation concurrency", () => {
 })
 
 describe("transfer card (Transfer design 2026-08-08)", () => {
-
+  /** Prepared-rule stub: relevance/landing is still materialized per prompt. */
   const detectStub = (cards: () => TransferSuggestionCard[]): TransferDetectService => ({
     hasSourceCandidates: () => cards().length > 0,
     prepareSources: async () => {},
@@ -6695,7 +6013,7 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
       expect(suggestions[0]!.rule).toBe("Bind 0.0.0.0 in containers")
       expect(suggestions[0]!.sourceLabel).toBe("Alpha Shop")
       expect("widening" in suggestions[0]!).toBe(false)
-
+      // Parked: no injection receipt yet.
       expect(h.store.messages.some((m) => m.kind === "memory_preview")).toBe(false)
 
       await h.coordinator.respondMemoryTransfer({ chatId: "chat-1", transferId: gate.transferId, decision: "handled" })
@@ -6738,7 +6056,7 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
         { actor: "system" },
       )
       source.id = item.id
-
+      // The source was edited after the card snapshot: version no longer matches.
       h.memory.store.update(item.id, { content: "edited since" }, { actor: "user" })
 
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "go" })
@@ -6771,7 +6089,7 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
       )
       source.id = item.id
       source.version = item.version
-
+      // A parked candidate makes Step 1 park.
       h.memory.store.create(
         { content: "pending change", scope: "project", projectId: "project-1", type: "fact", status: "candidate", provenanceSessionId: "chat-1" },
         { actor: "agent" },
@@ -6779,8 +6097,8 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
 
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "go" })
       await waitFor(() => h!.coordinator.pendingProposalGates.has("chat-1"))
-
-
+      // Step 1 undecided → the Transfer card must NOT exist yet (staged
+      // presentation, user ruling 2026-08-09).
       await new Promise((r) => setTimeout(r, 50))
       expect(h.store.messages.some((m) => m.kind === "memory_transfer")).toBe(false)
 
@@ -6789,7 +6107,7 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
         { kind: "memory_proposals" }
       >
       await h.coordinator.respondMemoryProposals({ chatId: "chat-1", proposalsId: gate.proposalsId, decision: "skipped" })
-
+      // Now the already-running task computation may publish and park.
       await waitFor(() => h!.store.messages.some((m) => m.kind === "memory_transfer"))
       await waitFor(() => h!.coordinator.pendingTransferGates.has("chat-1"))
 
@@ -6848,7 +6166,7 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
         { kind: "memory_transfer_result" }
       >
       expect(result.suggestions).toHaveLength(1)
-
+      // Parked on the card.
       expect(h.store.messages.some((m) => m.kind === "memory_preview")).toBe(false)
       await h.coordinator.respondMemoryTransfer({ chatId: "chat-1", transferId: shell.transferId, decision: "handled" })
       await waitFor(() => h!.store.messages.some((m) => m.kind === "memory_preview"))
@@ -6944,7 +6262,7 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "dockerize it" })
       await promptParseDidStart
       await waitFor(() => taskRuns === 1)
-
+      // Step 1 is still parsing, so Transfer presentation has not begun.
       expect(h.store.messages.some((message) => message.kind === "memory_transfer")).toBe(false)
 
       await Promise.race([
@@ -7432,7 +6750,7 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
       await waitFor(() => relevanceRuns === 1)
       expect(h.store.messages.some((m) => m.kind === "memory_transfer")).toBe(false)
 
-
+      // Simulate the Candidate card's accept action before its Continue.
       h.memory.store.create(
         { content: "accepted candidate", scope: "project", projectId: "project-1", type: "constraint" },
         { actor: "user" },
@@ -7559,8 +6877,8 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
       landingsStillCurrent: (_ctx, targetKey) => {
         if (targetKey === "target-v1") return false
         refreshedTargetChecks += 1
-
-
+        // The refresh loop and its immediate post-check both see v2. The
+        // target changes before the final transcript enqueue.
         return refreshedTargetChecks <= 2
       },
     }
@@ -7695,7 +7013,9 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
       h.memory.store.update(sourceItem.id, { content: "Source changed while the card waited" }, { actor: "user" })
       releaseFinalWrite()
 
-
+      // Let the queued write callback either revalidate into empty or park the
+      // stale card (the pre-fix behavior). Do not mistake the intentionally
+      // early pending-map registration for a completed append.
       await new Promise((resolve) => setTimeout(resolve, 30))
       if (h.coordinator.pendingTransferGates.has("chat-1")) await h.coordinator.cancel("chat-1")
 
@@ -7749,8 +7069,8 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
       prepareSources: async () => {},
       buildTaskForkPrompt: () => "task-local relevance",
       materializeTaskFromFork: async () => null,
-
-
+      // Slower than a microtask: the scan shell becomes visible first (the
+      // real-world shape), so the empty find must SETTLE it, not vanish.
       runTask: async () => {
         await new Promise((resolve) => setTimeout(resolve, 20))
         return { cards: [], targetKey: "target-v1" }
@@ -7802,7 +7122,7 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
       )
       source.id = item.id
       source.version = item.version
-
+      // Make the staleness row's id real so validation keeps it out of the way.
       void seed
 
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "go" })
@@ -7812,19 +7132,19 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
         { kind: "memory_transfer" }
       >
       await h.coordinator.respondMemoryTransfer({ chatId: "chat-1", transferId: gate.transferId, decision: "skipped" })
-
+      // Step 2 parks with its suggestion.
       await waitFor(() => h!.coordinator.pendingCheckupGates.has("chat-1"))
       expect(llmQueries).toBe(1)
 
-
+      // Reopen the Transfer card while Step 2 waits.
       await h.coordinator.reopenMemoryPreparation({ chatId: "chat-1", from: "transfer", stageId: gate.transferId })
       await waitFor(() => h!.coordinator.pendingTransferGates.has("chat-1"))
       await h.coordinator.respondMemoryTransfer({ chatId: "chat-1", transferId: gate.transferId, decision: "handled" })
-
+      // The service is called to republish the card, but its existing result is reused.
       await waitFor(() => serviceCalls === 2)
       expect(llmQueries).toBe(1)
       await waitFor(() => h!.coordinator.pendingCheckupGates.has("chat-1"))
-
+      // The reset marker for the transfer stage landed.
       expect(
         h.store.messages.some((m) => m.kind === "memory_preparation_reset" && m.from === "transfer"),
       ).toBe(true)
@@ -7932,16 +7252,16 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
         TranscriptEntry,
         { kind: "memory_proposals" }
       >
-
+      // Settle Step 1 — only then does the Transfer card appear and park.
       await h.coordinator.respondMemoryProposals({ chatId: "chat-1", proposalsId: gate.proposalsId, decision: "skipped" })
       await waitFor(() => h!.coordinator.pendingTransferGates.has("chat-1"))
 
-
+      // Reopen Step 1 while the Transfer card is still parked.
       await h.coordinator.reopenMemoryPreparation({ chatId: "chat-1", from: "proposals", stageId: gate.proposalsId })
       await waitFor(() => h!.coordinator.pendingProposalGates.has("chat-1"))
-      expect(h.coordinator.pendingTransferGates.has("chat-1")).toBe(true)
+      expect(h.coordinator.pendingTransferGates.has("chat-1")).toBe(true) // transfer untouched
 
-
+      // Settle the transfer FIRST — the turn must still wait for Step 1.
       const transferGate = h.store.messages.find((m) => m.kind === "memory_transfer") as Extract<
         TranscriptEntry,
         { kind: "memory_transfer" }
@@ -7981,7 +7301,7 @@ describe("transfer card (Transfer design 2026-08-08)", () => {
       >
       expect(decision.decision).toBe("cancelled")
       expect(h.store.messages.some((m) => m.kind === "interrupted")).toBe(true)
-
+      // No boot happened.
       expect(h.sessionStarts).toHaveLength(0)
     } finally {
       h.cleanup()
@@ -7999,7 +7319,7 @@ describe("streaming preview lifecycle", () => {
       h.emitEvent({ type: "assistant_delta", itemId: "item-1", delta: "partial re" })
       await waitFor(() => h.coordinator.getStreamingAssistantTexts().get("chat-1") === "partial re")
 
-
+      // The upstream connection drops before any assistant_text/result entry.
       h.closeStream()
       await waitFor(() => h.coordinator.getStreamingAssistantTexts().size === 0)
       expect(h.coordinator.getStreamingAssistantTexts().size).toBe(0)
@@ -8014,8 +7334,8 @@ describe("transfer landings on the preview receipt", () => {
     const h = createHarness({ preview: true })
     try {
       const seeded = h.memory.store.create({ content: "seed", scope: "personal", type: "fact" }, { actor: "system" })
-
-
+      // Simulates the REST transfer-accept recording a landing for this chat
+      // (new item or reinforce-merge alike).
       h.memory.noteTransferLanding("chat-1", seeded.id)
       await h.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "task" })
       await waitFor(() => h.store.messages.some((m) => m.kind === "memory_preview"))

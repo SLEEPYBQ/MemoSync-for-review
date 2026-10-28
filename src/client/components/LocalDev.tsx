@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react"
 import { useNavigate } from "react-router-dom"
+import { copyTextToClipboard } from "../lib/clipboard"
 import {
   ArrowLeftRight,
   BrainCircuit,
@@ -42,7 +43,7 @@ interface LocalDevProps {
   onCreateProject: (project: { mode: "new" | "existing"; localPath: string; title: string }) => Promise<void>
   onSend: AppState["handleSend"]
   availableProviders: AppState["availableProviders"]
-
+  /** localPath → projectId for projects the server already knows (enables attachment uploads pre-send). */
   projectIdByPath: Record<string, string>
 }
 
@@ -83,7 +84,7 @@ function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false)
 
   async function handleCopy() {
-    await navigator.clipboard.writeText(text)
+    if (!await copyTextToClipboard(text)) return
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
@@ -172,7 +173,8 @@ function Step({
   )
 }
 
-
+// Landing counts come from the shared memory store plus one needs-attention
+// probe per visit — the same sources the sidebar badge polls.
 function useLandingMemorySummary(enabled: boolean) {
   const items = useMemoryStore((s) => s.items)
   const status = useMemoryStore((s) => s.status)
@@ -190,12 +192,13 @@ function useLandingMemorySummary(enabled: boolean) {
           if (!disposed) setAttentionCount(attention.items.length)
         })
         .catch(() => {
-
+          // keep the last count — a missed probe must not blank the card
         })
     }
     probe()
-
-
+    // Poll like the sidebar badge (60s) so a conflict raised while the user
+    // lingers on the landing surfaces here too, instead of a stale green check
+    // that contradicts the sidebar red dot (BUG LAND-4).
     const interval = window.setInterval(() => {
       if (!document.hidden) probe()
     }, 60_000)
@@ -276,8 +279,9 @@ export function LocalDevContent({
   conditionPolicy,
 }: LocalDevProps & { conditionPolicy: ConditionPolicy }) {
   const navigate = useNavigate()
-
-
+  // Baseline arms strip the landing down to the hero + composer: no feature
+  // cards ("Add a project" stays reachable from the composer's project picker
+  // and the sidebar), and the hero centers in the freed space.
   const studyNeutral = conditionPolicy.condition !== "memosync"
   const projects = useMemo(() => snapshot?.projects ?? [], [snapshot?.projects])
   const projectPaths = useMemo(() => projects.map((project) => project.localPath), [projects])

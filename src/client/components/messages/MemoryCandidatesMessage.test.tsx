@@ -50,8 +50,8 @@ test("standalone transcripts omit candidate drafts without contacting the live m
     timestamp: "2026-07-14T00:00:00.000Z",
     candidates: [{
       id: "M-01",
-
-
+      // Legacy transcripts may contain these fields. The readonly renderer
+      // must not expose them in a share/export.
       content: "sk-legacy-secret",
       detail: "person@example.com",
       type: "fact",

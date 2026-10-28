@@ -11,7 +11,11 @@ interface OnboardingCheck {
   stage: StudyOnboardingStage | null
 }
 
-
+/**
+ * Server-backed client route ownership for onboarding. The server remains the
+ * security authority; this removes the visible SPA bypass while the durable
+ * state is rechecked after every navigation.
+ */
 export function OnboardingRouteBoundary({ enabled, children }: { enabled: boolean; children: ReactNode }) {
   const location = useLocation()
   const [retry, setRetry] = useState(0)

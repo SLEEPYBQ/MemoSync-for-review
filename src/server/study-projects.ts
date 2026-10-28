@@ -1,5 +1,10 @@
-
-
+// Study-project registrar (STUDY_PLAN §2.1 cross-project / T4): a participant's
+// container hosts MULTIPLE project workspaces (warm-up C, project A, project B).
+// The orchestrator provisions each workspace subdir and passes a STUDY_PROJECTS
+// manifest; at boot the server registers each as a project (idempotently, via
+// the same openProject path as a manual "add project") so they appear
+// deterministically — no participant has to hand-add a project, which would
+// introduce between-participant variance in a between-subjects study.
 import { basename } from "node:path"
 import { STUDY_TASKS, type StudyTask } from "../shared/studyTasks"
 import { resolveLocalPath } from "./paths"
@@ -9,7 +14,7 @@ export interface StudyProjectSpec {
   title: string
 }
 
-
+/** Minimal store surface this module needs (real EventStore satisfies it). */
 export interface StudyProjectStore {
   openProject(localPath: string, title?: string): Promise<{ id: string; localPath: string; title: string }>
 }
@@ -21,7 +26,11 @@ export interface RegisteredStudyProject {
   starterReady: boolean
 }
 
-
+/**
+ * Parse the STUDY_PROJECTS env value: a JSON array of {localPath, title?}.
+ * Empty/absent → []. Malformed JSON or a non-array throws (a study misconfig
+ * should fail loudly at boot, not silently drop the cross-project projects).
+ */
 export function parseStudyProjects(raw: string | undefined): StudyProjectSpec[] {
   if (!raw || !raw.trim()) return []
   const parsed = JSON.parse(raw)
@@ -34,8 +43,8 @@ export function parseStudyProjects(raw: string | undefined): StudyProjectSpec[] 
     const localPath = typeof entry?.localPath === "string" ? entry.localPath.trim() : ""
     if (!localPath) continue
     if (seenPaths.has(localPath)) {
-
-
+      // Two study projects on one localPath would register as ONE project
+      // (openProject dedups by path) and silently invalidate cross-project.
       throw new Error(`Duplicate study-project localPath: ${JSON.stringify(localPath)}`)
     }
     seenPaths.add(localPath)
@@ -45,7 +54,7 @@ export function parseStudyProjects(raw: string | undefined): StudyProjectSpec[] 
   return specs
 }
 
-
+/** Register each study project (idempotent), preserving order. */
 export async function registerStudyProjects(store: StudyProjectStore, specs: StudyProjectSpec[]) {
   const projects = []
   for (const spec of specs) {
@@ -54,7 +63,11 @@ export async function registerStudyProjects(store: StudyProjectStore, specs: Stu
   return projects
 }
 
-
+/**
+ * Bind the trusted STUDY_PROJECTS manifest to EventStore registrations once at
+ * boot. Later prompt/snapshot admission consumes this exact id+path mapping;
+ * it never rediscovers a project by basename from participant-visible state.
+ */
 export function resolveRegisteredStudyProjects(
   specs: readonly StudyProjectSpec[],
   registered: ReadonlyArray<{ id: string; localPath: string; title: string }>,

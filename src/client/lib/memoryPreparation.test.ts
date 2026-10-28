@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test"
 import { hasOpenMemoryPreparationStep } from "./memoryPreparation"
 import { processTranscriptMessages } from "./parseTranscript"
 
-
+// Raw entries shaped like a real turn: user prompt, empty Step 1, empty
+// Step 2 checkup, decided preview. Mirrors transcript f941655f (2026-08-11),
+// where an unsettled empty checkup suppressed the streaming footer for the
+// whole turn.
 let n = 0
 const base = () => ({ _id: `e${++n}`, createdAt: 1_786_440_763_000 + n * 1000 })
 

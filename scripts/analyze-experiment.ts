@@ -1,5 +1,7 @@
-
-
+// CLI for the experiment-log analyzer (SPEC §6): per-session metamemory
+// metrics + aggregates from an events.jsonl.
+//   bun run scripts/analyze-experiment.ts <events.jsonl> [--csv out.csv] [--include-internal-qa]
+// The log lives at ~/.memosync/data/experiments/events.jsonl.
 import { readFileSync, writeFileSync } from "node:fs"
 import { analyzeEvents } from "../src/server/experiment/analyze"
 

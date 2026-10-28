@@ -74,8 +74,8 @@ test("recovers transcript-backed participant prompts after freeze and a real res
     await eventStore.appendMessage(forkChat.id, {
       _id: "turn-fork-copy",
       kind: "user_prompt",
-
-
+      // A fork copies the source entry's original timestamp, which predates
+      // the fork chat. The pending token may later be cleared on provider boot.
       createdAt: forkChat.createdAt - 1,
       content: "Copied prompt, not a new participant send.",
       attachments: [],
@@ -89,8 +89,8 @@ test("recovers transcript-backed participant prompts after freeze and a real res
       attachments: [],
     })
     await eventStore.deleteChat(validChat.id)
-
-
+    // Compaction must retain the hidden chat's authoritative lineage even
+    // though ordinary UI queries continue to treat it as deleted.
     await eventStore.compact()
 
     studyStore = new StudyMemoryStore(studyDbPath)
@@ -102,8 +102,8 @@ test("recovers transcript-backed participant prompts after freeze and a real res
       now: () => new Date(openedAtMs).toISOString(),
     })
     beforeCrash.recordServerStageEntered("session_exposure", "038-S1")
-
-
+    // Transcript append has completed, while its best-effort telemetry callback
+    // has not. Freeze and process loss happen before that timer can retry.
     studyStore.createFreezeSnapshot({
       snapshotId: "freeze-after-missed-prompt",
       taskId: "038-S1",

@@ -286,8 +286,9 @@ export function useChatPageSidebarActions({
         body: result.body,
       }
     } catch (error) {
-
-
+      // Every other Git action surfaces failures via dialog.alert; this one
+      // silently swallowed them, leaving the user with an empty box and no clue
+      // (BUG PANEL-5). Especially likely on the DeepSeek deployment (AGENT-6).
       await dialog.alert({
         title: "Couldn't generate a commit message",
         description: error instanceof Error ? error.message : String(error),

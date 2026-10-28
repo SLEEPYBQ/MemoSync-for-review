@@ -66,12 +66,12 @@ describe('revision service (DG4 propose-fixes drafting)', () => {
     expect(proposal.projectId).toBe('RenderX');
     expect(proposal.evidenceClass).toBe('inferred');
     expect(memory.store.revisionTargetOf(proposal.id)?.id).toBe(target.id);
-
+    // The drafting prompt carried the drift evidence.
     expect(calls[0]!.user).toContain('VIOLATED');
     expect(calls[0]!.system).toContain('at most 100 words');
     expect(calls[0]!.system).toContain('semantically complete');
     expect(calls[0]!.system).not.toContain('160 chars');
-
+    // The original stays active until the user decides.
     expect(memory.store.getById(target.id)!.status).toBe('active');
   });
 
@@ -94,7 +94,7 @@ describe('revision service (DG4 propose-fixes drafting)', () => {
     const target = activeMemory('BROKEN_OLD_RULE');
     traceTimes(target.id, 'violated', 3);
     const call: Parameters<typeof createRevisionService>[0]['callJson'] = async () => {
-
+      // The user fixes the rule mid-draft — the LLM's replacement is stale.
       memory.store.update(target.id, { content: 'USER_ALREADY_FIXED_RULE' }, { actor: 'user' });
       return { action: 'revise', content: 'Stale replacement written against the old text', reason: 'violated 3x' };
     };
@@ -117,8 +117,9 @@ describe('revision service (DG4 propose-fixes drafting)', () => {
     memory.store.recordTraceLabel(mixed.id, 'violated', { actor: 'agent', turn: 1 });
     memory.store.recordTraceLabel(mixed.id, 'injected_without_effect', { actor: 'agent', turn: 2 });
     memory.store.recordTraceLabel(mixed.id, 'violated', { actor: 'agent', turn: 3 });
-
-
+    // A without-effect streak never drafts: no drift evidence to write a
+    // replacement from (live-testing produced echo proposals) — that memory
+    // belongs to the stale surface, not the revision lane.
     const inert = activeMemory('inert streak');
     traceTimes(inert.id, 'injected_without_effect', 3);
     const open = activeMemory('already has a proposal');
@@ -161,7 +162,7 @@ describe('revision service (DG4 propose-fixes drafting)', () => {
     expect(created).toHaveLength(0);
     expect(memory.store.hasOpenRevision(target.id)).toBe(false);
     expect(memory.store.getById(target.id)!.status).toBe('active');
-
+    // No orphan candidate was written either.
     expect(memory.store.list({ status: 'candidate' })).toHaveLength(0);
   });
 

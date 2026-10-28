@@ -6,6 +6,7 @@ import type { ProcessedToolCall } from "./types"
 import { Button } from "../ui/button"
 import { markdownComponentsWithLinks } from "./shared"
 import { cn } from "../../lib/utils"
+import { copyTextToClipboard } from "../../lib/clipboard"
 import { isImeComposingKeyEvent } from "../../lib/imeKeys"
 import { useTranscriptRenderOptions } from "./render-context"
 
@@ -33,7 +34,7 @@ export function ExitPlanModeMessage({ message, onConfirm, isLatest }: Props) {
 
   const handleCopy = async () => {
     if (!input?.plan) return
-    await navigator.clipboard.writeText(input.plan)
+    if (!await copyTextToClipboard(input.plan)) return
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
@@ -151,7 +152,7 @@ export function ExitPlanModeMessage({ message, onConfirm, isLatest }: Props) {
                 value={editMessage}
                 onChange={(e) => setEditMessage(e.target.value)}
                 onKeyDown={(e) => {
-
+                  // Enter mid-IME-composition commits a candidate, not the plan edit (MSG-8).
                   if (isImeComposingKeyEvent(e.nativeEvent)) return
                   if (e.key === "Enter" && !e.shiftKey && editMessage.trim()) {
                     e.preventDefault()

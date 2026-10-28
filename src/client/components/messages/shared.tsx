@@ -41,6 +41,7 @@ import {
   Check,
 } from "lucide-react"
 import { cn } from "../../lib/utils"
+import { copyTextToClipboard } from "../../lib/clipboard"
 import { parseLocalFileLink } from "../../lib/pathUtils"
 import { useMessageViolatedCitations, useTranscriptRenderOptions } from "./render-context"
 import { useTranscriptChatContext } from "./render-context"
@@ -74,7 +75,7 @@ export function OpenLocalLinkProvider({
   )
 }
 
-
+// Tool icon mapping - shared between ToolCallMessage and SystemMessage
 export const toolIcons: Record<string, LucideIcon> = {
   Task: ListTodo,
   TaskOutput: ListTodo,
@@ -98,7 +99,7 @@ export const toolIcons: Record<string, LucideIcon> = {
 
 export const defaultToolIcon: LucideIcon = ToyBrick
 
-
+// Get icon for a tool.
 export function getToolIcon(toolName: string): LucideIcon {
   if (toolIcons[toolName]) {
     return toolIcons[toolName]
@@ -106,7 +107,7 @@ export function getToolIcon(toolName: string): LucideIcon {
   return defaultToolIcon
 }
 
-
+// Container for meta-style messages (system, tool, result)
 export function MetaRow({ children, className }: { children: ReactNode; className?: string }) {
   return (
     <div className={cn("flex gap-3 justify-start items-center", className)}>
@@ -115,7 +116,7 @@ export function MetaRow({ children, className }: { children: ReactNode; classNam
   )
 }
 
-
+// Content row with consistent text styling
 export function MetaContent({ children, className }: { children: ReactNode; className?: string }) {
   return (
     <div className={cn("flex items-center gap-1.5 text-xs", className)}>
@@ -124,27 +125,27 @@ export function MetaContent({ children, className }: { children: ReactNode; clas
   )
 }
 
-
+// Separator pipe
 export function MetaSeparator() {
   return <span className="text-muted-foreground">|</span>
 }
 
-
+// Bold label text
 export function MetaLabel({ children, className }: { children: ReactNode; className?: string }) {
   return <span className={cn("font-medium text-foreground/80", className)}>{children}</span>
 }
 
-
+// Muted text
 export function MetaText({ children }: { children: ReactNode }) {
   return <span className="text-muted-foreground">{children}</span>
 }
 
-
+// Expandable row with chevron
 interface ExpandableRowProps {
   children: ReactNode
   expandedContent: ReactNode
   defaultExpanded?: boolean
-
+  /** Observe toggles (e.g. monitoring telemetry for pool/trace expansion). */
   onExpandedChange?: (expanded: boolean) => void
 }
 
@@ -176,13 +177,13 @@ export function ExpandableRow({ children, expandedContent, defaultExpanded = fal
   )
 }
 
-
+// Code block for expanded content
 export function MetaCodeBlock({ label, children, copyText }: { label: ReactNode; children: ReactNode; copyText?: string }) {
   const [copied, setCopied] = useState(false)
   const textContent = copyText ?? extractText(children)
 
   const handleCopy = useCallback(async () => {
-    await navigator.clipboard.writeText(textContent)
+    if (!await copyTextToClipboard(textContent)) return
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }, [textContent])
@@ -211,7 +212,7 @@ export function MetaCodeBlock({ label, children, copyText }: { label: ReactNode;
   )
 }
 
-
+// Pill/badge for tags
 export function MetaPill({ children, icon: Icon, className }: { children: ReactNode; icon?: LucideIcon; className?: string }) {
   return (
     <span className={cn("inline-flex items-center gap-1 px-2 py-1 bg-muted border border-border  rounded-full", className)}>
@@ -221,7 +222,7 @@ export function MetaPill({ children, icon: Icon, className }: { children: ReactN
   )
 }
 
-
+// Container with vertical line on the left
 export function VerticalLineContainer({ children, className }: { children: ReactNode; className?: string }) {
   return (
     <div className={cn("grid grid-cols-[auto_1fr] gap-2 min-w-0", className)}>
@@ -235,27 +236,36 @@ export function VerticalLineContainer({ children, className }: { children: React
   )
 }
 
-
+// Ensure the memory store is populated before a citation/candidate/trace UI
+// tries to resolve an id against it. `memoryStore.loadAll()` does not dedupe
+// concurrent calls itself, so this hook gates on `status` (effects in the same
+// commit run synchronously, so only the first mount actually fetches).
 export function useEnsureMemoriesLoaded() {
+  const { readonly } = useTranscriptRenderOptions()
   const status = useMemoryStore((s) => s.status)
   const loadAll = useMemoryStore((s) => s.loadAll)
   useEffect(() => {
-    if (status === "idle") void loadAll()
-  }, [status, loadAll])
+    if (!readonly && status === "idle") void loadAll()
+  }, [readonly, status, loadAll])
 }
 
-
+/**
+ * Per-memory interrupt plumbing (2026-08-19 C1/C2): ChatPage provides this
+ * while its chat can be stopped; every citation chip (reply text, sidebar
+ * live row) then carries a stop entry in its hover card, and the recovery
+ * card reaches resume() through the same context.
+ */
 export interface TurnInterruptApi {
-
+  /** True while the current turn is running and can still be stopped. */
   active: boolean
-
+  /** Guide-only illustration: render the affordance without admitting input. */
   readOnly?: boolean
   interrupt: (memoryId: string, quote?: string) => void
   resume: (args: {
     interruptId: string
-
+    /** Required by production recovery; optional only while old Guide scenes are migrated. */
     correction?: string
-
+    /** Read/demo compatibility for the pre-composer recovery model. */
     action?: "content_fixed" | "usage_correction" | "removed_only"
     selectedIds: string[]
     enforce?: boolean
@@ -266,7 +276,9 @@ export function useTurnInterrupt() {
   return useContext(TurnInterruptContext)
 }
 
-
+// Interrupt belongs to the in-flight reply, not every historical citation
+// mounted under ChatPage's long-lived TurnInterruptContext. The streaming
+// reply and the live Memory Record row opt into this narrower scope.
 const CurrentTurnMemoryCitationContext = createContext(false)
 export function CurrentTurnMemoryCitationProvider({ children }: { children: ReactNode }) {
   return (
@@ -276,17 +288,19 @@ export function CurrentTurnMemoryCitationProvider({ children }: { children: Reac
   )
 }
 
-
+// Scope-colored [M-NN] citation chip (SPEC §4.10c). Resolves the memory from
+// the store; unresolved ids render as a neutral, non-interactive chip (either
+// truly unknown, or the store hasn't loaded yet).
 export function MemoryCitationChip({ id, children }: { id: string; children?: ReactNode }) {
   useEnsureMemoriesLoaded()
   const { chatId } = useTranscriptChatContext()
   const memory = useMemoryStore((s) => s.items.find((m) => m.id === id))
   const interruptApi = useTurnInterrupt()
   const belongsToCurrentTurn = useContext(CurrentTurnMemoryCitationContext)
-
+  // Two-step confirm inside the hover card (C1: 轻确认防误触).
   const [stopArmed, setStopArmed] = useState(false)
-
-
+  // The VISIBLE stop button next to the chip (2026-08-19 evening revision):
+  // hover-only was undiscoverable. Same two-step confirm, auto-disarm.
   const [inlineArmed, setInlineArmed] = useState(false)
   const [hoverOpen, setHoverOpen] = useState(false)
   useSurfaceExposure({
@@ -301,10 +315,10 @@ export function MemoryCitationChip({ id, children }: { id: string; children?: Re
   useEffect(() => () => clearTimeout(inlineDisarmTimer.current), [])
   const chipRef = useRef<HTMLSpanElement>(null)
   const label = children ?? `[${id}]`
-
-
+  // The trace judged THIS reply as violating this memory — the chip carries
+  // the drift signal in place, no click needed (advisor feedback 2026-07-16).
   const violatedHere = useMessageViolatedCitations()?.has(id) ?? false
-
+  // One citation_hover beacon per chip instance — hover storms are noise.
   const hoverReportedRef = useRef(false)
 
   if (!memory) {
@@ -325,7 +339,7 @@ export function MemoryCitationChip({ id, children }: { id: string; children?: Re
   const scope = isMemoryScope(memory.scope) ? memory.scope : "session"
 
   const fireInterrupt = () => {
-
+    // The anchor quote: the sentence block the chip sits in.
     const block = chipRef.current?.closest("p, li, td, div")
     interruptApi!.interrupt(id, block?.textContent?.trim().slice(0, 300) || undefined)
   }
@@ -362,7 +376,9 @@ export function MemoryCitationChip({ id, children }: { id: string; children?: Re
             <AlertTriangle className="h-3 w-3 shrink-0" /> this reply violated the memory — details in the trace below
           </p>
         ) : null}
-
+        {/* Hover shows the canonical read-only card — the ONE exception is the
+            per-memory stop entry while a turn is running (2026-08-19 C1):
+            spotting a misuse and stopping happen at the same place. */}
         <MemoryCardCore item={memory} />
         {interruptApi?.active && belongsToCurrentTurn ? (
           <button
@@ -389,8 +405,8 @@ export function MemoryCitationChip({ id, children }: { id: string; children?: Re
       </HoverCardContent>
     </HoverCard>
     {interruptApi?.active && belongsToCurrentTurn ? (
-
-
+      // Visible per-memory stop, right where the chip streams in. Two-step:
+      // first press arms (and auto-disarms), second press stops the turn.
       <button
         type="button"
         data-memory-interrupt="visible"
@@ -423,7 +439,7 @@ export function MemoryCitationChip({ id, children }: { id: string; children?: Re
   )
 }
 
-
+// Helper function to extract text content from ReactNode
 function extractText(node: ReactNode): string {
   if (typeof node === "string") {
     return node
@@ -453,7 +469,7 @@ function withChildClassName(node: MarkdownChildNode, className: string): Markdow
   })
 }
 
-
+// Markdown component overrides
 export const markdownComponents = {
   h1: ({ children }: { children?: ReactNode }) => (
     <h1 className="text-[20px] font-normal leading-tight mt-5 mb-3 first:mt-0 last:mb-0">{children}</h1>
@@ -479,7 +495,7 @@ export const markdownComponents = {
     const textContent = extractText(children)
 
     const handleCopy = async () => {
-      await navigator.clipboard.writeText(textContent)
+      if (!await copyTextToClipboard(textContent)) return
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     }
@@ -583,7 +599,9 @@ export function createMarkdownComponents(options?: {
       const onOpenLocalLink = options?.onOpenLocalLink ?? useContext(OpenLocalLinkContext)
       const renderOptions = useTranscriptRenderOptions()
 
-
+      // MemoSync memory citations: [M-NN] tokens are linkified to a private
+      // scheme upstream (linkifyMemoryCitations); render them as scope-colored
+      // chips with a hover card (SPEC §4.10c).
       const memoryId = parseMemoryCitationHref(href)
       if (memoryId) {
         return <MemoryCitationChip id={memoryId}>{children}</MemoryCitationChip>
@@ -635,10 +653,24 @@ export function createMarkdownComponents(options?: {
   }
 }
 
-
+/**
+ * Stable, module-level markdown components for the common (no-options) case.
+ * Calling createMarkdownComponents() inline in render returned a NEW `a`
+ * component identity every render, so React unmounted+remounted every link
+ * (memory citation chips lost their hover card, and citation_hover telemetry
+ * re-fired) on each streaming chunk (BUG MSG-10). The `a` component reads the
+ * open-local-link handler from context, so one shared instance is correct for
+ * every caller that relies on the provider.
+ */
 export const markdownComponentsWithLinks = createMarkdownComponents()
 
-
+/**
+ * Escape `<`/`>` in the PROSE parts of user-authored text (leaving code spans
+ * and fences untouched) before markdown rendering. react-markdown drops raw
+ * HTML, so a user's own "Promise<void>", "<App/>", or "#include <stdio.h>" lost
+ * the angle-bracket tokens in their own bubble (BUG MSG-13). Inside code the
+ * brackets already render verbatim, so those segments are left as-is.
+ */
 export function escapeAngleBracketsOutsideCode(text: string): string {
   if (!text) return text
   const CODE_SEGMENT = /(```[\s\S]*?```|`[^`\n]*`)/g

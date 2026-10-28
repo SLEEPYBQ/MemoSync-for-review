@@ -120,8 +120,8 @@ function createDefaultSnapshot(filePath: string, warning: string | null = null):
 export async function readLlmProviderSnapshot(filePath = getLlmProviderFilePath(homedir())) {
   try {
     const text = await readFile(filePath, "utf8")
-
-
+    // Upgrade files created by older versions that used the process umask and
+    // could therefore leave provider credentials world-readable.
     await chmod(filePath, 0o600).catch(() => {})
     if (!text.trim()) {
       return createDefaultSnapshot(filePath, "LLM provider file was empty. Using defaults.")

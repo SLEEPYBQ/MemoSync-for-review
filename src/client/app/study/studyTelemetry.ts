@@ -1,3 +1,5 @@
+import { generateUUID } from "../../lib/utils"
+
 export type StudyTimedStage = "information" | "memory_questionnaire" | "monitoring_tlx" | "control_tlx" | "sus"
 
 export interface StudyTelemetryOutboxRequest {
@@ -72,7 +74,11 @@ async function isAlreadyRecordedOperation(response: Response): Promise<boolean> 
   }
 }
 
-
+/**
+ * Durable client delivery for participant interaction telemetry. The caller
+ * supplies a participant/condition-scoped storage key; this module owns
+ * persistence, ordered retry, and acknowledgement semantics behind one seam.
+ */
 export function createStudyTelemetryOutbox({
   storage,
   storageKey,
@@ -128,8 +134,9 @@ export function createStudyTelemetryOutbox({
           || [400, 404, 410, 422].includes(response.status)
           || await isAlreadyRecordedOperation(response)
         if (!acknowledged) return
-
-
+        // Enqueue may persist another event while this request is in flight.
+        // Re-read before acknowledgement so removing the head never overwrites
+        // a concurrently appended event with this flush's stale snapshot.
         const current = storedRequests(storage, storageKey)
         const acknowledgedIndex = current.findIndex((entry) => entry.eventId === request.eventId)
         if (acknowledgedIndex >= 0) current.splice(acknowledgedIndex, 1)
@@ -187,14 +194,15 @@ export function createStudyTelemetryOutbox({
 }
 
 type StudyTelemetryOutbox = ReturnType<typeof createStudyTelemetryOutbox>
-type StudyTelemetryCondition = "memosync" | "auto" | "static"
+type StudyTelemetryCondition = "memosync"
 type BrowserStudyTelemetryStorage = StudyTelemetryStorage & Pick<Storage, "key" | "length">
 
 let activeStudyTelemetryOutbox: StudyTelemetryOutbox | null = null
 let pendingStudyTelemetryStorage: BrowserStudyTelemetryStorage | null = null
 let pendingStudyTelemetryWriter: StudyTelemetryOutbox | null = null
 
-
+/** Enable the anonymous pre-scope queue synchronously before study UI effects
+ * can emit. Its storage key contains no participant or condition identity. */
 export function prepareStudyTelemetryOutbox(
   storage: BrowserStudyTelemetryStorage | null = typeof window === "undefined" ? null : window.localStorage,
 ): void {
@@ -208,8 +216,8 @@ export function prepareStudyTelemetryOutbox(
   pendingStudyTelemetryWriter = createStudyTelemetryOutbox({
     storage,
     storageKey: PENDING_OUTBOX_STORAGE_KEY,
-
-
+    // The pre-scope writer only uses synchronous persist(); it never starts or
+    // sends until onboarding resolves the server-owned participant scope.
     fetcher: async () => new Response(null, { status: 503 }),
     onlineTarget: null,
   })
@@ -228,14 +236,19 @@ function clearStudyTelemetryScopes(storage: BrowserStudyTelemetryStorage): void 
   for (const key of keys) storage.removeItem(key)
 }
 
-
+/**
+ * Initialize only after the server-owned onboarding status resolves. A new
+ * participant begins at `information`, which resets every old origin-local
+ * scope before any study interaction is possible. Returning participants
+ * reuse their condition scope and flush it on app initialization.
+ */
 export async function initializeStudyTelemetryOutbox({
   condition,
   resetForNewParticipant,
   storage = typeof window === "undefined" ? null : window.localStorage,
   fetcher = fetch,
   onlineTarget = typeof window === "undefined" ? null : window,
-  randomId = () => crypto.randomUUID(),
+  randomId = generateUUID,
 }: {
   condition: StudyTelemetryCondition
   resetForNewParticipant: boolean
@@ -251,8 +264,9 @@ export async function initializeStudyTelemetryOutbox({
     return
   }
   prepareStudyTelemetryOutbox(storage)
-
-
+  // Information means a new server-owned participant. Clear anonymous pending
+  // evidence before creating any scoped outbox so an old participant's events
+  // can never be rebound to the new allocation.
   if (resetForNewParticipant) clearStudyTelemetryScopes(storage)
   const scopeKey = `${OUTBOX_SCOPE_PREFIX}${condition}`
   let scope = storage.getItem(scopeKey)
@@ -268,8 +282,8 @@ export async function initializeStudyTelemetryOutbox({
   })
   const pending = storedRequests(storage, PENDING_OUTBOX_STORAGE_KEY)
   scopedOutbox.importStored(pending)
-
-
+  // importStored is synchronous and durable. Only after the complete pending
+  // set exists under the resolved scope may the anonymous key be removed.
   storage.removeItem(PENDING_OUTBOX_STORAGE_KEY)
   activeStudyTelemetryOutbox = scopedOutbox
   await scopedOutbox.start()
@@ -280,8 +294,9 @@ export function enqueueStudyTelemetry(request: StudyTelemetryOutboxRequest): voi
     void activeStudyTelemetryOutbox.enqueue(request)
     return
   }
-
-
+  // In a study bootstrap, prepareStudyTelemetryOutbox has installed a durable
+  // anonymous writer. Outside study mode it remains null, so ordinary product
+  // use does not accumulate study events.
   pendingStudyTelemetryWriter?.persist(request)
 }
 
@@ -292,14 +307,16 @@ export function stopStudyTelemetryOutbox(): void {
   pendingStudyTelemetryWriter = null
 }
 
-
+/** Retry the independent onboarding lookup without blocking the study route.
+ * The anonymous queue remains active between attempts; an online event wakes a
+ * delayed retry immediately. */
 export function startStudyTelemetryBootstrap({
   condition,
   loadOnboarding,
   storage = typeof window === "undefined" ? null : window.localStorage,
   fetcher = fetch,
   onlineTarget = typeof window === "undefined" ? null : window,
-  randomId = () => crypto.randomUUID(),
+  randomId = generateUUID,
   retryDelayMs = (attempt) => Math.min(5_000, 250 * (2 ** Math.max(0, attempt - 1))),
 }: {
   condition: StudyTelemetryCondition
@@ -393,10 +410,14 @@ export function startStudyTelemetryBootstrap({
   }
 }
 
-
+/**
+ * Stage entry is measurement evidence, not navigation authority. Retry a
+ * transient failure with the same semantic stage key; the server owns the
+ * deterministic id and keeps the first accepted timestamp across reloads.
+ */
 export async function recordStudyStageEntered(stage: StudyTimedStage, taskId?: string): Promise<void> {
   const body = {
-    eventId: `stage-entry:${crypto.randomUUID()}`,
+    eventId: `stage-entry:${generateUUID()}`,
     kind: "stage_enter",
     surface: "study",
     action: stage,
@@ -413,8 +434,8 @@ export async function recordStudyStageEntered(stage: StudyTimedStage, taskId?: s
       })
       if (response.ok || (response.status >= 400 && response.status < 500)) return
     } catch {
-
-
+      // A reload will issue the same stage entry again; bounded retries cover
+      // ordinary boot/proxy races without keeping a page alive forever.
     }
     await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)))
   }

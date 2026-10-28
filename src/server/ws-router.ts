@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import type { ServerWebSocket } from "bun"
-import { DEFAULT_DEEPSEEK_MODEL_ID, PROTOCOL_VERSION } from "../shared/types"
+import { DEFAULT_DEEPSEEK_MODEL_ID, DEFAULT_PI_MODEL, PROTOCOL_VERSION } from "../shared/types"
 import type { ClientCommand, ClientEnvelope, ServerEnvelope, SubscriptionTopic } from "../shared/protocol"
 import { isClientEnvelope } from "../shared/protocol"
 import type { AgentCoordinator } from "./agent"
@@ -144,15 +144,17 @@ interface CreateWsRouterArgs {
   getDiscoveredProjects: () => DiscoveredProject[]
   machineDisplayName: string
   updateManager: UpdateManager | null
-
-
+  /** The port this app itself serves on — excluded from local-server discovery
+   * so the panel doesn't "discover" MemoSync itself. */
   getSelfPort?: () => number
-
-
+  /**
+   * Study deployments cut every non-essential outbound connection: the
+   * skills.sh registry (search/install) refuses here. Defaults to enabled.
+   */
   remoteSkillsEnabled?: boolean
-
+  /** Present only in study mode: project topology is researcher-managed. */
   studyProjectAccess?: StudyProjectAccess
-
+  /** Formal-study preview owner; Browser polling may recover only its current degraded project. */
   studyPreviewRuntime?: Pick<StudyPreviewRuntimeController, "recover">
   canAutoHealStudyPreview?: (projectId: string) => boolean
   listLocalHttpServersFn?: typeof listLocalHttpServers
@@ -177,7 +179,8 @@ interface SnapshotComputationCache {
   }
 }
 
-
+/** Prevent older snapshot loops from overtaking newer terminal state on a
+ * different socket when several browser tabs are connected. */
 export function createSerialExecutor() {
   let tail: Promise<void> = Promise.resolve()
   return function enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -209,8 +212,8 @@ function resolveSubmittedLlmApiKey(
 ) {
   const submitted = submittedApiKey.trim()
   if (submitted) return submitted
-
-
+  // A saved key belongs to its provider. Reusing it after switching providers
+  // could disclose that credential to a different (or custom) endpoint.
   const sameEndpoint = provider !== "custom" || current.baseUrl.trim() === submittedBaseUrl.trim()
   return current.provider === provider && sameEndpoint ? current.apiKey : ""
 }
@@ -553,6 +556,13 @@ export function createWsRouter({
         },
         planMode: false,
       },
+      pi: {
+        model: DEFAULT_PI_MODEL,
+        modelOptions: {
+          reasoningEffort: "medium",
+        },
+        planMode: false,
+      },
     },
     memoryPreview: {
       enabled: true,
@@ -587,6 +597,14 @@ export function createWsRouter({
         modelOptions: {
           ...snapshot.providerDefaults.codex.modelOptions,
           ...patch.providerDefaults?.codex?.modelOptions,
+        },
+      },
+      pi: {
+        ...snapshot.providerDefaults.pi,
+        ...patch.providerDefaults?.pi,
+        modelOptions: {
+          ...snapshot.providerDefaults.pi.modelOptions,
+          ...patch.providerDefaults?.pi?.modelOptions,
         },
       },
     },
@@ -867,15 +885,19 @@ export function createWsRouter({
         continue
       }
       const envelopeStartedAt = performance.now()
-
-
+      // Building a chat snapshot loads that chat's transcript from disk. If one
+      // chat's transcript is unreadable (e.g. corruption a mid-append kill left
+      // behind), it must not abort this socket's remaining topics — nor, via
+      // broadcastSnapshots' shared loop, every OTHER socket's updates (BUG WS-2).
+      // Skip just the failing topic and keep going.
       let envelope: ReturnType<typeof createEnvelope>
       try {
         envelope = createEnvelope(id, topic, options?.cache)
       } catch (error) {
         console.error(`[ws-router] failed to build snapshot for topic ${topic.type}${topic.type === "chat" ? `:${topic.chatId}` : ""}`, error)
-
-
+        // Tell THIS subscriber its topic is broken — without a scoped error
+        // the subscription just freezes silently (the client keeps showing
+        // the last good snapshot forever).
         send(ws, {
           v: PROTOCOL_VERSION,
           type: "error",
@@ -906,8 +928,8 @@ export function createWsRouter({
         })
       }
       const { payloadBytes, status } = send(ws, envelope)
-
-
+      // Bun reports -1 after accepting the message into its queue; only 0
+      // means the snapshot was dropped and still needs a later retry.
       if (status !== 0) {
         snapshotSignatures.set(id, signature)
         sentCount += 1
@@ -943,7 +965,7 @@ export function createWsRouter({
     const cache: SnapshotComputationCache = {}
     for (const ws of sockets) {
       socketCount += 1
-
+      // One socket's failure must never starve the rest of the batch (BUG WS-2).
       try {
         await pushSnapshots(ws, { skipPrune: true, cache })
       } catch (error) {
@@ -1067,8 +1089,8 @@ export function createWsRouter({
     const timer = setTimeout(() => {
       pendingSnapshotRetryTimers.delete(ws)
       if (!dirtySnapshotSockets.delete(ws) || !sockets.has(ws)) return
-
-
+      // One prompt retry heals a transient connection issue without spinning.
+      // If it is also dropped, keep the socket dirty for drain/heartbeat resync.
       void pushSnapshots(ws, { skipPrune: true, retryDropped: false })
     }, DROPPED_SNAPSHOT_RETRY_MS)
     pendingSnapshotRetryTimers.set(ws, timer)
@@ -1237,8 +1259,9 @@ export function createWsRouter({
           const project = command.projectId ? store.getProject(command.projectId) : null
           if (project && studyPreviewRuntime && canAutoHealStudyPreview(project.id)) {
             try {
-
-
+              // The supervisor serializes this second admission check with
+              // recovery; a concurrently queued freeze marks the project
+              // blocked synchronously and therefore cannot be resurrected.
               await studyPreviewRuntime.recover(
                 project.localPath,
                 () => canAutoHealStudyPreview(project.id),
@@ -1254,8 +1277,11 @@ export function createWsRouter({
             projectTerminalRootPids: project ? terminals.getRootPidsByCwd(project.localPath) : [],
             excludePorts: getSelfPort ? [getSelfPort()] : [],
           })
-
-
+          // In Docker the iframe runs outside the container, so in-container
+          // localhost:PORT is unreachable. PREVIEW_VIA_PROXY lets the client
+          // choose a localhost-subdomain route for local use or a same-origin
+          // path route behind Cloudflare / SSH (preview-proxy.ts). Host runs
+          // keep the direct address (WebSocket/HMR intact).
           const preferProxy = process.env.PREVIEW_VIA_PROXY === "1"
           const result = scanned.map((server) => ({
             ...server,
@@ -1344,8 +1370,9 @@ export function createWsRouter({
           return
         }
         case "settings.writeLlmProvider": {
-
-
+          // Keep read-key-reuse-write as one ordered operation. Settings input
+          // events can overlap, and unique temp files alone do not guarantee
+          // that the last submitted value wins.
           const snapshot = await enqueueLlmProviderWrite(async () => {
             const current = await resolvedLlmProvider.read()
             return resolvedLlmProvider.write({
@@ -1424,8 +1451,10 @@ export function createWsRouter({
           return
         }
         case "project.remove": {
-
-
+          // Cancel + close any running turns in this project's chats before
+          // hiding it — otherwise an agent keeps executing tools against the
+          // project directory with no UI left to see or stop it (BUG WS-3).
+          // Mirrors chat.delete's cancel + closeChat.
           for (const chat of store.listChatsByProject(command.projectId)) {
             await agent.cancel(chat.id)
             await agent.closeChat(chat.id)
@@ -1507,8 +1536,9 @@ export function createWsRouter({
           break
         }
         case "chat.send": {
-
-
+          // AgentCoordinator owns study admission. Keeping it at the queue
+          // authority covers send, steer, auto-drain and restart without
+          // duplicate router checks or alternate-channel bypasses.
           const result = await agent.send(command)
           const profile = command.clientTraceId && result.chatId
             ? agent.getActiveTurnProfile(result.chatId)
@@ -1791,8 +1821,9 @@ export function createWsRouter({
           if (!project) {
             throw new Error("Project not found")
           }
-
-
+          // The project dir can vanish under a recorded project (e.g. a Docker
+          // container rebuild wipes non-volume paths) — spawning a shell with a
+          // missing cwd fails as a misleading posix_spawn ENOENT on the shell.
           await ensureProjectDirectory(project.localPath)
           const snapshot = terminals.createTerminal({
             projectPath: project.localPath,

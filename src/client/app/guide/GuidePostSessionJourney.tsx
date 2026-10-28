@@ -62,7 +62,11 @@ function FinishPractice() {
   )
 }
 
-
+/**
+ * Guide-only local state/view host. It reuses the production questionnaire
+ * surfaces but never owns transport and never preselects a measurement answer.
+ * Every control updates tutorial-only state; Guide Next advances phases.
+ */
 export function GuidePostSessionJourney({ phase }: { phase: GuidePostSessionPhase }) {
   const [questionnaire, setQuestionnaire] = useState<StudyQuestionnaireDraft>(EMPTY_DRAFT)
   const [monitoring, setMonitoring] = useState<RawTlxDraft>({})

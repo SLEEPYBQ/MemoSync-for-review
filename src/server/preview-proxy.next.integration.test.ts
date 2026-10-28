@@ -260,8 +260,9 @@ export default function RedirectMe() { redirect("/detail?from=redirect"); }
     await page.getByTestId("redirect-link").click()
     await page.getByRole("heading", { name: "Next fixture detail" }).waitFor()
     expect(page.url()).toBe(`${previewBase}detail?from=redirect`)
-
-
+    // The preview gateway deliberately does not proxy dev-server WebSockets;
+    // Next's HMR connection therefore reports a known manual-refresh warning.
+    // Application errors and escaped HTTP resources must still stay at zero.
     const unexpectedErrors = browserErrors.filter((message) => (
       !message.includes("/_next/webpack-hmr")
       && message !== "Failed to load resource: the server responded with a status of 404 (Not Found)"

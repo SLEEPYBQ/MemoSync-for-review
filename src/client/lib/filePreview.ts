@@ -1,4 +1,4 @@
-
+// How to preview a workspace file in the Files side panel, by file name.
 export type FilePreviewKind = "markdown" | "image" | "pdf" | "text" | "binary"
 
 const MARKDOWN = new Set(["md", "markdown", "mdx"])
@@ -11,13 +11,13 @@ const TEXT = new Set([
   "editorconfig", "prettierrc", "eslintrc", "example",
 ])
 
-
+/** Files whose whole name (no extension) marks them as text. */
 const TEXT_BASENAMES = new Set(["dockerfile", "makefile", "license", "readme", "changelog", "codeowners", "procfile"])
 
 export function classifyFilePreview(name: string): FilePreviewKind {
   const lower = name.toLowerCase()
   const dot = lower.lastIndexOf(".")
-
+  // ".gitignore" → ext "gitignore"; "LICENSE" → no extension.
   const ext = dot >= 0 ? lower.slice(dot + 1) : ""
   if (MARKDOWN.has(ext)) return "markdown"
   if (ext === "pdf") return "pdf"

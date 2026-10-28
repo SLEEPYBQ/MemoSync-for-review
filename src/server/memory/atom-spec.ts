@@ -1,5 +1,8 @@
-
-
+/**
+ * Condition-neutral definition of the Content unit used by capture,
+ * Static measurement extraction, focus history, and the questionnaire.
+ * Keep this text byte-identical wherever an LLM is asked to create atoms.
+ */
 export const MEMORY_ATOM_SPEC_VERSION = 'memory-atom-v1';
 
 export const MEMORY_ATOM_SPEC = `Atomic memory rules:

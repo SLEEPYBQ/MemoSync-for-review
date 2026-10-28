@@ -2,11 +2,20 @@ import { readdirSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 
-
+/**
+ * Directory listing for the Add Project path picker. The app runs in a
+ * container ("the workspace machine"), so a bare text field reads like a
+ * local-computer path and confuses participants (pilot feedback 2026-08-11)
+ * — the picker browses the REMOTE filesystem instead.
+ *
+ * Containment: requests never escape `root` (the workspace home). Hidden
+ * directories and node_modules are noise for project selection and are
+ * skipped. Unreadable paths clamp back to the root rather than erroring.
+ */
 export interface WorkspaceDirsSnapshot {
   root: string
   path: string
-
+  /** null at the root — the picker hides its ".." entry there. */
   parent: string | null
   dirs: Array<{ name: string; path: string }>
 }

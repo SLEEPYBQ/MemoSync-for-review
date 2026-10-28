@@ -2,7 +2,8 @@ import { Loader2, X } from "lucide-react"
 import { MetaRow, MetaContent } from "./shared"
 import { AnimatedShinyText } from "../ui/animated-shiny-text"
 
-
+// Keyed by ChatActivityStatus (shared/types.ts) — the footer shows only the
+// activity status; SDK statuses like "requesting" are never surfaced.
 const STATUS_LABELS: Record<string, string> = {
   starting: "Starting...",
   previewing_memory: "Previewing memories...",

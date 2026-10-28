@@ -1,5 +1,12 @@
-
-
+// Memory E2E matrix — the three paths e2e-full-app.ts does not cover, driven
+// over the WS protocol against a RUNNING instance (real model calls):
+//   3. WITHOUT_MEMORY  preview → "proceed without memory" → turn runs, no trace
+//   4. BRING-IN        curated session pins → only the pinned set is in play
+//   5. LIFECYCLE       capture → user accepts → the NEXT turn cites the new
+//                      memory from INJECTION (validates the Claude
+//                      rebuild-on-memory-change fix live)
+//
+//   E2E_BASE=http://127.0.0.1:3210 bun run scripts/e2e-memory-matrix.ts
 import type { ChatSnapshot, TranscriptEntry } from "../src/shared/types"
 
 const BASE = process.env.E2E_BASE || "http://127.0.0.1:3210"
@@ -38,7 +45,7 @@ function waitFor<T>(pred: (m: any) => T | undefined, ms: number, label: string):
   })
 }
 
-
+/** Drive one chat turn: send → auto-respond to the preview → until result. */
 async function runTurn(opts: {
   chatId?: string
   projectId?: string
@@ -62,8 +69,9 @@ async function runTurn(opts: {
 
   const seen = new Set<string>()
   const entries: TranscriptEntry[] = []
-
-
+  // On a continued chat the snapshot REPLAYS prior turns; only entries that
+  // appear AFTER the first snapshot (minus our still-pending preview) belong
+  // to THIS turn. Prior results/previews are history.
   let baseline: Set<string> | null = null
   let responded = false
   let resultAt = 0
@@ -82,8 +90,8 @@ async function runTurn(opts: {
       snap.messages.filter((e) => e.kind === "memory_preview_decision").map((e) => (e as any).previewId as string),
     )
     if (baseline === null) {
-
-
+      // History = everything already decided/finished at subscribe time. The
+      // fresh (undecided) preview and anything after it is this turn's.
       baseline = new Set(
         snap.messages
           .filter((e) => !(e.kind === "memory_preview" && !decidedPreviews.has((e as any).previewId)))
@@ -118,14 +126,14 @@ const text = (es: TranscriptEntry[]) =>
 const api = <T,>(path: string, init?: RequestInit) =>
   fetch(`${BASE}${path}`, init).then(async (r) => (await r.json()).data as T)
 
-
+// project id from the sidebar
 send({ type: "subscribe", id: "sb", topic: { type: "sidebar" } })
 const sidebar = await waitFor<any>((m) => (m.type === "snapshot" && m.snapshot?.type === "sidebar" ? m.snapshot.data : undefined), 10_000, "sidebar")
 const projectId = sidebar.projectGroups[0].groupKey as string
 console.log(`[matrix] project ${projectId}`)
 const results: Array<{ name: string; pass: boolean; note: string }> = []
 
-
+// ---------- PATH 3: without_memory ----------
 {
   console.log("\n[matrix] PATH 3 — without_memory")
   const { entries } = await runTurn({
@@ -144,7 +152,7 @@ const results: Array<{ name: string; pass: boolean; note: string }> = []
   })
 }
 
-
+// ---------- PATH 4: bring-in pins ----------
 {
   console.log("\n[matrix] PATH 4 — bring-in pins")
   const createId = rid()
@@ -178,7 +186,7 @@ const results: Array<{ name: string; pass: boolean; note: string }> = []
   })
 }
 
-
+// ---------- PATH 5: capture → accept → next turn injects ----------
 {
   console.log("\n[matrix] PATH 5 — lifecycle (accept mid-session, next turn cites)")
   const marker = `zebra-${Date.now() % 100000}`
@@ -207,8 +215,11 @@ const results: Array<{ name: string; pass: boolean; note: string }> = []
       decision: "go_on",
       postResultWaitMs: 20_000,
     })
-
-
+    // MECHANISM assertion (what this path exists to prove): after the accept,
+    // the very next turn's preview plan includes the new memory — i.e. the
+    // Claude session was rebuilt with the fresh injected set — and the answer
+    // uses the rule. Whether the model formats an inline [M-NN] citation is a
+    // model-compliance signal, reported but non-fatal.
     const previewB = turnB.entries.find((e) => e.kind === "memory_preview") as any
     const inPlan = Boolean(previewB?.memories?.some((m: any) => m.id === cand.id))
     const answer = text(turnB.entries)

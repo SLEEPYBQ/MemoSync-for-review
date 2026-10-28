@@ -23,6 +23,28 @@ function makeAttachment(overrides: Partial<ChatAttachment>): ChatAttachment {
 }
 
 describe("classifyAttachmentPreview", () => {
+  for (const [mimeType, kind] of [
+    ["application/json; charset=utf-8", "json"],
+    [" Application/JSON ; Charset=UTF-8 ", "json"],
+    ["text/csv; charset=utf-8", "table"],
+    ["text/tab-separated-values; charset=utf-8", "table"],
+    ["application/pdf; version=1.7", "pdf"],
+  ] as const) {
+    test(`normalizes parameterized MIME type ${mimeType}`, () => {
+      const attachment = makeAttachment({ displayName: "data", mimeType })
+      expect(classifyAttachmentPreview(attachment)).toEqual({ kind, openInNewTab: false })
+      expect(classifyAttachmentIcon(attachment)).toBe(kind)
+    })
+  }
+
+  test("keeps the JSON size limit for parameterized MIME types", () => {
+    expect(classifyAttachmentPreview(makeAttachment({
+      displayName: "data.json",
+      mimeType: "application/json; charset=utf-8",
+      size: JSON_PREVIEW_LIMIT_BYTES + 1,
+    }))).toEqual({ kind: "external", openInNewTab: true })
+  })
+
   test("routes oversized json directly to a new tab", () => {
     const target = classifyAttachmentPreview(makeAttachment({
       displayName: "data.json",
@@ -57,11 +79,11 @@ describe("classifyAttachmentPreview", () => {
 
 describe("parseDelimitedPreview", () => {
   test("parses quoted csv cells correctly", () => {
-    const result = parseDelimitedPreview("name,notes\nreviewer,\"a,b,c\"", ",")
+    const result = parseDelimitedPreview("name,notes\nuser,\"a,b,c\"", ",")
 
     expect(result.rows).toEqual([
       ["name", "notes"],
-      ["reviewer", "a,b,c"],
+      ["user", "a,b,c"],
     ])
   })
 })

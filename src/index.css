@@ -59,6 +59,8 @@
     --chart-4: 280 65% 60%;
     --chart-5: 340 75% 55%;
     --logo: oklch(71.2% 0.194 13.428);
+    /* MemoSync scope colors (canonical v1 values, SPEC §2): RGB triplets.
+       DEFAULT = dot/fill; fg = AA-legible text; surface = tint; border = outline. */
     --scope-personal: 217 119 87;
     --scope-personal-fg: 176 81 47;
     --scope-personal-surface: 251 240 235;
@@ -71,6 +73,7 @@
     --scope-session-fg: 88 107 63;
     --scope-session-surface: 241 244 235;
     --scope-session-border: 216 224 201;
+    /* memory-candidate accent (amber, from v1) */
     --cand-fg: 143 99 16;
     --cand-dot: 224 163 58;
     --cand-surface: 251 244 230;
@@ -189,6 +192,7 @@
     background-color: var(--color-background);
     color: var(--color-foreground);
     font-family: "Body", sans-serif;
+    /* font-weight: ; */
     margin: 0;
     min-height: 100dvh;
     -webkit-font-smoothing: antialiased;
@@ -199,6 +203,8 @@
     font-family: "Bricolage Grotesque Variable", "Bricolage Grotesque", sans-serif;
     font-weight: 800;
   }
+
+  /* Prevent iOS zoom on input focus */
   input,
   textarea,
   select {
@@ -216,6 +222,8 @@
     -moz-appearance: textfield;
     appearance: textfield;
   }
+
+  /* Cursor pointer on all buttons, no focus/active styling */
   button {
     cursor: pointer;
     touch-action: manipulation;
@@ -229,12 +237,18 @@
     --tw-ring-shadow: none !important;
     --tw-ring-offset-shadow: none !important;
   }
+
+  /* Disable pull-to-refresh */
   body {
     overscroll-behavior-y: contain;
   }
+
+  /* Safe area insets for notched devices */
   .safe-area-inset-bottom {
     padding-bottom: env(safe-area-inset-bottom);
   }
+
+  /* Restore list styles for markdown content */
   .prose ul {
     list-style-type: disc;
     padding-left: 1.5em;
@@ -281,10 +295,13 @@
 
   code,
   pre {
+    /* Match the editor/terminal: Tailwind's system mono stack. "Roboto Mono"
+       was never bundled, so it only ever worked by accident. */
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
   }
 
   .prose code {
+    /* background-color: hsl(var(--card)); */
     padding: 0.125em 0.25em;
     border-radius: 0.25em;
     font-size: 0.875em;
@@ -380,6 +397,8 @@
     opacity: 1;
     filter: blur(0);
   }
+
+  /* Custom scrollbar styling */
   * {
     scrollbar-width: thin;
     scrollbar-color: hsl(var(--border)) transparent;
@@ -404,6 +423,8 @@
   *::-webkit-scrollbar-thumb:hover {
     background-color: hsl(var(--muted-foreground) / 0.3);
   }
+
+  /* Hide scrollbar utility */
   .scrollbar-hide {
     -ms-overflow-style: none;
     scrollbar-width: none;
@@ -412,18 +433,26 @@
   .scrollbar-hide::-webkit-scrollbar {
     display: none;
   }
+
+  /* Sonner toaster: auto-width + proper centering on desktop */
   @media (min-width: 641px) {
     [data-sonner-toaster] {
       width: fit-content !important;
     }
   }
+
+  /* Disable focus outline on Recharts elements */
   .recharts-wrapper *:focus,
   .recharts-wrapper *:focus-visible {
     outline: none;
   }
+
+  /* Slower spin animation */
   .animate-spin-slow {
     animation: spin 1.5s linear infinite !important;
   }
+
+  /* Fade-in animation for state transitions */
   .animate-fade-in {
     animation: fade-in 250ms ease-out;
   }
@@ -488,6 +517,11 @@
     animation: memosync-empty-state-flower-in 0.399s cubic-bezier(0.175, 0.885, 0.32, 1.275) both;
     transform-origin: center;
   }
+
+  /* MemoSync layered-cards icon: Figma "Card Spread Motion" Folded <-> Expanded.
+     Hover (data-animated="hover") or data-spread="true" fans the cards out with
+     a springy, staggered shuffle; data-animated="loop" breathes slowly (empty
+     state) so the mark feels alive without user input. */
   .memosync-icon .msi-card {
     transform-box: fill-box;
     transform-origin: center;
@@ -495,9 +529,14 @@
     transition: transform 0.45s cubic-bezier(0.34, 1.56, 0.64, 1);
     filter: drop-shadow(0 1px 1.5px rgb(0 0 0 / 0.14));
   }
+
+  /* Staggered like a hand of cards: bottom card moves first, top lands last. */
   .memosync-icon .msi-green { transition-delay: 0ms; }
   .memosync-icon .msi-blue { transition-delay: 45ms; }
   .memosync-icon .msi-orange { transition-delay: 90ms; }
+
+  /* Expanded pose = the Figma frame's center deltas + rotations (translate in
+     unrotated viewBox axes, so it must come before rotate). */
   .memosync-icon[data-animated="hover"]:hover .msi-green,
   .memosync-icon[data-spread="true"] .msi-green {
     transform: translate(-57px, 64px) rotate(7deg);
@@ -626,6 +665,8 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Point-3 Stage 2: highlight the paragraph a quote-anchored memory maps to. */
 @keyframes citation-flash-block {
   0% { background-color: rgb(var(--cand-dot) / 0); }
   20% { background-color: rgb(var(--cand-dot) / 0.18); }

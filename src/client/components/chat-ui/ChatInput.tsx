@@ -6,6 +6,7 @@ import {
   type ClaudeContextWindow,
   type ClaudeReasoningEffort,
   type CodexReasoningEffort,
+  type PiReasoningEffort,
   type ModelOptions,
   type ProviderCatalogEntry,
   normalizeClaudeContextWindow,
@@ -14,7 +15,7 @@ import {
 import { Button, buttonVariants } from "../ui/button"
 import { Textarea } from "../ui/textarea"
 import { ScrollArea } from "../ui/scroll-area"
-import { cn } from "../../lib/utils"
+import { cn, generateUUID } from "../../lib/utils"
 import { isImeComposingKeyEvent } from "../../lib/imeKeys"
 import { matchSlashCommands, SLASH_POPUP_MAX_HEIGHT_PX, slashPopupMaxHeightPx } from "../../lib/slashCommands"
 import { useSlashCommandsStore } from "../../stores/slashCommandsStore"
@@ -103,6 +104,13 @@ export function trimTrailingPastedNewlines(text: string) {
   return text.replace(/(?:\r\n|\r|\n)+$/, "")
 }
 
+export function createUploadFormData(file: File) {
+  const formData = new FormData()
+  formData.append("files", file)
+  formData.append("clientFileSizes", String(file.size))
+  return formData
+}
+
 function replaceTextSelection(args: {
   value: string
   insertedText: string
@@ -127,8 +135,11 @@ interface Props {
   disabled: boolean
   canCancel?: boolean
   chatId?: string | null
-
-
+  /**
+   * Persistence key for the TEXT draft, when it should differ from chatId — the
+   * landing composer has no chatId yet but must still keep typed text across
+   * navigation (BUG LAND-1). Defaults to chatId.
+   */
   draftKey?: string | null
   projectId?: string | null
   inputElementRef?: React.Ref<HTMLTextAreaElement>
@@ -136,16 +147,19 @@ interface Props {
   availableProviders: ProviderCatalogEntry[]
   contextWindowSnapshot?: ContextWindowSnapshot | null
   previousPrompt?: string | null
-
+  /** Slash commands/skills the engine reported (system_init) — powers the "/" autocomplete. */
   slashCommands?: string[]
-
+  /** Extra chips rendered in the preference-controls row (e.g. the landing page's project picker). */
   leadingControls?: React.ReactNode
 }
 
 export interface ChatInputHandle {
   enqueueFiles: (files: File[]) => void
-
-
+  /**
+   * Hand a message back to the composer (e.g. a dismissed preview gate
+   * cancels the turn — the typed text must not be lost). Fills only when the
+   * draft is empty so it never clobbers something the user started typing.
+   */
   restoreText: (text: string) => void
 }
 
@@ -222,27 +236,63 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     resetChatComposerFromProvider,
   } = useChatPreferencesStore()
   const composerChatId = chatId ?? NEW_CHAT_COMPOSER_ID
-
-
+  // Text-draft persistence key: chatId for a real chat, or an explicit draftKey
+  // for the landing composer (which has no chatId yet) so typed text survives
+  // navigation (BUG LAND-1).
   const textDraftKey = draftKey ?? chatId ?? null
   const storedComposerState = useChatPreferencesStore((state) => state.chatStates[composerChatId])
   const composerState = storedComposerState ?? getComposerState(composerChatId)
-  const [value, setValue] = useState(() => (textDraftKey ? getDraft(textDraftKey) : ""))
-
+  const draftRevisionRef = useRef(0)
+  const submissionRef = useRef<object | null>(null)
+  const [value, setValueState] = useState(() => (textDraftKey ? getDraft(textDraftKey) : ""))
+  const valueRef = useRef(value)
+  const setValue = useCallback((next: React.SetStateAction<string>) => {
+    const updated = typeof next === "function" ? next(valueRef.current) : next
+    if (updated === valueRef.current) return
+    draftRevisionRef.current += 1
+    valueRef.current = updated
+    setValueState(updated)
+    if (textDraftKey) setDraft(textDraftKey, updated)
+  }, [textDraftKey, setDraft])
+  // "/" autocomplete over engine-reported commands (closed by Esc until the draft changes).
   const [slashIndex, setSlashIndex] = useState(0)
   const [slashDismissed, setSlashDismissed] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const isStandalone = useIsStandalone()
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>(() => hydrateComposerAttachments(chatId ? getAttachmentDrafts(chatId) : []))
+  const [attachments, setAttachmentsState] = useState<ComposerAttachment[]>(() => hydrateComposerAttachments(chatId ? getAttachmentDrafts(chatId) : []))
+  const attachmentsRef = useRef(attachments)
+  const setAttachments = useCallback((next: React.SetStateAction<ComposerAttachment[]>) => {
+    draftRevisionRef.current += 1
+    const updated = typeof next === "function" ? next(attachmentsRef.current) : next
+    attachmentsRef.current = updated
+    setAttachmentsState(updated)
+    if (chatId) {
+      // Pending uploads are edits too, even before they have a persisted file.
+      setAttachmentDrafts(chatId, updated
+        .filter((attachment) => attachment.status === "uploaded")
+        .map(({ previewUrl: _previewUrl, status: _status, ...attachment }) => attachment), true)
+    }
+  }, [chatId, setAttachmentDrafts])
   const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null)
   const [uploadError, setUploadError] = useState<string | null>(null)
   const uploadQueueRef = useRef<File[]>([])
   const activeUploadsRef = useRef(0)
-  const attachmentsRef = useRef<ComposerAttachment[]>([])
   const uploadGenerationRef = useRef(0)
   const removedAttachmentIdsRef = useRef<Set<string>>(new Set())
   const previousProjectIdRef = useRef<string | null>(projectId ?? null)
-  const latestChatIdRef = useRef<string | null>(chatId ?? null)
+
+  useLayoutEffect(() => {
+    valueRef.current = textDraftKey ? getDraft(textDraftKey) : ""
+    setValueState(valueRef.current)
+    submissionRef.current = null
+    return () => {
+      draftRevisionRef.current += 1
+      submissionRef.current = null
+      uploadGenerationRef.current += 1
+      uploadQueueRef.current = []
+      activeUploadsRef.current = 0
+    }
+  }, [chatId, textDraftKey, getDraft])
 
   const providerLocked = activeProvider !== null
   const providerPrefs = getEffectiveComposerState(composerState, activeProvider, providerDefaults)
@@ -290,7 +340,21 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     activeUploadsRef.current = 0
     setSelectedAttachmentId(null)
     setUploadError(null)
-  }, [cleanupAttachmentPreview])
+  }, [cleanupAttachmentPreview, setAttachments])
+
+  useLayoutEffect(() => useChatInputStore.subscribe((state, previous) => {
+    if (textDraftKey && state.drafts[textDraftKey] !== previous.drafts[textDraftKey]) {
+      valueRef.current = state.drafts[textDraftKey] ?? ""
+      setValueState(valueRef.current)
+    }
+    if (chatId && previous.attachmentDrafts[chatId] && !state.attachmentDrafts[chatId]) {
+      const retained = attachmentsRef.current.filter((attachment) => attachment.status !== "uploaded")
+      attachmentsRef.current.filter((attachment) => attachment.status === "uploaded").forEach(cleanupAttachmentPreview)
+      attachmentsRef.current = retained
+      setAttachmentsState(retained)
+      setSelectedAttachmentId(null)
+    }
+  }), [chatId, textDraftKey, cleanupAttachmentPreview])
 
   const autoResize = useCallback(() => {
     const element = textareaRef.current
@@ -339,10 +403,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, [chatId])
 
   useEffect(() => {
-    latestChatIdRef.current = chatId ?? null
-  }, [chatId])
-
-  useEffect(() => {
     initializeComposerForChat(composerChatId)
   }, [composerChatId, initializeComposerForChat])
 
@@ -353,10 +413,10 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     removedAttachmentIdsRef.current.clear()
     setSelectedAttachmentId(null)
     setUploadError(null)
-    setAttachments((current) => {
-      current.forEach(cleanupAttachmentPreview)
-      return hydrateComposerAttachments(chatId ? getAttachmentDrafts(chatId) : [])
-    })
+    attachmentsRef.current.forEach(cleanupAttachmentPreview)
+    const hydrated = hydrateComposerAttachments(chatId ? getAttachmentDrafts(chatId) : [])
+    attachmentsRef.current = hydrated
+    setAttachmentsState(hydrated)
   }, [chatId, cleanupAttachmentPreview, getAttachmentDrafts])
 
   useEffect(() => {
@@ -374,10 +434,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, [projectId, chatId, clearAttachments, clearAttachmentDrafts])
 
   useEffect(() => {
-    attachmentsRef.current = attachments
-  }, [attachments])
-
-  useEffect(() => {
     if (!chatId) return
     return subscribeStudyPromptServerOwnership(chatId, (ownership) => {
       const getCurrent = () => ({
@@ -390,8 +446,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
         promptHash: ownership.promptHash,
         getCurrent,
         clear: (matched) => {
-
-
+          // The helper re-read this exact snapshot after hashing, so a draft
+          // typed while the delayed Board response arrived is left untouched.
           setValue((current) => current === matched.content ? "" : current)
           clearDraft(chatId)
           clearAttachments()
@@ -400,22 +456,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
         },
       })
     })
-  }, [chatId, clearAttachmentDrafts, clearAttachments, clearDraft])
-
-  useEffect(() => {
-    if (!chatId) return
-
-    const persistedAttachments = attachments
-      .filter((attachment) => attachment.status === "uploaded")
-      .map(({ previewUrl: _previewUrl, status: _status, ...attachment }) => attachment)
-
-    if (persistedAttachments.length === 0) {
-      clearAttachmentDrafts(chatId)
-      return
-    }
-
-    setAttachmentDrafts(chatId, persistedAttachments)
-  }, [attachments, chatId, clearAttachmentDrafts, setAttachmentDrafts])
+  }, [chatId, clearAttachmentDrafts, clearAttachments, clearDraft, setValue])
 
   useEffect(() => () => {
     attachmentsRef.current.forEach(cleanupAttachmentPreview)
@@ -428,7 +469,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   function setReasoningEffort(reasoningEffort: string) {
     updateComposerState((state) => ({
       ...state,
-      modelOptions: { ...state.modelOptions, reasoningEffort: reasoningEffort as ClaudeReasoningEffort & CodexReasoningEffort },
+      modelOptions: { ...state.modelOptions, reasoningEffort: reasoningEffort as ClaudeReasoningEffort & CodexReasoningEffort & PiReasoningEffort },
     } as ComposerState))
   }
 
@@ -459,7 +500,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (!file) break
 
       activeUploadsRef.current += 1
-      const tempId = crypto.randomUUID()
+      const tempId = generateUUID()
       const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined
       const generation = uploadGenerationRef.current
 
@@ -478,8 +519,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
 
       void (async () => {
         try {
-          const formData = new FormData()
-          formData.append("files", file)
+          const formData = createUploadFormData(file)
 
           const response = await fetch(`/api/projects/${projectId}/uploads`, {
             method: "POST",
@@ -536,7 +576,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
         }
       })()
     }
-  }, [projectId])
+  }, [projectId, setAttachments])
 
   const enqueueFiles = useCallback((files: File[]) => {
     if (!projectId) {
@@ -564,24 +604,28 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (!text) return
       setValue((current) => {
         if (current.trim()) return current
-        if (textDraftKey) setDraft(textDraftKey, text)
         return text
       })
       textareaRef.current?.focus()
     },
-  }), [enqueueFiles, setDraft, textDraftKey])
+  }), [enqueueFiles, setValue])
 
   async function handleSubmit() {
-    if (!canSubmit || hasPendingUploads) return
+    if (!canSubmit || hasPendingUploads || submissionRef.current) return
 
+    const submission = {}
+    submissionRef.current = submission
+    const revision = draftRevisionRef.current
+    const ownsDraft = () => submissionRef.current === submission && draftRevisionRef.current === revision
+    const persistedRevision = useChatInputStore.getState().getDraftRevision(textDraftKey, chatId ?? null)
     const nextValue = value
     const previousAttachments = attachmentsRef.current
-    const previousSelectedAttachmentId = selectedAttachmentId
-    const previousUploadError = uploadError
     const attachmentsForSubmit = uploadedAttachments.map(({ previewUrl: _previewUrl, status: _status, ...attachment }) => attachment)
     let modelOptions: ModelOptions
     if (providerPrefs.provider === "claude") {
       modelOptions = { claude: { ...providerPrefs.modelOptions } }
+    } else if (providerPrefs.provider === "pi") {
+      modelOptions = { pi: { ...providerPrefs.modelOptions } }
     } else {
       modelOptions = { codex: { ...providerPrefs.modelOptions } }
     }
@@ -592,32 +636,29 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       planMode: showPlanMode ? providerPrefs.planMode : false,
       attachments: attachmentsForSubmit,
     }
-
-
+    // The opening Long-term Memory Board may hold this Promise for minutes.
+    // Keep both local and persisted drafts intact until the *real* send is
+    // accepted, so reload/back/send failure cannot erase participant input.
     await runRetainedDraftSubmission({
       submit: () => onSubmit(nextValue, submitOptions),
       onAccepted: () => {
+        if (submissionRef.current === submission && !ownsDraft()) return
+        if (!useChatInputStore.getState().clearSubmittedDraft(persistedRevision)) return
+        if (!ownsDraft()) return
         setValue("")
-        if (textDraftKey) clearDraft(textDraftKey)
         if (textareaRef.current) textareaRef.current.style.height = "auto"
         clearAttachments({ cleanupPreviews: false })
-        if (latestChatIdRef.current) clearAttachmentDrafts(latestChatIdRef.current)
         previousAttachments.forEach(cleanupAttachmentPreview)
       },
       onRejected: (error) => {
         console.error("[ChatInput] Submit failed:", error)
-
-
-        setValue(nextValue)
-        if (textDraftKey) setDraft(textDraftKey, nextValue)
-        setAttachments(previousAttachments)
-        setSelectedAttachmentId(previousSelectedAttachmentId)
-        setUploadError(previousUploadError)
       },
     })
+    if (submissionRef.current === submission) submissionRef.current = null
   }
 
-
+  // Fresh chats have no system_init yet — fall back to the last list this
+  // provider reported anywhere (persisted per provider).
   const cachedSlashCommands = useSlashCommandsStore((state) => state.byProvider[selectedProvider])
   const effectiveSlashCommands = slashCommands.length ? slashCommands : (cachedSlashCommands ?? [])
   const slashMatch = slashDismissed ? null : matchSlashCommands(value, effectiveSlashCommands)
@@ -626,8 +667,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   useEffect(() => {
     slashListRef.current?.children[activeSlashIndex]?.scrollIntoView({ block: "nearest" })
   }, [activeSlashIndex])
-
-
+  // The popup opens upward — cap it to the space above the composer so it
+  // never clips off the viewport top (the landing page centers the composer).
   const slashOpen = slashMatch !== null
   const [slashListMaxHeight, setSlashListMaxHeight] = useState(SLASH_POPUP_MAX_HEIGHT_PX)
   useLayoutEffect(() => {
@@ -640,18 +681,18 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   function applySlashCommand(command: string) {
     const next = `/${command} `
     setValue(next)
-    if (textDraftKey) setDraft(textDraftKey, next)
     textareaRef.current?.focus()
   }
 
   function handleKeyDown(event: React.KeyboardEvent) {
-
-
+    // Pinyin/IME composition owns its keydowns: Enter picks a candidate (not
+    // send — sending mid-composition strands the committed text in the DOM
+    // after React clears state), Esc cancels the candidate (not the turn).
     if (isImeComposingKeyEvent(event.nativeEvent)) return
 
     if (slashMatch) {
       const active = slashMatch.matches[activeSlashIndex]
-
+      // A fully-typed command lets Enter fall through and send the message.
       const exactlyTyped = slashMatch.query === active.toLowerCase()
       if (event.key === "ArrowDown") {
         event.preventDefault()
@@ -696,7 +737,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey && value.length === 0 && previousPrompt) {
       event.preventDefault()
       setValue(previousPrompt)
-      if (textDraftKey) setDraft(textDraftKey, previousPrompt)
       return
     }
 
@@ -730,7 +770,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       })
       const nextCaretPosition = textarea.selectionStart + trimmedText.length
       setValue(nextValue)
-      if (textDraftKey) setDraft(textDraftKey, nextValue)
       autoResize()
       requestAnimationFrame(() => {
         textarea.selectionStart = nextCaretPosition
@@ -817,7 +856,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   <button
                     key={command}
                     type="button"
-
+                    // pointerdown (not click) so the textarea keeps focus
                     onPointerDown={(event) => {
                       event.preventDefault()
                       applySlashCommand(command)
@@ -866,7 +905,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
               rows={1}
               onChange={(event) => {
                 setValue(event.target.value)
-                if (textDraftKey) setDraft(textDraftKey, event.target.value)
                 setSlashIndex(0)
                 setSlashDismissed(false)
                 autoResize()
@@ -913,7 +951,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       <div className={cn("relative py-3 max-w-[840px] mx-auto", isStandalone && "p-5 pt-3")}>
         <div className="overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden flex flex-row">
           <div className="min-w-3" />
-
+          {/* One mx-auto group so leading chips and preference chips center TOGETHER — no gap between them. */}
           <div className="mx-auto flex shrink-0 items-center gap-0.5">
           {leadingControls}
           <ChatPreferenceControls
@@ -942,6 +980,9 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 case "codexReasoningEffort":
                   setReasoningEffort(change.effort)
                   break
+                case "piReasoningEffort":
+                  setReasoningEffort(change.effort)
+                  break
                 case "contextWindow":
                   setClaudeContextWindow(change.contextWindow)
                   break
@@ -949,7 +990,9 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   updateComposerState(
                     (state) => state.provider === "claude"
                       ? state
-                      : { ...state, modelOptions: { ...state.modelOptions, fastMode: change.fastMode } }
+                      : state.provider === "codex"
+                        ? { ...state, modelOptions: { ...state.modelOptions, fastMode: change.fastMode } }
+                        : state
                   )
                   break
               }

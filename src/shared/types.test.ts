@@ -24,7 +24,7 @@ describe("shared model normalization", () => {
   })
 
   test("uses declarative metadata for DeepSeek max-effort support", () => {
-
+    // Both DeepSeek models expose the full high/max thinking range.
     expect(supportsClaudeMaxReasoningEffort("deepseek-v4-pro")).toBe(true)
     expect(supportsClaudeMaxReasoningEffort("opus")).toBe(true)
     expect(supportsClaudeMaxReasoningEffort("fable")).toBe(true)

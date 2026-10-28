@@ -1,5 +1,9 @@
-
-
+// Step 1 (redesign 2026-08-07 §3): Review New Memory Candidates. ONE
+// container wrapping this conversation's pending change cards
+// (new candidates + revision proposals — last turn's captures plus the fresh
+// prompt parse), parked BEFORE the injection preview. The turn does not move
+// until the user settles the gate: work every card, or skip the rest with an
+// explicit click — the system never skips for them.
 import { useEffect, useMemo, useState } from "react"
 import { ArrowRight, Inbox, Info, Loader2 } from "lucide-react"
 import type { HydratedTranscriptMessage } from "../../../shared/types"
@@ -18,7 +22,7 @@ type MemoryProposalsHydratedMessage = Extract<HydratedTranscriptMessage, { kind:
 
 interface Props {
   message: MemoryProposalsHydratedMessage
-
+  /** Read-only host or an orphaned gate — freeze the buttons. */
   stale?: boolean
   onRespond: (proposalsId: string, decision: "reviewed" | "skipped") => Promise<void> | void
   canReopen?: boolean
@@ -43,7 +47,8 @@ export const PERMANENT_CANDIDATE_DISMISSAL_COPY =
 
 export type CandidateReviewState = "candidate" | "accepted" | "discarded" | "optimistic-dismissed" | "missing"
 
-
+/** Canonical store state always outranks a transient dismissal receipt held by
+ * another mounted surface. */
 export function candidateReviewState(
   item: MemoryItem | undefined,
   optimisticallyDismissed: boolean,
@@ -54,7 +59,9 @@ export function candidateReviewState(
   return optimisticallyDismissed ? "optimistic-dismissed" : "missing"
 }
 
-
+/** One production Candidate station shared by transcript gates and the Board's
+ * generic pending-candidate entrance. Canonical MemoryItem.status decides each
+ * row; callers never maintain a parallel accepted/dismissed state. */
 export function MemoryCandidateReviewStation({
   candidates,
   freshAt,
@@ -116,8 +123,8 @@ export function MemoryProposalsGate({
   }, [hasMissing, loadAll, refreshAttempted, status])
 
   const total = message.candidates.length
-
-
+  // Still-pending = live status 'candidate' (accepted/dismissed/archived all
+  // count as handled; a locally dismissed id is handled even before refetch).
   const pendingCount = message.candidates.filter((c) => {
     const live = itemsById.get(c.id)
     return candidateReviewState(live, localDismissedIds.has(c.id)) === "candidate"
@@ -147,7 +154,8 @@ export function MemoryProposalsGate({
     )
   }
 
-
+  // The step ran and found nothing: still SAY so — silence read as "did
+  // Step 1 even run?" (user feedback 2026-08-07).
   if (message.decision === "empty" || total === 0) {
     return (
       <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
@@ -157,7 +165,7 @@ export function MemoryProposalsGate({
     )
   }
 
-
+  // Settled gate: one quiet summary line — history, not a control surface.
   if (message.decision) {
     const mayReopen = canReopen && onReopen && (message.decision === "reviewed" || message.decision === "skipped")
     return (

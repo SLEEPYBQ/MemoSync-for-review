@@ -1,5 +1,9 @@
-
-
+// Memory Board — the user's memories as operable objects (SPEC §4.9): a
+// candidate-review lane, three scope columns (Personal/Project/Session) with
+// drag-to-rescope, free-text search across every lane, and a right-side
+// detail panel with per-item history + rollback (§4.11, option 乙). Ported
+// (functionality) from MemoSync, re-implemented in Kanna's visual language.
+// State via the memoryStore; mutations via memoriesApi.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { DragEvent } from "react"
 import { useLocation, useNavigate } from "react-router-dom"
@@ -41,10 +45,11 @@ import { MemoryCandidateReviewStation } from "../components/messages/MemoryPropo
 import { TranscriptChatContextProvider } from "../components/messages/render-context"
 import type { FocusedMemoryReviewController } from "./study/MemoryBoardLauncher"
 
-
+// Manual creation: session memories are agent-created within a session (they
+// need a sessionId), so the form only offers Personal / Project.
 const CREATE_SCOPES = SCOPES.filter((s) => s !== "session")
-
-
+// The Session column itself is not a generic drop target: a move must name a
+// real chat. A chat-bound Board supplies that exact target as a group below.
 const DROP_SCOPES: Extract<MemoryScope, "personal" | "project">[] = ["personal", "project"]
 
 function matchesQuery(item: MemoryItem, query: string): boolean {
@@ -57,19 +62,19 @@ function matchesQuery(item: MemoryItem, query: string): boolean {
 }
 
 export interface MemoryBoardOverlayMode {
-
+  /** Session-start gate: no close until every server-authoritative backlog row is handled. */
   blocking: boolean
   taskId?: string
   chatId?: string
   status?: MemoryBoardReviewStatus
   actionError?: string | null
   submitting?: boolean
-
+  /** Opening review only: the participant-authored message held behind it. */
   pendingPrompt?: string
-
+  /** Active in-chat Long-term review expanded into this same overlay. */
   focusedReview?: FocusedMemoryReviewController
   onClose?: () => void
-
+  /** Blocking variant: called when the participant enters the session. */
   onEnterSession?: () => void
   onBacklogChanged?: () => void
 }
@@ -149,7 +154,9 @@ export type MemoryBoardScopeEntry =
   | { kind: "memory"; item: MemoryItem }
   | { kind: "candidate-placeholder"; item: MemoryItem }
 
-
+/** The three scope columns are a projection of the canonical store. A
+ * Candidate occupies its destination as a read-only placeholder; accepting
+ * or reverting it changes the same id's projection without a second UI state. */
 export function projectMemoryBoardScopes(items: MemoryItem[]): Record<MemoryScope, MemoryBoardScopeEntry[]> {
   const columns: Record<MemoryScope, MemoryBoardScopeEntry[]> = { personal: [], project: [], session: [] }
   for (const item of items) {
@@ -170,8 +177,8 @@ export function deriveMemoryBoardModel(
     return inProjectLens && matchesQuery(item, options.query)
   })
   return {
-
-
+    // Step 1 is an authoritative decision station. Library controls must not
+    // hide rows while the server still counts them as blocking.
     candidateStation: items.filter((item) => item.status === "candidate"),
     scopes: projectMemoryBoardScopes(visibleInColumns),
   }
@@ -202,27 +209,31 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
   const [actionError, setActionError] = useState<string | null>(null)
   const [query, setQuery] = useState("")
   const [selectedId, setSelectedId] = useState<string | null>(null)
-
+  // Conflict maintenance (A1): older memories targeted by conflicts_with.
   const [needsAttention, setNeedsAttention] = useState<
     Array<{ memory: MemoryItem; supersededBy: MemoryItem[] }>
   >([])
-
-
+  // The one drop zone under the pointer, as a single key (column "col:<scope>"
+  // or group "grp:<scope>:<id>"). Set on dragover (which fires continuously,
+  // innermost zone wins via stopPropagation) and cleared on drop / drag end —
+  // never on dragleave, whose firing on every child-boundary crossing is what
+  // makes nested drop zones flicker.
   const [activeDrop, setActiveDrop] = useState<string | null>(null)
-
+  // Drag-across-scope opens the transfer instrument instead of silently rescoping.
   const [transferRequest, setTransferRequest] = useState<{
     item: MemoryItem
     target: TransferInitialTarget
   } | null>(null)
-
-
+  // Project lens (?project=<id>, set when entering from a project chat): the
+  // Board stays the global inventory, but the project section narrows to the
+  // current project until the chip is dismissed. Personal/session stay put.
   const [projectFilter, setProjectFilter] = useState<string | null>(
     () => new URLSearchParams(window.location.search).get("project"),
   )
-
-
+  // Proposals just created by a Save & sync / import: pinged and scrolled to
+  // in the review list so the report line has a visible landing (friction #7).
   const [freshCandidates, setFreshCandidates] = useState<{ ids: Set<string>; at: number }>({ ids: new Set(), at: 0 })
-
+  // Meta-model diff: items touched since the previous board visit get pills.
   const [prevVisitAt] = useState<number | null>(() => getLastBoardVisit())
   const telemetryChatId = overlay?.chatId
   useEffect(() => {
@@ -248,12 +259,12 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
     hoveredBoardIdsRef.current.add(id)
     if (telemetryChatId) recordUiMonitor("board", { sessionId: telemetryChatId, ids: [id], interaction: "hover" })
   }, [telemetryChatId])
-
+  // id → title maps so project/session cards can say WHERE they bind.
   const [originTitles, setOriginTitles] = useState<{
     projects: Record<string, string>
     chats: Record<string, string>
   }>({ projects: {}, chats: {} })
-
+  // chatId → projectId, so session groups can name the project they came from.
   const [chatProjects, setChatProjects] = useState<Record<string, string>>({})
   const [draft, setDraft] = useState<{
     content: string
@@ -285,7 +296,7 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
   const refreshOriginTitles = useCallback(() => {
     Promise.all([workspaceApi.projectTitles(), workspaceApi.chatTitles()])
       .then(([projects, chats]) => setOriginTitles({ projects, chats }))
-      .catch(() => {})
+      .catch(() => {}) // labels are decoration — cards fall back to raw ids
     workspaceApi
       .chatProjectIds()
       .then(setChatProjects)
@@ -307,13 +318,13 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
     },
     [originTitles],
   )
-
-
+  // Re-check after any item change (an accepted supersede or an archive can
+  // resolve a conflict) — cheap read, keyed on the item set.
   useEffect(() => {
     refreshNeedsAttention()
   }, [refreshNeedsAttention, items])
 
-
+  // Monitoring-act beacon: the drift lane was actually on screen (dedup by set).
   const needsAttentionSeenRef = useRef("")
   useEffect(() => {
     const key = needsAttention.map((n) => n.memory.id).sort().join(",")
@@ -322,7 +333,10 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
     if (telemetryChatId) recordUiMonitor("needs_attention_view", { ids: needsAttention.map((n) => n.memory.id), sessionId: telemetryChatId, interaction: "open" })
   }, [needsAttention, telemetryChatId])
 
-
+  // The Board only loaded on mount, so accepts/captures happening in a chat
+  // (another tab, or while this page sat open) left it stale — a conflict
+  // "merge" looked like nothing changed. Refresh on window focus and poll
+  // lightly while visible.
   useEffect(() => {
     const refresh = () => {
       void loadAll()
@@ -339,7 +353,8 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
     }
   }, [loadAll, refreshNeedsAttention, refreshOriginTitles])
 
-
+  // Keep selection valid: if the selected item is archived/removed elsewhere,
+  // close the panel instead of pointing at stale data.
   useEffect(() => {
     if (selectedId && !items.some((m) => m.id === selectedId)) setSelectedId(null)
   }, [items, selectedId])
@@ -363,15 +378,15 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
     () => candidateReviewCohortItems(items, candidateReviewCohortIds),
     [candidateReviewCohortIds, items],
   )
-
-
+  // The archived shelf: archiving must not be a one-way door — the items stay
+  // visible (collapsed) and restorable, or "archive" is delete with extra steps.
   const archivedItems = useMemo(
     () => items.filter((m) => m.status === "archived" && matchesQuery(m, query) && inProjectLens(m)),
     [items, query, inProjectLens],
   )
   const [showArchived, setShowArchived] = useState(false)
   const [restoringId, setRestoringId] = useState<string | null>(null)
-
+  // Muted proposals (dismissal fingerprints): loaded lazily on expand.
   const [showMuted, setShowMuted] = useState(false)
   const [muted, setMuted] = useState<MutedProposal[] | null>(null)
   const [unmutingId, setUnmutingId] = useState<string | null>(null)
@@ -388,7 +403,7 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
       await memoriesApi.unmute(memoryId)
       setMuted((current) => current?.filter((m) => m.memoryId !== memoryId) ?? current)
     } catch {
-
+      // already lifted elsewhere — refresh the list
       void memoriesApi.listMuted().then((r) => setMuted(r.items)).catch(() => {})
     } finally {
       setUnmutingId(null)
@@ -400,27 +415,28 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
       const updated = await memoriesApi.update(id, { status: "active" }, { surface: "board" })
       upsertLocal(updated)
     } catch {
-      void loadAll()
+      void loadAll() // raced elsewhere — refetch rather than lie
     } finally {
       setRestoringId(null)
     }
   }, [upsertLocal, loadAll])
-
-
+  // ?focus=candidates (landing "Review candidates" card) — scroll to the
+  // candidate lane and flash it once the list has loaded, then clean the URL.
   const location = useLocation()
   const navigate = useNavigate()
   const candidatesSectionRef = useRef<HTMLElement | null>(null)
   const flashTimerRef = useRef<number | undefined>(undefined)
   const [flashCandidates, setFlashCandidates] = useState(false)
   useEffect(() => {
-    if (overlay) return
+    if (overlay) return // overlay mode has no route focus params
     if (parseBoardFocus(location.search) !== "candidates") return
     if (status !== "ready") return
     if (candidates.length > 0) {
       candidatesSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
       setFlashCandidates(true)
-
-
+      // Timer lives in a ref: the navigate() below changes location.search,
+      // which re-runs this effect — an effect-cleanup timer would be
+      // cancelled right there and the flash would never turn off.
       window.clearTimeout(flashTimerRef.current)
       flashTimerRef.current = window.setTimeout(() => setFlashCandidates(false), 1800)
     }
@@ -433,7 +449,7 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
   async function handleCreate() {
     const content = draft.content.trim()
     if (!content) return
-
+    // A project-scoped memory must name a real project or it never injects (MEMUI-1).
     if (draft.scope === "project" && !draft.projectId) return
     setBusy(true)
     try {
@@ -441,8 +457,8 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
         content,
         detail: draft.detail.trim() || undefined,
         scope: draft.scope,
-
-
+        // Bind to the chosen real project. A project memory with a bogus id
+        // (the old hardcoded "default") never injects into any chat (MEMUI-1).
         projectId: draft.scope === "project" ? draft.projectId : undefined,
       }, { surface: "board" })
       upsertLocal(created)
@@ -451,8 +467,8 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
       setActionError(null)
       overlay?.onBacklogChanged?.()
     } catch (err) {
-
-
+      // Surface the failure — the Board's direct actions used to swallow every
+      // error, so a failed create/accept/dismiss just did nothing (BUG MEMUI-2).
       setActionError(err instanceof Error ? err.message : "Couldn't create the memory.")
     } finally {
       setBusy(false)
@@ -484,7 +500,7 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
       throw err
     }
   }
-
+  // Conflict maintenance (A1): archive the older memory in a contested pair.
   async function archiveContested(item: MemoryItem) {
     try {
       const updated = await memoriesApi.update(item.id, { status: "archived" }, { surface: "board" })
@@ -498,15 +514,18 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
     }
   }
 
-
+  // Project/Session columns read best grouped by what they bind to — a flat
+  // mixed list hides "whose memory is this" exactly when several projects
+  // (T4) or chats coexist. Personal stays flat (one owner).
   function groupCardsByOrigin(
     scope: MemoryScope,
     list: MemoryItem[],
   ): Array<{ key: string; label: string | null; items: MemoryItem[] }> {
     if (scope === "personal") return list.length > 0 ? [{ key: "personal", label: null, items: list }] : []
     const groups = new Map<string, MemoryItem[]>()
-
-
+    // A newly created chat is already a valid Session binding even before it
+    // owns any Session memory. Keep that empty target visible so a participant
+    // can move a Project memory into the current session from the opening Board.
     if (scope === "session" && overlay?.chatId) groups.set(overlay.chatId, [])
     for (const item of list) {
       const key = (scope === "project" ? item.projectId : item.sessionId) ?? "unassigned"
@@ -517,8 +536,8 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
     return [...groups.entries()].map(([key, items]) => {
       if (key === "unassigned") return { key, label: "unassigned", items }
       if (scope === "project") return { key, label: originTitles.projects[key] ?? key, items }
-
-
+      // Session groups carry their PROJECT of origin too — a chat title alone
+      // doesn't say which project's context the memory belongs to.
       const chatTitle = originTitles.chats[key]
       const chatLabel = key === overlay?.chatId
         ? (chatTitle ? `Current session · ${chatTitle}` : "Current session")
@@ -537,12 +556,12 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
           selected={item.id === selectedId}
           draggable
           onDragStart={(e) => handleDragStart(e, item.id)}
-
-
+          // Always fires when the drag ends, wherever it lands (or is cancelled)
+          // — the reliable clear for a drop released outside every zone.
           onDragEnd={() => setActiveDrop(null)}
           onClick={() => setSelectedId(item.id)}
-
-
+          // The group header already names the binding; provenance says which
+          // chat captured it (session cards: header IS the chat — skip).
           capturedIn={
             scope !== "session" && item.provenanceSessionId
               ? (originTitles.chats[item.provenanceSessionId] ?? undefined)
@@ -587,24 +606,30 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
     e.dataTransfer.setData("text/plain", id)
     e.dataTransfer.effectAllowed = "move"
   }
-
-
+  // One handler for every drop zone: mark this zone active. stopPropagation
+  // lets the innermost zone (a group inside a column) own the pointer, so the
+  // column and its group never fight over the highlight.
   function handleZoneDragOver(e: DragEvent<HTMLElement>, key: string) {
     e.preventDefault()
     e.stopPropagation()
     e.dataTransfer.dropEffect = "move"
     if (activeDrop !== key) setActiveDrop(key)
   }
-
-
+  // A drop onto a target only does something when it actually changes the
+  // memory's binding — dropping a Project-A item back on Project A, or a
+  // personal item on Personal, is a no-op. A project column drop with no
+  // chosen project (projectId undefined) is NOT a no-op: the dialog's picker
+  // resolves it.
   function sameBinding(item: MemoryItem, target: TransferInitialTarget): boolean {
     if (target.scope !== item.scope) return false
     if (target.scope === "project") return target.projectId != null && target.projectId === item.projectId
     if (target.scope === "session") return target.sessionId === item.sessionId
-    return true
+    return true // personal → personal
   }
-
-
+  // Every cross-context move goes through the transfer instrument: the proposal
+  // judges as-is / rewrite / context-bound before anything moves. The drop only
+  // fixes the DESTINATION; a project-column drop leaves the project unset so the
+  // dialog forces an explicit pick (cross-project), while a group drop names it.
   function handleDropTarget(e: DragEvent<HTMLElement>, target: TransferInitialTarget) {
     e.preventDefault()
     e.stopPropagation()
@@ -628,7 +653,9 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
       <div className="min-w-0 flex-1 overflow-y-auto px-6 py-6" onScroll={recordBoardScroll}>
         <div className="mx-auto max-w-5xl">
           <header className="mb-4 flex items-center gap-3">
-
+            {/* The board is a full-page detour with no other exit affordance
+                (pilot feedback 2026-08-11): give it an explicit way back.
+                Overlay mode has no route to go back to. */}
             {overlay ? null : (
               <Button
                 variant="ghost"
@@ -673,8 +700,9 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
           </header>
 
           {overlay?.blocking && gateModel.message ? (
-
-
+            // Session-start gate (2026-08-19 E1): every candidate, Transfer,
+            // and Checkup row blocks entry. The count comes from the server,
+            // never this page's search/project filter.
             <div
               data-opening-memory-board-gate="true"
               className="mb-5 flex flex-wrap items-start justify-between gap-4 px-1"
@@ -1066,7 +1094,8 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
             ) : null}
           </section> : null}
 
-
+          {/* Markdown sync (DG5, 2026-08-19 I1): kept for expert users, parked
+              at the bottom of the board — never competes with the review lanes. */}
           {sections.markdown ? <MarkdownSyncCard
             onSynced={(newIds) => {
               void loadAll()
@@ -1085,13 +1114,14 @@ export function MemoryBoardPage({ overlay }: { overlay?: MemoryBoardOverlayMode 
             if (!open) setTransferRequest(null)
           }}
           initialTarget={transferRequest.target}
-
+          // A drag reads as "move", not "copy".
           defaultArchiveOriginal
           surface="board"
           onDone={(created) => {
             setTransferRequest(null)
-
-
+            // Make the landing visible: if the new item lives outside the
+            // current project lens, widen the lens; then open its detail so
+            // the user sees exactly WHERE it landed.
             if (created.scope === "project" && projectFilter && created.projectId !== projectFilter) {
               setProjectFilter(null)
             }

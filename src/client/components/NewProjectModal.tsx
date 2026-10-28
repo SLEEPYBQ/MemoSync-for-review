@@ -36,8 +36,8 @@ export function NewProjectModal({ open, onOpenChange, onConfirm }: Props) {
   const [tab, setTab] = useState<Tab>("new")
   const [name, setName] = useState("")
   const [existingPath, setExistingPath] = useState("")
-
-
+  // The picker browses the WORKSPACE machine (where the agent runs) — a bare
+  // path field reads like the user's own computer (pilot feedback 2026-08-11).
   const [dirs, setDirs] = useState<WorkspaceDirsSnapshot | null>(null)
   const [dirsLoading, setDirsLoading] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -53,7 +53,7 @@ export function NewProjectModal({ open, onOpenChange, onConfirm }: Props) {
       const { data } = (await res.json()) as { data: WorkspaceDirsSnapshot }
       setDirs(data)
     } catch {
-
+      // Browsing is a convenience — typing a path still works.
     } finally {
       setDirsLoading(false)
     }
@@ -126,8 +126,8 @@ export function NewProjectModal({ open, onOpenChange, onConfirm }: Props) {
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 onKeyDown={(e) => {
-
-
+                  // Enter mid-IME-composition commits a pinyin candidate, it must
+                  // not submit the half-typed project name (LAND-2).
                   if (isImeComposingKeyEvent(e.nativeEvent)) return
                   if (e.key === "Enter") handleSubmit()
                   if (e.key === "Escape") onOpenChange(false)

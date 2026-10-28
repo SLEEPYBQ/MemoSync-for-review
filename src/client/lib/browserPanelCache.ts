@@ -1,7 +1,10 @@
 import type { LocalHttpServerInfo, ProjectQuickAction } from "../../shared/protocol"
 import type { AppSocket } from "../app/socket"
 
-
+// Cache local-server lists PER PROJECT. A single global cache flashed one
+// project's servers (and its "same-project" markers) when you switched to
+// another, and a delayed refresh from the old project could overwrite the new
+// one's list (BUG PANEL-6). Mirrors the per-project quick-actions cache below.
 const localHttpServersCacheByProjectId = new Map<string, LocalHttpServerInfo[]>()
 const localHttpServersRequestByProjectId = new Map<string, Promise<LocalHttpServerInfo[]>>()
 

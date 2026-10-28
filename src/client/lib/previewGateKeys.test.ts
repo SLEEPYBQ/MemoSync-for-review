@@ -51,7 +51,10 @@ describe("previewGateKeyAction", () => {
     expect(previewGateKeyAction({ key: "a" }, emptyComposer)).toBe(null)
   })
 
-
+  // BUG MSG-4: a keyboard user Tab'd to "Proceed without memory" / "Dismiss
+  // turn" and pressed Enter — the window handler must NOT hijack that Enter as
+  // go_on (which, via preventDefault, also suppressed the button they chose).
+  // Let the focused control handle its own Enter.
   test("Enter while a gate button/link/select is focused does NOT decide go_on", () => {
     expect(previewGateKeyAction(enter, { tagName: "BUTTON" })).toBe(null)
     expect(previewGateKeyAction(enter, { tagName: "A" })).toBe(null)
@@ -62,7 +65,11 @@ describe("previewGateKeyAction", () => {
     expect(previewGateKeyAction(escape, { tagName: "BUTTON" })).toBe("dismiss")
   })
 
-
+  // The composer consumes Enter-to-send with preventDefault() and React clears
+  // the controlled textarea before the native event bubbles to window — so by
+  // the time the gate's listener reads it, the "typing protection" value guard
+  // sees an EMPTY composer and the same keystroke would also decide the gate.
+  // A global fallback shortcut must never act on a key someone already claimed.
   test("a defaultPrevented Enter (consumed by the composer send) must NOT decide", () => {
     expect(previewGateKeyAction({ key: "Enter", defaultPrevented: true }, emptyComposer)).toBe(null)
   })

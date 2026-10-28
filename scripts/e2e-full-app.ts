@@ -1,5 +1,12 @@
-
-
+// FULL-APP memory-loop E2E — drives ONE real turn through the production
+// coordinator over the WS protocol against a RUNNING instance (normally the
+// local server on DeepSeek). Exercises the whole SPEC §4.10
+// loop: per-turn preview gate → go_on → engine turn → [M-NN] citation →
+// post-turn capture candidates + trace annotation entries.
+//
+//   E2E_BASE=http://127.0.0.1:3210 bun run scripts/e2e-full-app.ts [claude|codex]
+//
+// Makes real model calls; the instance needs a few seeded memories.
 import type { ChatSnapshot, TranscriptEntry } from "../src/shared/types"
 
 const BASE = process.env.E2E_BASE || "http://127.0.0.1:3210"
@@ -42,7 +49,7 @@ function waitFor<T>(pred: (m: any) => T | undefined, timeoutMs: number, label: s
   })
 }
 
-
+// 1. Find the demo project via the sidebar snapshot.
 send({ type: "subscribe", id: "sidebar", topic: { type: "sidebar" } })
 const sidebar = await waitFor<any>(
   (m) => (m.type === "snapshot" && m.snapshot?.type === "sidebar" ? m.snapshot.data : undefined),
@@ -54,7 +61,7 @@ if (!group) throw new Error("no project in sidebar — start the instance with D
 const project = { id: group.groupKey as string, title: group.realTitle as string }
 console.log(`[e2e] project: ${project.id} (${project.title}) provider=${PROVIDER}`)
 
-
+// 2. Send the turn (creates the chat).
 const sendId = rid()
 send({
   type: "command",
@@ -115,14 +122,14 @@ while (Date.now() < deadline) {
     "chat snapshot",
   ).catch(() => undefined)
   if (snap === undefined) break
-
+  // Consume this snapshot message so the next waitFor sees a fresh one.
   const idx = inbox.findIndex((m) => m.type === "snapshot" && m.snapshot?.type === "chat")
   if (idx >= 0) inbox.splice(idx, 1)
   ingest(snap)
-
+  // After the result, linger for the background passes (capture/trace).
   if (sawResult && entriesByKind.has("memory_trace") && entriesByKind.has("memory_candidates")) break
   if (sawResult && Date.now() > deadline - 180_000) {
-
+    // give the post-turn passes up to ~2 minutes after the result
     await new Promise((r) => setTimeout(r, 1500))
   }
 }
@@ -134,7 +141,7 @@ const decision = (entriesByKind.get("memory_preview_decision") ?? []).length > 0
 const candidates = (entriesByKind.get("memory_candidates") ?? []).length > 0
 const trace = (entriesByKind.get("memory_trace") ?? []).length > 0
 
-
+// Server-side ground truth: usage events recorded for cited memories.
 const memories = await fetch(`${BASE}/api/memories`).then((r) => r.json()).then((b) => b.data ?? [])
 const used = memories.filter((m: any) => m.usageCount > 0).map((m: any) => `${m.id}:${m.usageCount}`)
 

@@ -111,8 +111,8 @@ describe("quiz copy", () => {
   })
 
   test("participant-visible client copy never names FullStack-Bench", async () => {
-
-
+    // Study-owner cleanup 2026-08-20: remove exactly the phrase
+    // FullStack-Bench from participant copy; broader terms stay untouched.
     const { readdirSync, readFileSync, statSync } = await import("node:fs")
     const { join } = await import("node:path")
     const root = new URL("../..", import.meta.url).pathname

@@ -1,11 +1,21 @@
-
-
+// Motion primitives for memory-lifecycle moments. Motion here is MEANING, not
+// decoration: each lifecycle station gets one signature move so a glance tells
+// what kind of event just happened (birth rises, transfer flips, violation
+// pings once, delegation stamps). Grounding rules:
+//
+// - One-shot and short (200–500ms), spring-eased. Nothing loops — a looping
+//   attention animation is a nag, and the drift signals must stay trustworthy.
+// - FRESH-GUARDED: the transcript list is virtualized, so rows REMOUNT when
+//   scrolled back into view. Entrance animations only play while the event is
+//   actually fresh (its timestamp within FRESH_WINDOW_MS of mount); old rows
+//   render settled. Pass `freshAt` from the message timestamp.
+// - `prefers-reduced-motion` renders everything settled immediately.
 import { useMemo, type CSSProperties, type ReactNode } from "react"
 import { motion, useReducedMotion, type Transition } from "motion/react"
 
 const FRESH_WINDOW_MS = 8_000
 
-
+/** True while the event that produced this UI just happened. */
 export function isFresh(freshAt?: string | number): boolean {
   if (freshAt === undefined) return true
   const t = typeof freshAt === "number" ? freshAt : Date.parse(freshAt)
@@ -15,7 +25,10 @@ export function isFresh(freshAt?: string | number): boolean {
 
 const SPRING: Transition = { type: "spring", stiffness: 420, damping: 32, mass: 0.7 }
 
-
+/**
+ * Birth move: rise + settle. For cards entering the stream (capture
+ * candidates, the preview gate). `delay` staggers siblings.
+ */
 export function RiseIn({
   children,
   freshAt,
@@ -42,7 +55,11 @@ export function RiseIn({
   )
 }
 
-
+/**
+ * Secondary-surface move: slide in from the side after the primary content
+ * landed. For the gate's attention row — the eye reads the gate first, then
+ * the ride-along arrives, visually subordinate.
+ */
 export function SlideInLater({
   children,
   freshAt,
@@ -69,7 +86,11 @@ export function SlideInLater({
   )
 }
 
-
+/**
+ * Transfer move: a real 3D flip. Face A ("Transferring …") holds for
+ * `holdMs`, then the card turns over to face B (the Localized result).
+ * Old gates render face B directly — the journey already happened.
+ */
 export function FlipReveal({
   front,
   back,
@@ -90,8 +111,8 @@ export function FlipReveal({
   if (!animateFlip) return <div className={className}>{back}</div>
   const face: CSSProperties = { backfaceVisibility: "hidden", gridArea: "1 / 1" }
   return (
-
-
+    // Perspective must live on the PARENT for the child's rotation to gain
+    // depth — set on the rotating element it has no effect on its own turn.
     <div className={className} style={{ perspective: 1200 }}>
       <motion.div
         style={{ transformStyle: "preserve-3d", display: "grid" }}
@@ -106,7 +127,10 @@ export function FlipReveal({
   )
 }
 
-
+/**
+ * Violation move: ONE red ring ping on arrival, then quiet. The signal's
+ * salience comes from staying visible, not from repeating.
+ */
 export function PulseOnce({
   children,
   freshAt,
@@ -134,7 +158,10 @@ export function PulseOnce({
   )
 }
 
-
+/**
+ * Delegation move: the "auto" stamp pops into place — quick, confident,
+ * slightly overshooting. For the auto-applied badge.
+ */
 export function StampIn({
   children,
   freshAt,

@@ -1,5 +1,11 @@
-
-
+// Step 2 (redesign 2026-08-07 §3): suggested changes to saved memories. Three
+// parallel library checks (conflicts / redundancy / staleness) surface here,
+// grouped by type with empty groups hidden. Promotion rows are legacy-only;
+// old transcripts keep a passive receipt but no longer expose a scope-changing
+// action. While the queries
+// run the container renders as a skeleton with cycling status words; each
+// suggestion row is a memory reference + the model's one-line reason + the
+// type's fixed actions. Actions ride the existing attention-resolve API.
 import { useEffect, useMemo, useState } from "react"
 import { AlertTriangle, ArrowRight, CheckCheck, Clock3, Copy, Info, ListChecks, Loader2 } from "lucide-react"
 import type { HydratedTranscriptMessage, MemoryCheckupKind, MemoryCheckupSuggestionSnapshot } from "../../../shared/types"
@@ -26,13 +32,13 @@ interface Props {
   onRespond: (checkupId: string, decision: "handled" | "skipped") => Promise<void> | void
   canReopen?: boolean
   onReopen?: () => Promise<void> | void
-
+  /** Position in this turn's flow — 3 when a Transfer card sits before us, 2 otherwise. */
   stepNumber?: number
   surface?: MemoryControlSurface
   boardResolution?: MemoryBoardActionContext
-
+  /** Session-start Board: every resurfaced row must be handled before leaving. */
   requireAllRows?: boolean
-
+  /** Shared when the same active gate is expanded in the Memory Board. */
   resolvedRows?: ReadonlyMap<string, string>
   onSuggestionResolved?: (memoryId: string, outcome: string) => void
 }
@@ -102,7 +108,9 @@ export function MemoryCheckupGate({
   const [reopening, setReopening] = useState(false)
   const effectiveResolvedRows = resolvedRows ?? localResolvedRows
 
-
+  // Reopening Step 1 or Step 2 invalidates the previous checkup result. Clear
+  // local row state as soon as the reset marker folds into this component so
+  // newly generated suggestions can never inherit an old "handled" status.
   useEffect(() => {
     if (message.pending || message.waiting) setLocalResolvedRows(new Map())
   }, [message.pending, message.waiting])
@@ -117,7 +125,7 @@ export function MemoryCheckupGate({
     )
   }
 
-
+  // Skeleton: queries in flight. The wireframe rows pulse; the words cycle.
   if (message.pending && message.suggestions === undefined) {
     return <CheckupSkeleton stepNumber={stepNumber} />
   }
@@ -302,7 +310,11 @@ function CheckupSkeleton({ stepNumber = 2 }: { stepNumber?: number }) {
   )
 }
 
-
+/**
+ * One suggestion row: memory reference (hover = the canonical read-only card)
+ * + the model's reason + this type's fixed actions. The row is the host — the
+ * buttons live here, never on the memory card itself.
+ */
 function CheckupSuggestionRow({
   suggestion,
   resolvedOutcome,

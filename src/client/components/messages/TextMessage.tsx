@@ -10,14 +10,16 @@ interface Props {
   isCurrentTurn?: boolean
 }
 
-
+// react-markdown's default urlTransform strips unknown URL schemes (href
+// becomes "") — the private memosync-memory: scheme must survive so the `a`
+// component can render the scope-colored citation chip instead of a dead link.
 export function urlTransform(url: string): string {
   return url.startsWith(MEMORY_CITATION_SCHEME) ? url : defaultUrlTransform(url)
 }
 
 export function TextMessage({ message, isCurrentTurn = false }: Props) {
-
-
+  // Trace verdicts land after the reply; this reply's violated citations (if
+  // any) flow down to its [M-NN] chips so drift shows at the sentence itself.
   const violated = useViolatedCitationsMap()?.get(message.id) ?? null
   const markdown = (
     <div className="text-pretty prose prose-sm dark:prose-invert px-0.5 w-full max-w-full space-y-4">

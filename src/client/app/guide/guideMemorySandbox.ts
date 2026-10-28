@@ -10,11 +10,15 @@ interface RealMemorySnapshot {
 
 export interface GuideMemorySandboxController {
   (): void
-
+  /** Swap the isolated collection shown by production Guide surfaces. */
   setItems(items: MemoryItem[]): void
 }
 
-
+/**
+ * Isolate the real memory Zustand store while the guide renders production
+ * memory components. The returned cleanup restores the latest real snapshot,
+ * including a load that completed behind the guide.
+ */
 export function installGuideMemorySandbox(): GuideMemorySandboxController {
   const initial = useMemoryStore.getState()
   const realActions = {

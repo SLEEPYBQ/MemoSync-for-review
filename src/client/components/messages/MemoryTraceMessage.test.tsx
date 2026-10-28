@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server"
 import { MemoryTraceMessage } from "./MemoryTraceMessage"
 import { TranscriptChatContextProvider } from "./render-context"
 
-
+// Minimal memory_trace message; only the fields the component reads matter.
 function msg(
   labels: Array<{ id: string; label: string; note?: string; quote?: string; toolId?: string; cause?: string; impact?: string; missing?: string }>,
   extra: Record<string, unknown> = {},
@@ -22,8 +22,8 @@ describe("MemoryTraceMessage", () => {
     expect(html).toContain("reply or tool evidence")
   })
   test("expands all four verdict groups on initial render", () => {
-
-
+    // Study-owner decision 2026-08-20: no verdict hides behind a collapsed
+    // header on first render — the participant sees every group's rows at once.
     const html = renderToStaticMarkup(
       createElement(MemoryTraceMessage, {
         message: msg([
@@ -38,7 +38,7 @@ describe("MemoryTraceMessage", () => {
     expect(html).toContain("M-02")
     expect(html).toContain("M-03")
     expect(html).toContain("M-04")
-
+    // The NA row still names its missing object when expanded by default.
     expect(html).toContain("no image in this turn")
   })
 
@@ -51,12 +51,12 @@ describe("MemoryTraceMessage", () => {
         ]),
       }),
     )
-
-
+    // The operational verdict is visible without interaction (review feedback:
+    // "was this used?" used to need an extra click).
     expect(html).toContain("shaped this turn")
     expect(html).toContain("M-01")
-
-
+    // The no-effect group keeps its counted header, and its row is now
+    // expanded on initial render too (study-owner decision 2026-08-20).
     expect(html).toContain("1 no visible effect")
     expect(html).toContain("M-02")
   })
@@ -75,7 +75,7 @@ describe("MemoryTraceMessage", () => {
     const iOperational = html.indexOf("M-11")
     expect(iViolated).toBeGreaterThanOrEqual(0)
     expect(iViolated).toBeLessThan(iOperational)
-
+    // The no-effect memory renders after the shaped rows, expanded by default.
     expect(html).toContain("1 no visible effect")
     const iNoEffect = html.indexOf("M-10")
     expect(iNoEffect).toBeGreaterThan(iOperational)

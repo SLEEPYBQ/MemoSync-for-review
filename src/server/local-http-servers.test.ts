@@ -21,9 +21,9 @@ describe("local http servers", () => {
   test("parses listening tcp ports from lsof output", () => {
     const output = `
 COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
-node    12345 reviewer   23u  IPv4 123456      0t0  TCP *:5174 (LISTEN)
-bun     12346 reviewer   23u  IPv4 123457      0t0  TCP localhost:3210 (LISTEN)
-other   12347 reviewer   23u  IPv4 123458      0t0  TCP 127.0.0.1:8080 (LISTEN)
+node    12345 user   23u  IPv4 123456      0t0  TCP *:5174 (LISTEN)
+bun     12346 user   23u  IPv4 123457      0t0  TCP localhost:3210 (LISTEN)
+other   12347 user   23u  IPv4 123458      0t0  TCP 127.0.0.1:8080 (LISTEN)
     `
 
     expect(parseLsofListeningPorts(output)).toEqual([3210, 5174, 8080])

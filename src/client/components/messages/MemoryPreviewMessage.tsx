@@ -1,5 +1,14 @@
-
-
+// Independent pre-turn component: Working Memory for This Turn (redesign
+// 2026-08-07 §3). It follows the proposed-changes component, but is not a
+// third step inside it: the paper treats these as two different shared objects.
+// user's model has exactly ONE concept: selected = injected, unselected = not
+// injected. The injected list seeds from the model's suggestions (with a
+// one-line why each) and grows by clicking items in the collapsed pool;
+// removing a row un-injects it. Under the hood the full pool still rides the
+// context for cache friendliness and unselected items get a "this turn,
+// ignore" instruction — the user's model is true at the behavior level, and
+// the audit charges violations against THIS list. None of that machinery is
+// explained here.
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useParams } from "react-router-dom"
 import Markdown, { defaultUrlTransform } from "react-markdown"
@@ -29,20 +38,22 @@ interface Props {
     memoryIds?: string[],
     expectedUses?: ExpectedMemoryUse[],
   ) => void | Promise<void>
-
-
+  /**
+   * An undecided preview that newer turn entries have passed by (e.g. the
+   * server restarted while parked) — show it, but don't offer dead buttons.
+   */
   stale?: boolean
 }
 
-
+/** Why an item sits on the injected list — the three sources stay visibly distinct. */
 type InjectSource = "suggested" | "attention" | "manual" | "standing"
 
 const SOURCE_LABELS: Record<InjectSource, string | null> = {
   suggested: "suggested",
   attention: "enforced",
   manual: "you added",
-
-
+  // Compat default when no suggestion pass exists on this turn — everything
+  // rides, and a label would just be noise on every row.
   standing: null,
 }
 
@@ -62,7 +73,8 @@ function replyUrlTransform(url: string): string {
   return url.startsWith(MEMORY_CITATION_SCHEME) ? url : defaultUrlTransform(url)
 }
 
-
+/** Render the embedded assistant with the same Markdown and live memory
+ * citations as the main conversation, while keeping its typography compact. */
 export function ReplyMarkdown({ text, className }: { text: string; className?: string }) {
   return (
     <div
@@ -86,13 +98,13 @@ const DECISION_TEXT: Record<MemoryPreviewDecision | "expired", string> = {
   go_on: "started with this working memory",
   without_memory: "started with empty working memory",
   dismiss: "turn dismissed — message returned to the composer",
-
+  // System-recorded: the server restarted while this gate was parked.
   expired: "expired — send the message again",
 }
 
 export function MemoryPreviewMessage({ message, onRespond, stale = false }: Props) {
-
-
+  // Guide-tour demo mode: internal UI state is seeded from the tour step and
+  // the ask box answers locally — no server call ever leaves this card.
   const { previewDemo } = useTranscriptRenderOptions()
   const [submitting, setSubmitting] = useState<MemoryPreviewDecision | null>(null)
   const pending = message.decision === undefined && !stale
@@ -100,7 +112,8 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
   const interactive = pending && !refreshing
   const { chatId } = useParams<{ chatId: string }>()
 
-
+  // selected = injected. null = not seeded yet (waiting for the suggestion
+  // pass); a Map so every row remembers WHY it is on the list.
   const [selection, setSelection] = useState<Map<string, InjectSource> | null>(null)
   const [expectedUsesById, setExpectedUsesById] = useState<Map<string, string>>(new Map())
   const [planningIds, setPlanningIds] = useState<Set<string>>(new Set())
@@ -139,7 +152,10 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
     })
   }, [message.decisionExpectedUses, message.expectedUses, memoriesById])
 
-
+  // Seed / merge the suggestion pass exactly once. No pass on this turn →
+  // everything rides (the pre-redesign default, kept for LLM-less setups).
+  // Pay-attention carryovers (audit follow-up ①) seed regardless, with their
+  // own source label.
   useEffect(() => {
     if (!pending) {
       if (selection !== null) return
@@ -155,8 +171,8 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
       return
     }
     if (message.selectionError && !selectionRecovered) {
-
-
+      // Failure is not a model decision to select nothing. Preserve any
+      // manual choices and mandatory items, then expose the pool for recovery.
       if (selection === null) {
         setSelection(new Map([...attentionIds].filter((id) => memoriesById.has(id)).map((id) => [id, "attention" as InjectSource])))
         setPoolExpanded(true)
@@ -207,7 +223,7 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
     const uniqueIds = [...new Set(ids)].filter((id) => memoriesById.has(id))
     if (!uniqueIds.length) return
     if (previewDemo) {
-
+      // Demo card: no planning pass — fill the default line immediately.
       setExpectedUsesById((current) => {
         const next = new Map(current)
         for (const id of uniqueIds) if (!next.has(id)) next.set(id, DEFAULT_EXPECTED_USE)
@@ -243,8 +259,9 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
         const next = new Set(current)
         for (const id of uniqueIds) {
           if (planTokenByIdRef.current.get(id) !== token) continue
-
-
+          // Keep the last token until the next request/reset. React may apply
+          // queued state updaters after this finally block; they still need
+          // to distinguish the latest plan from a superseded request.
           next.delete(id)
         }
         return next
@@ -278,7 +295,10 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
     }
   }
 
-
+  // "Ask agent to revise": a small talking assistant inside the card — an
+  // instruction changes the selection, a question gets answered; either way
+  // it replies (user feedback 2026-08-07: 不能只干不说话). Start stays the
+  // only commit point.
   const [reviseText, setReviseText] = useState("")
   const [revising, setRevising] = useState(false)
   const [reviseStatusIndex, setReviseStatusIndex] = useState(0)
@@ -289,7 +309,8 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
     return () => clearInterval(timer)
   }, [revising])
 
-
+  // The tour advances this card's internal state step by step (pool open on
+  // the pool step, a seeded exchange on the ask step) — sync when it changes.
   useEffect(() => {
     if (previewDemo?.poolExpanded !== undefined) setPoolExpanded(previewDemo.poolExpanded)
   }, [previewDemo?.poolExpanded])
@@ -303,7 +324,7 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
     setRevising(true)
     setReviseText("")
     if (previewDemo) {
-
+      // Demo: a short think, then the canned reply — selection stays yours.
       await new Promise((resolve) => setTimeout(resolve, 900))
       setExchanges((prev) => [...prev, { q: instruction, a: previewDemo.reviseReply }])
       setRevising(false)
@@ -325,8 +346,8 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
           const next = new Map<string, InjectSource>()
           for (const id of result.selectedIds) {
             if (!memoriesById.has(id)) continue
-
-
+            // Kept rows keep their story; agent-added rows read as yours (the
+            // instruction was yours).
             next.set(id, prev?.get(id) ?? "manual")
           }
           return next
@@ -346,8 +367,8 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
   }
 
   function respond(decision: MemoryPreviewDecision, memoryIds?: string[], expectedUses?: ExpectedMemoryUse[]) {
-
-
+    // Demo card: the production controls report into the Guide's local turn
+    // controller. No participant command or transcript endpoint is involved.
     if (dispatchPreviewDemoDecision(previewDemo, {
       previewId: message.previewId,
       decision,
@@ -358,21 +379,23 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
     if (submitting) return
     setSubmitting(decision)
     void Promise.resolve(onRespond(message.previewId, decision, memoryIds, expectedUses)).catch(() => {
-
-
+      // Send failed (disconnect / command timeout): re-enable the buttons so the
+      // user can retry, instead of a permanently-disabled card with a spinner
+      // that even Enter/Esc can't get past (BUG MSG-5).
       setSubmitting(null)
     })
   }
 
   function start() {
     if (submitting || seeding || revising || planningSelected || failedSelected.length) return
-
-
+    // Zero injected = the honest "start with nothing" — same user model,
+    // existing server semantics.
     if (injectedIds.length === 0) respond("without_memory")
     else respond("go_on", injectedIds, selectedExpectedUses)
   }
 
-
+  // Keyboard path for the gate (STUDY_PLAN §2.4): Enter = start with the
+  // current injected list, Esc = dismiss. Never while typing.
   useEffect(() => {
     if (!pending) return
     const onKeyDown = (event: KeyboardEvent) => {
@@ -390,7 +413,7 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
     }
     window.addEventListener("keydown", onKeyDown)
     return () => window.removeEventListener("keydown", onKeyDown)
-
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pending, submitting, message.previewId, injectedIds, seeding, revising, planningSelected, failedSelected.length])
 
   const decidedText = message.decision
@@ -405,8 +428,8 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
     <RiseIn freshAt={message.timestamp}>
       <div
         className="rounded-xl border border-border bg-card p-4 shadow-sm"
-
-
+        // While the gate awaits a keyboard decision, claim Esc so sticky-focus
+        // doesn't swallow it (BUG CORE-1).
         {...(interactive ? { [PREVIEW_GATE_PENDING_ATTRIBUTE]: "" } : {})}
       >
         <div className="flex flex-wrap items-baseline gap-2">
@@ -459,8 +482,10 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
                         <MemoryCitationChip id={id} />
                         <span className="min-w-0 flex-1 text-foreground">{memory.content}</span>
                         {transferredIds.has(id) ? (
-
-
+                          // Landed by THIS turn's transfer stage — also covers
+                          // reinforce-merges, where the accept strengthened an
+                          // existing memory instead of adding a row (otherwise
+                          // an accepted transfer looks like it vanished).
                           <span
                             title="Landed by this turn's transfer review (a merge strengthens an existing memory)"
                             className="shrink-0 rounded-full border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] leading-none text-violet-700 dark:text-violet-300"
@@ -482,8 +507,8 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
                         ) : null}
                         {interactive ? (
                           source === "attention" ? (
-
-
+                            // Enforced rows lock (2026-08-19 D1): no casual ×.
+                            // Cancelling the enforce is an explicit, named act.
                             <button
                               type="button"
                               title="This memory is enforced for this run — cancel the enforce to remove it"
@@ -533,7 +558,7 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
             ) : null}
 
             {!seeding && poolRest.length > 0 ? (
-
+              // data-preview-pool: spotlight anchor for the guide tour.
               <div data-preview-pool className="mt-1.5 rounded-lg border border-border/70 bg-background/60 p-2.5">
                 <div className="flex flex-wrap items-center gap-2">
                   <LibraryBig className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -586,7 +611,7 @@ export function MemoryPreviewMessage({ message, onRespond, stale = false }: Prop
         )}
 
         {interactive && message.memories.length > 0 ? (
-
+          // data-preview-ask: spotlight anchor for the guide tour.
           <div data-preview-ask className="mt-3 border-t border-border/60 pt-3">
             {exchanges.length > 0 ? (
               <div className="mb-2 flex max-h-40 flex-col gap-1.5 overflow-y-auto pr-1">

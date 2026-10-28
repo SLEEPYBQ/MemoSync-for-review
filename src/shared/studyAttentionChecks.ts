@@ -53,7 +53,7 @@ const CHECKS: Record<string, StudyAttentionCheckDefinition> = {
   },
 }
 
-
+// Keep the formal task catalog and attention-check catalog in lockstep.
 for (const task of STUDY_TASKS) {
   if (!CHECKS[task.id]) throw new Error(`Missing attention check for study task ${task.id}`)
 }
@@ -88,7 +88,7 @@ export function scoreStudyAttentionCheck(
   }
 }
 
-
+/** The check appears on the middle memory page, never systematically first or last. */
 export function attentionCheckMemoryIndex(memoryCount: number): number | null {
   if (!Number.isInteger(memoryCount) || memoryCount <= 0) return null
   return Math.floor((memoryCount - 1) / 2)

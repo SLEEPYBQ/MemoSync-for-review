@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { appendGitIgnoreEntry, DiffStore, extractGitHubRepoSlug, fetchGitHubPullRequests } from "./diff-store"
+import { appendGitIgnoreEntry, DiffStore, extractGitHubRepoSlug, fetchGitHubPullRequests, getGhAuthInfo } from "./diff-store"
 
 async function run(command: string[], cwd: string) {
   const process = Bun.spawn(command, {
@@ -38,6 +38,109 @@ async function createBareRemote() {
 }
 
 const tempDirs: string[] = []
+
+describe("GitHub authentication compatibility", () => {
+  const version = ["gh", "--version"]
+  const jsonStatus = ["gh", "auth", "status", "--json", "hosts"]
+  const legacyStatus = ["gh", "auth", "status", "--hostname", "github.com"]
+  const login = ["gh", "api", "user", "--hostname", "github.com", "--jq", ".login"]
+
+  function commandSequence(steps: Array<[string[], { exitCode?: number; stdout?: string; stderr?: string }]>) {
+    const calls: string[][] = []
+    return {
+      command: async (args: string[]) => {
+        const step = steps[calls.length]
+        calls.push(args)
+        return { exitCode: step ? 0 : 1, stdout: "", stderr: "", ...step?.[1] }
+      },
+      assertComplete: () => expect(calls).toEqual(steps.map(([args]) => args)),
+    }
+  }
+
+  test("keeps modern active-account selection without using the fallback", async () => {
+    const sequence = commandSequence([
+      [version, {}],
+      [jsonStatus, { stdout: JSON.stringify({ hosts: { "github.com": [
+        { active: false, login: "inactive", state: "success" },
+        { active: true, login: "current", state: "success" },
+      ] } }) }],
+    ])
+    expect(await getGhAuthInfo(sequence.command)).toEqual({
+      ghInstalled: true, authenticated: true, activeAccountLogin: "current",
+    })
+    sequence.assertComplete()
+  })
+
+  for (const result of [
+    { exitCode: 1, stderr: "unknown flag: --json" },
+    { exitCode: 0, stdout: "unparseable status output" },
+  ]) {
+    test(`falls back when JSON status is ${result.exitCode ? "unsupported" : "unparseable"}`, async () => {
+      const sequence = commandSequence([
+        [version, {}], [jsonStatus, result], [legacyStatus, {}], [login, { stdout: "octocat\n" }],
+      ])
+      expect(await getGhAuthInfo(sequence.command)).toEqual({
+        ghInstalled: true, authenticated: true, activeAccountLogin: "octocat",
+      })
+      sequence.assertComplete()
+    })
+  }
+
+  test("authenticates the active account when an inactive legacy account fails", async () => {
+    const sequence = commandSequence([
+      [version, {}], [jsonStatus, { exitCode: 1, stderr: "unknown flag: --json" }],
+      [legacyStatus, { exitCode: 1, stderr: "old-work token validation failed" }],
+      [login, { stdout: "current\n" }],
+    ])
+    expect(await getGhAuthInfo(sequence.command)).toEqual({
+      ghInstalled: true, authenticated: true, activeAccountLogin: "current",
+    })
+    sequence.assertComplete()
+  })
+
+  test("does not authenticate when the active-account lookup fails", async () => {
+    const sequence = commandSequence([
+      [version, {}], [jsonStatus, { exitCode: 1, stderr: "unknown flag: --json" }],
+      [legacyStatus, { exitCode: 1, stderr: "Not logged in to github.com" }],
+      [login, { exitCode: 1, stderr: "HTTP 401" }],
+    ])
+    expect(await getGhAuthInfo(sequence.command)).toEqual({
+      ghInstalled: true, authenticated: false, activeAccountLogin: undefined,
+    })
+    sequence.assertComplete()
+  })
+
+  test("does not treat aggregate legacy status success as proof the active token works", async () => {
+    const sequence = commandSequence([
+      [version, {}], [jsonStatus, { exitCode: 1, stderr: "unknown flag: --json" }],
+      [legacyStatus, {}],
+      [login, { exitCode: 1, stderr: "HTTP 401" }],
+    ])
+    expect(await getGhAuthInfo(sequence.command)).toEqual({
+      ghInstalled: true, authenticated: false, activeAccountLogin: undefined,
+    })
+    sequence.assertComplete()
+  })
+
+  test("preserves a modern authentication failure without a fallback", async () => {
+    const sequence = commandSequence([
+      [version, {}],
+      [jsonStatus, { stdout: JSON.stringify({ hosts: { "github.com": [
+        { active: true, login: "expired", state: "failed" },
+      ] } }) }],
+    ])
+    expect(await getGhAuthInfo(sequence.command)).toEqual({
+      ghInstalled: true, authenticated: false, activeAccountLogin: "expired",
+    })
+    sequence.assertComplete()
+  })
+
+  test("reports a missing executable without throwing", async () => {
+    expect(await getGhAuthInfo(async () => { throw new Error("ENOENT") })).toEqual({
+      ghInstalled: false, authenticated: false, activeAccountLogin: undefined,
+    })
+  })
+})
 
 describe("DiffStore", () => {
   afterEach(async () => {
@@ -82,6 +185,68 @@ describe("DiffStore", () => {
       files: [],
       branchHistory: { entries: [] },
     })
+  })
+
+  for (const tracked of [false, true]) {
+    for (const targetKind of ["file", "directory", "missing"] as const) {
+      test(`diffs ${tracked ? "tracked" : "untracked"} symbolic links to a ${targetKind} as link text`, async () => {
+        const repoRoot = await createRepo()
+        tempDirs.push(repoRoot)
+        const targetRoot = await mkdtemp(path.join(tmpdir(), "memosync-link-target-"))
+        tempDirs.push(targetRoot)
+        const targetPath = path.join(targetRoot, "目标")
+        const targetContents = "target bytes must not enter the diff\nsecond line\n"
+        if (targetKind === "file") await writeFile(targetPath, targetContents)
+        if (targetKind === "directory") await mkdir(targetPath)
+
+        const linkPath = path.join(repoRoot, "shortcut.png")
+        if (tracked) {
+          await symlink("old-target", linkPath)
+          await run(["git", "add", "shortcut.png"], repoRoot)
+          await run(["git", "commit", "-m", "add link"], repoRoot)
+          await rm(linkPath)
+        }
+        await symlink(targetPath, linkPath)
+
+        const store = new DiffStore(repoRoot)
+        await store.initialize()
+        await store.refreshSnapshot("project-1", repoRoot)
+        const snapshot = store.getProjectSnapshot("project-1")
+        expect(snapshot.status).toBe("ready")
+        expect(snapshot.files).toHaveLength(1)
+        expect(snapshot.files[0]).toMatchObject({
+          path: "shortcut.png",
+          changeType: tracked ? "modified" : "added",
+          isUntracked: !tracked,
+          additions: 1,
+          deletions: tracked ? 1 : 0,
+          mimeType: "text/plain",
+          size: Buffer.byteLength(targetPath),
+        })
+        const { patch } = await store.readPatch({ projectPath: repoRoot, path: "shortcut.png" })
+        expect(patch).toContain(`+${targetPath}`)
+        expect(patch).not.toContain(targetContents)
+        if (tracked) expect(patch).toContain("-old-target")
+      })
+    }
+  }
+
+  test("retains a file-to-symbolic-link type change with identical text", async () => {
+    const repoRoot = await createRepo()
+    tempDirs.push(repoRoot)
+    const linkPath = path.join(repoRoot, "shortcut.txt")
+    await writeFile(linkPath, "target")
+    await run(["git", "add", "shortcut.txt"], repoRoot)
+    await run(["git", "commit", "-m", "add file"], repoRoot)
+    await rm(linkPath)
+    await symlink("target", linkPath)
+
+    const store = new DiffStore(repoRoot)
+    await store.initialize()
+    await store.refreshSnapshot("project-1", repoRoot)
+    expect(store.getProjectSnapshot("project-1").files).toEqual([
+      expect.objectContaining({ path: "shortcut.txt", changeType: "modified", mimeType: "text/plain" }),
+    ])
   })
 
   test("commits only the selected files and refreshes the snapshot", async () => {
@@ -214,7 +379,7 @@ describe("DiffStore", () => {
   test("refreshSnapshot reports origin presence before the first commit", async () => {
     const repoRoot = await createRepo()
     tempDirs.push(repoRoot)
-    await run(["git", "remote", "add", "origin", "https://github.com/example/sample-project.git"], repoRoot)
+    await run(["git", "remote", "add", "origin", "https://github.com/example/sample-repo.git"], repoRoot)
     await writeFile(path.join(repoRoot, "poem.md"), "rose\n", "utf8")
 
     const store = new DiffStore(repoRoot)
@@ -225,7 +390,7 @@ describe("DiffStore", () => {
       status: "ready",
       branchName: "main",
       hasOriginRemote: true,
-      originRepoSlug: "example/sample-project",
+      originRepoSlug: "example/sample-repo",
     })
   })
 
@@ -520,10 +685,10 @@ describe("DiffStore", () => {
     await run(["git", "add", "."], repoRoot)
     await run(["git", "commit", "-m", "init"], repoRoot)
     await run(["git", "remote", "add", "origin", "git@github.com:acme/repo.git"], repoRoot)
-    await run(["git", "remote", "add", "github-desktop-jane", "git@github.com:jane/repo.git"], repoRoot)
+    await run(["git", "remote", "add", "github-desktop-collaborator", "git@github.com:collaborator/repo.git"], repoRoot)
     await run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], repoRoot).catch(() => {})
     await run(["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], repoRoot).catch(() => {})
-    await run(["git", "update-ref", "refs/remotes/github-desktop-jane/feature/pr-branch", "HEAD"], repoRoot)
+    await run(["git", "update-ref", "refs/remotes/github-desktop-collaborator/feature/pr-branch", "HEAD"], repoRoot)
     await run(["git", "update-ref", "refs/remotes/origin/feature/pr-branch", "HEAD"], repoRoot)
     await run(["git", "update-ref", "refs/remotes/origin/feature/non-pr", "HEAD"], repoRoot)
 
@@ -535,10 +700,10 @@ describe("DiffStore", () => {
           title: "PR branch",
           head: {
             ref: "feature/pr-branch",
-            label: "jane:feature/pr-branch",
+            label: "collaborator:feature/pr-branch",
             repo: {
-              clone_url: "git@github.com:jane/repo.git",
-              full_name: "jane/repo",
+              clone_url: "git@github.com:collaborator/repo.git",
+              full_name: "collaborator/repo",
             },
           },
           base: {
@@ -558,14 +723,14 @@ describe("DiffStore", () => {
 
       const result = await store.listBranches({ projectPath: repoRoot })
       expect(result.pullRequests.some((entry) => entry.prNumber === 42)).toBe(true)
-      expect(result.remote.some((entry) => entry.remoteRef === "github-desktop-jane/feature/pr-branch")).toBe(false)
+      expect(result.remote.some((entry) => entry.remoteRef === "github-desktop-collaborator/feature/pr-branch")).toBe(false)
       expect(result.remote.some((entry) => entry.remoteRef === "origin/feature/pr-branch")).toBe(false)
       expect(result.remote.some((entry) => entry.remoteRef === "origin/feature/non-pr")).toBe(true)
     } finally {
       globalThis.fetch = originalFetch
     }
-
-
+    // ~18 sequential git subprocesses put the baseline at 3-4s on a warm
+    // machine — the default 5s ceiling flakes under any load.
   }, 20_000)
 
   test("checkoutBranch creates a local tracking branch from a remote branch", async () => {

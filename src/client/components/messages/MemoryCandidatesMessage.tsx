@@ -1,5 +1,7 @@
-
-
+// Review cards for capture-surfaced memory candidates (SPEC §4.1, §4.10).
+// Rendered in-transcript, one card per candidate the forced capture hook
+// proposed after a turn. Accept / Edit / Dismiss talk to the memory HTTP API
+// directly and reconcile against the shared memory store.
 import { useEffect, useMemo, useState } from "react"
 import { AlertTriangle, Check, Loader2, Pencil, RefreshCw, ShieldCheck, Undo2, X, Zap } from "lucide-react"
 import type { HydratedTranscriptMessage } from "../../../shared/types"
@@ -88,7 +90,9 @@ function LiveMemoryCandidatesMessage({ message }: Props) {
   const itemsById = useMemo(() => new Map(items.map((item) => [item.id, item])), [items])
   const hasMissingCandidate = message.candidates.some((candidate) => !itemsById.has(candidate.id))
 
-
+  // The store may already be hydrated before a post-turn capture finishes.
+  // Refresh once so an id-only transcript row can resolve the newly created
+  // candidate. A still-missing id after that refresh is a dismissed tombstone.
   useEffect(() => {
     if (status !== "ready" || !hasMissingCandidate || refreshAttempted) return
     setRefreshAttempted(true)
@@ -104,7 +108,7 @@ function LiveMemoryCandidatesMessage({ message }: Props) {
         const liveCandidate = itemsById.get(candidate.id)
         if (liveCandidate) {
           return (
-
+            // Birth move: each capture rises into the stream, siblings stagger.
             <RiseIn key={candidate.id} freshAt={message.timestamp} delay={index * 0.12}>
               <MemoryCandidateCard
                 candidate={liveCandidate}
@@ -157,7 +161,13 @@ function ResolvedCandidate({ resolved, id }: { resolved: Exclude<ResolvedState, 
   )
 }
 
-
+/**
+ * The post-decision card is still a monitoring surface: what exactly did I
+ * just admit? Expand to re-read the accepted text, and "Undo accept" is the
+ * one-click inverse (back to the review lane; a revision's archived target
+ * comes back with it). The inverse refuses if the item was edited after
+ * acceptance — that rollback belongs to the Board's history.
+ */
 function AcceptedCandidateCard({
   candidate,
   surface,
@@ -178,8 +188,8 @@ function AcceptedCandidateCard({
     try {
       await runCandidateMutation(async () => {
         await memoriesApi.revertAutoAccept(candidate.id, { sessionId: chatId, surface })
-
-
+        // Back to candidate: the canonical store makes every mounted review
+        // and Board destination flip in the same render.
         await loadAll()
       }, onChanged)
     } catch (err) {
@@ -246,8 +256,8 @@ function AutoAppliedCard({
     try {
       await runCandidateMutation(async () => {
         await memoriesApi.revertAutoAccept(candidate.id, { sessionId: chatId, surface })
-
-
+        // The item is a candidate again (and a reverted revision's target is
+        // active again) — refetch so this card flips back to a pending review.
         await loadAll()
       }, onChanged)
     } catch (err) {
@@ -260,7 +270,7 @@ function AutoAppliedCard({
   return (
     <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
       <div className="flex flex-wrap items-center gap-2">
-
+        {/* Delegation move: the stamp pops into place — quick and confident. */}
         <StampIn freshAt={freshAt}>
           <span className="inline-flex items-center gap-1 rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[11px] font-medium text-violet-700 dark:text-violet-300">
             <Zap className="h-3 w-3" />
@@ -297,15 +307,15 @@ export function MemoryCandidateCard({
   surface = "chat_gate",
 }: {
   candidate: MemoryItem
-
+  /** Delegating/Auto mode applied this proposal without asking. */
   autoApplied?: boolean
-
+  /** This card re-surfaces an EARLIER, still-unreviewed proposal. */
   resurfaced?: boolean
-
+  /** The transcript entry's timestamp — gates the one-shot entrance moves. */
   freshAt?: string | number
   onDismissed?: () => void
   onChanged?: () => Promise<void> | void
-
+  /** Only an explicitly reopened Candidate gate exposes this inverse. */
   allowRestore?: boolean
   surface?: MemoryControlSurface
 }) {
@@ -313,8 +323,8 @@ export function MemoryCandidateCard({
   const upsertLocal = useMemoryStore((s) => s.upsertLocal)
   const removeLocal = useMemoryStore((s) => s.removeLocal)
   const loadAll = useMemoryStore((s) => s.loadAll)
-
-
+  // A REVISION proposal (self-evolution M3/M4): accepting it also archives the
+  // memory it replaces — the card must say so before the user commits.
   const revisionOf = candidate.revisionOf
 
   const { chatId, projectId } = useTranscriptChatContext()
@@ -322,19 +332,23 @@ export function MemoryCandidateCard({
   const [editing, setEditing] = useState(false)
   const [draftContent, setDraftContent] = useState(candidate.content)
   const [draftDetail, setDraftDetail] = useState(candidate.detail ?? "")
-
-
+  // The captured snapshot is immutable; track the latest saved text so the card
+  // reflects an edit after Save instead of snapping back to the original (MSG-3).
   const [displayContent, setDisplayContent] = useState(candidate.content)
   const [displayDetail, setDisplayDetail] = useState(candidate.detail)
   const [busy, setBusy] = useState<"accept" | "dismiss" | "restore" | "save" | "sanitize" | null>(null)
   const [error, setError] = useState<string | null>(null)
-
-
+  // A pending LLM redaction proposal: content shown in the edit box, detail
+  // carried along, redactions listed so the user sees what was replaced.
   const [sanitized, setSanitized] = useState<{
     redactions: Array<{ placeholder: string; kind: string }>
   } | null>(null)
 
-
+  // Reconcile against the live store: if this item was already resolved
+  // elsewhere (Board, or a reload of a prior session), prefer that truth.
+  // 'archived' means it WAS accepted and later archived (a candidate can only
+  // reach archived through active) — rendering that as "dismissed" rewrote
+  // the review's history.
   const resolved: ResolvedState =
     storeStatus === "active" || storeStatus === "archived"
       ? "accepted"
@@ -355,14 +369,16 @@ export function MemoryCandidateCard({
     setError(null)
     try {
       const trimmed = draftContent.trim()
-
-
+      // Editing (incl. a sanitize proposal) with an empty box must NOT silently
+      // fall back to the original text — that would store the pre-edit content,
+      // and for a sensitive candidate the still-unredacted original (MSG-12).
       if ((editing || sanitized) && !trimmed) {
         setError("Memory content can't be empty.")
         return
       }
-
-
+      // Changing the scope to project/session requires the matching id, or the
+      // server 400s and the candidate can never be accepted into that scope
+      // (MSG-1). Bind to the chat this candidate was captured in / its project.
       const activation = buildCandidateActivationScopePatch({
         scope,
         contextProjectId: projectId,
@@ -375,16 +391,16 @@ export function MemoryCandidateCard({
         return
       }
       const patch = activation.patch
-
-
+      // Apply both edited fields in the same act. An empty detail is explicit:
+      // it erases the old value instead of preserving a sensitive original.
       if ((editing || sanitized) && trimmed) {
         Object.assign(patch, buildCandidateDraftPatch(trimmed, draftDetail))
       }
       const updated = await runCandidateMutation(async () => {
         const result = await memoriesApi.update(candidate.id, patch, { surface })
         upsertLocal(result)
-
-
+        // Accepting a revision archived its target server-side — refetch so
+        // the replaced memory leaves every active list in the same beat.
         if (revisionOf) await loadAll()
         return result
       }, onChanged)
@@ -397,7 +413,8 @@ export function MemoryCandidateCard({
     }
   }
 
-
+  // DG1 "confirm" branch: ask the LLM for a redacted version and stage it in
+  // the edit box for review — the user still decides whether it becomes active.
   async function handleSanitize() {
     setBusy("sanitize")
     setError(null)
@@ -469,8 +486,9 @@ export function MemoryCandidateCard({
   }
 
   if (resolved !== "pending") {
-
-
+    // Auto mode applied this proposal without asking — monitoring stays on:
+    // the card says so and offers the one-click inverse. A revert puts the
+    // item back into the review lane, and this card becomes a pending review.
     if (autoApplied && storeStatus === "active") {
       return <AutoAppliedCard candidate={candidate} revisionOf={revisionOf} freshAt={freshAt} surface={surface} onChanged={onChanged} />
     }
@@ -526,8 +544,9 @@ export function MemoryCandidateCard({
       ) : null}
 
       {revisionOf ? (
-
-
+        // Two clean versions, stacked — readable prose beats a red/green line
+        // diff (user decision 2026-07-16). While editing, only the current
+        // version stays as reference; the textarea is the proposed text.
         <div className="mt-2 flex flex-col gap-1.5">
           <div className="rounded-lg border border-border bg-muted/40 px-3 py-2">
             <p className="text-[10px] font-medium text-muted-foreground">
@@ -592,7 +611,7 @@ export function MemoryCandidateCard({
               </Button>
             </div>
           </div>
-        ) : revisionOf ? null : (
+        ) : revisionOf ? null : ( // for revisions the "proposed" card above carries the text
           <p className="whitespace-pre-wrap text-sm text-foreground">{displayContent}</p>
         )}
       </div>

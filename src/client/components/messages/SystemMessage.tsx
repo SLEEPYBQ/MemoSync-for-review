@@ -47,7 +47,7 @@ function PillSection({ title, items, icon, getIcon }: PillSectionProps) {
   )
 }
 
-
+/** Parse MCP tool name: "mcp__server__tool" → { server: "server", tool: "tool" } */
 function parseMcpTool(name: string): { server: string; tool: string } | null {
   const match = name.match(/^mcp__([^_]+)__(.+)$/)
   if (!match) return null

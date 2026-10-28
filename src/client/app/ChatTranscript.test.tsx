@@ -17,7 +17,9 @@ import {
 
 const ROW_WRAPPER_CLASS = "mx-auto w-full max-w-[800px] pb-5"
 
-
+// Renders the same pipeline the app uses: buildResolvedTranscriptRows feeding
+// ChatTranscriptRow inside the per-row wrapper — keep in sync with
+// ChatTranscriptViewport's renderItem.
 function renderTranscript(messages: HydratedTranscriptMessage[]) {
   const rows = buildResolvedTranscriptRows(messages, {
     isLoading: false,
@@ -818,8 +820,9 @@ describe("areChatTranscriptRowPropsEqual", () => {
   })
 
   test("a preview card going stale re-renders the row", () => {
-
-
+    // Regression: this field was missing from the live comparator, so an
+    // undecided memory_preview card kept its actionable look after newer
+    // turn entries had passed it by.
     expect(
       areChatTranscriptRowPropsEqual(singleRowProps(), singleRowProps({ isStaleMemoryPreview: true }))
     ).toBe(false)

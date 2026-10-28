@@ -120,7 +120,7 @@ export interface RawTlxActivityResponse<TActivity extends RawTlxActivity> {
   ratings: RawTlxRatings
 }
 
-
+/** Self-describing response for one activity, suitable for independent submission and resume. */
 export interface StudyRawTlxActivityResponse<TActivity extends RawTlxActivity = RawTlxActivity>
   extends RawTlxActivityResponse<TActivity> {
   instrument: typeof RAW_TLX_INSTRUMENT_ID
@@ -140,13 +140,13 @@ export interface StudySusResponse {
   ratings: SusRatings
 }
 
-
+/** Raw TLX uses an equal-weight mean; it does not include NASA-TLX pairwise weighting. */
 export function calculateRawTlxScore(ratings: RawTlxRatings): number {
   const total = RAW_TLX_DIMENSION_IDS.reduce((sum, dimension) => sum + ratings[dimension], 0)
   return total / RAW_TLX_DIMENSION_IDS.length
 }
 
-
+/** Standard SUS scoring: odd items subtract 1, even items invert from 5, then multiply by 2.5. */
 export function calculateSusScore(ratings: SusRatings): number {
   const contribution = SUS_ITEM_IDS.reduce((sum, itemId, index) => {
     const rating = ratings[itemId]

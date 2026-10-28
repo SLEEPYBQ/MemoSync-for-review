@@ -7,7 +7,7 @@ import { claudeProjectFolderName, claudeSessionFileExists } from "./claude-sessi
 describe("claudeProjectFolderName", () => {
   test("encodes every non-alphanumeric char as '-' (matches the CLI's on-disk folders)", () => {
     expect(claudeProjectFolderName("/root/Kanna/test")).toBe("-root-Kanna-test")
-    expect(claudeProjectFolderName("/Users/user/Developer/my_project")).toBe("-Users-user-Developer-my-project")
+    expect(claudeProjectFolderName("/Users/user/Projects/my_project")).toBe("-Users-user-Projects-my-project")
     expect(claudeProjectFolderName("/tmp/my.app dir")).toBe("-tmp-my-app-dir")
   })
 })

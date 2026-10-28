@@ -1,31 +1,33 @@
-
-
+// Engine-neutral memory capability specs. The business logic is written ONCE
+// here; per-engine adapters (claude-adapter.ts, codex-adapter.ts) compile these
+// into each engine's native tool shape. This is the "register once, works on
+// every engine" seam the project is built around.
 import { z } from 'zod';
 import type { MemoryService } from './index';
 import type { CaptureService } from './capture';
 import type { MemoryItem } from './types';
 
-
+/** Per-turn context threaded into a tool handler. */
 export interface MemoryToolContext {
-
+  /** Active repo/project id (used to scope project memories). */
   projectId?: string;
-
+  /** Active conversation/session id (provenance for proposed memories). */
   sessionId?: string;
-
+  /** Current user-visible turn; required by Claude's turn-local capture ledger. */
   turn?: number;
-
+  /** Engine executing the tool; only Claude review capture enables the ledger. */
   engine?: string;
-
+  /** Server-confirmed working memory for this turn; omitted by legacy callers. */
   allowedMemoryIds?: readonly string[];
 }
 
-
+/** Normalized tool result; adapters translate this into each engine's shape. */
 export interface MemoryToolResult {
   text: string;
   isError?: boolean;
 }
 
-
+/** An engine-neutral tool definition. `schema` is a Zod raw shape (object props). */
 export interface MemoryToolSpec {
   name: string;
   description: string;
@@ -33,7 +35,7 @@ export interface MemoryToolSpec {
   handler(args: Record<string, unknown>, ctx: MemoryToolContext): Promise<MemoryToolResult> | MemoryToolResult;
 }
 
-
+/** Format ranked/listed memories the way the model should see them (short forms). */
 export function formatMemoriesForModel(items: Array<{ id: string; scope: string; type: string; content: string; detail?: string }>): string {
   return items.map((m) => `[${m.id}] (${m.scope} · ${m.type}) ${m.content}${m.detail ? ' [+detail]' : ''}`).join('\n');
 }
@@ -51,16 +53,32 @@ function pendingCandidateReviewTiming(items: MemoryItem[], currentSessionId?: st
     : 'It remains pending in its existing Memory review / Memory Board.';
 }
 
-
+/**
+ * Build the memory tools bound to a MemoryService. Returned specs are
+ * engine-neutral; feed them to the Claude / Codex adapters.
+ *
+ * Capture is dual-channel (REDESIGN D3): the forced coordinator hook stays as
+ * the floor, and — when a CaptureService is provided — the session agent gets
+ * propose_memory back: it proposes with full in-context judgment, but every
+ * proposal goes through the SAME routing gate and lands as a review candidate,
+ * never directly active. There is still deliberately NO search_memory tool:
+ * the injected index IS the complete memory surface for a turn, so the receipt
+ * the user sees never under-reports what the agent can reach. The model's only
+ * recall path is load_memory_detail over already-injected ids.
+ */
 export function buildMemoryToolSpecs(
   memory: MemoryService,
   opts?: {
     capture?: CaptureService | null;
-
-
+    /**
+     * A pending Candidate already exists, so no new memory was created.
+     * Claude's review flow reports the real pending surface: this chat's next
+     * Candidate gate when provenance matches, otherwise the existing Memory
+     * review / Memory Board. The legacy default keeps other integrations unchanged.
+     */
     pendingCandidateTiming?: 'immediate' | 'next_turn';
-
-
+    /** Fires when an agent proposal lands as candidate(s) — the transcript
+     * review card rides on this (the hook channel appends its own). */
     onProposed?: (created: import('./types').MemoryItem[], info?: { resurfaced?: boolean }) => void;
   },
 ): MemoryToolSpec[] {
@@ -186,7 +204,7 @@ export function buildMemoryToolSpecs(
   ];
 }
 
-
+/** Execute a memory tool by name (used by the Codex item/tool/call dispatcher). */
 export async function dispatchMemoryTool(
   specs: MemoryToolSpec[],
   name: string,

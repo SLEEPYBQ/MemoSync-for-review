@@ -190,7 +190,7 @@ export function createStudyOpeningAttachmentSnapshotStore(snapshotRootInput: str
         kind: snapshot.kind,
         displayName: snapshot.displayName,
         absolutePath: exactPath,
-
+        // Claude sees only the immutable server path in either path field.
         relativePath: exactPath,
         contentUrl: "",
         mimeType: snapshot.mimeType,
@@ -249,7 +249,7 @@ export function createStudyOpeningAttachmentSnapshotStore(snapshotRootInput: str
         }
       } finally {
         if (fd !== null) closeSync(fd)
-        try { unlinkSync(temporaryPath) } catch {   }
+        try { unlinkSync(temporaryPath) } catch { /* already cleaned */ }
       }
       const persisted = verify([snapshot])
       if (!persisted.ok) throw new Error(persisted.error)

@@ -80,7 +80,11 @@ while (true) {
   if (shouldRestartCliProcess(result.code, result.signal)) {
     const isStartupUpdate = result.signal === null && result.code === CLI_STARTUP_UPDATE_RESTART_EXIT_CODE
 
-
+    // Guard against infinite restart loops: if two consecutive startup-update
+    // restarts happen it means the installed update did not change the binary
+    // that actually runs (e.g. when launched via `bunx`, which maintains its
+    // own package cache). Skip the self-update on the next spawn so the child
+    // proceeds normally instead of trying to update again.
     if (isStartupUpdate && lastStartupUpdateRestart) {
       console.log(`${LOG_PREFIX} update installed but the running binary did not change, continuing with current version`)
       skipUpdateOnNextChild = true

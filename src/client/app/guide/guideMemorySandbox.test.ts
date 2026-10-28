@@ -54,11 +54,11 @@ describe("installGuideMemorySandbox", () => {
 
     uninstall = installGuideMemorySandbox()
     const accepted = { ...DEMO_MEMORY_ITEMS[0]!, content: "Accepted inside the Guide Board" }
-
-
+    // The Guide-local HTTP controller publishes the accepted collection before
+    // MemoryBoardPage applies the same item through its production local seam.
     uninstall.setItems(DEMO_MEMORY_ITEMS.map((item) => item.id === accepted.id ? accepted : item))
-
-
+    // This is the observable local-store seam used by MemoryBoardPage after
+    // its production Accept request succeeds.
     useMemoryStore.getState().upsertLocal(accepted)
     expect(useMemoryStore.getState().items.find((item) => item.id === accepted.id)?.content).toBe(
       "Accepted inside the Guide Board",
@@ -82,8 +82,8 @@ describe("installGuideMemorySandbox", () => {
     uninstall = installGuideMemorySandbox()
     const dismissedId = "M-05"
     uninstall.setItems(DEMO_MEMORY_ITEMS.filter((item) => item.id !== dismissedId))
-
-
+    // This is the observable local-store seam used by MemoryBoardPage after
+    // its production Dismiss request succeeds.
     useMemoryStore.getState().removeLocal(dismissedId)
     expect(useMemoryStore.getState().items.some((item) => item.id === dismissedId)).toBe(false)
 

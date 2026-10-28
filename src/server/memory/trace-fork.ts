@@ -1,12 +1,15 @@
-
-
+// Fork-based trace (user design 2026-08-05): instead of a sidecar LLM call
+// that rebuilds the turn as a fresh prompt (whose prefix never hits any
+// cache), fork the just-finished engine session and ask the audit question on
+// top of the trajectory the server already paid for. Mechanics live in
+// fork-query.ts (shared with capture extraction and checkup prewarm).
 import { runForkQuery } from "./fork-query"
 import type { MemoryItem } from "./types"
 
 export interface ForkTraceInput {
-
+  /** The just-finished Claude session's resume token. */
   sessionToken: string
-
+  /** The project workspace the session ran in (resume needs the same cwd). */
   localPath: string
   usedMemories: MemoryItem[]
   timeoutMs?: number
@@ -14,7 +17,11 @@ export interface ForkTraceInput {
 
 const FORK_TRACE_TIMEOUT_MS = 90_000
 
-
+/**
+ * Run the trace question on a fork of the main session. Returns the raw JSON
+ * object (same shape the sidecar expects) or null on ANY failure — the caller
+ * falls back to the sidecar; this path must never take the turn loop down.
+ */
 export async function runForkTrace(input: ForkTraceInput): Promise<Record<string, unknown> | null> {
   if (!input.sessionToken || input.usedMemories.length === 0) return null
   const prompt = [

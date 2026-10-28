@@ -40,30 +40,33 @@ function getStructuredToolResultFromDebug(entry: Extract<TranscriptEntry, { kind
 }
 
 export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedTranscriptMessage[] {
-  const pendingToolCalls = new Map<string, { hydrated: HydratedToolCall; normalized: NormalizedToolCall }>()
+  const pendingToolCalls = new Map<string, { hydrated: HydratedToolCall; normalized: NormalizedToolCall; turn: number }>()
   const messages: HydratedTranscriptMessage[] = []
+  let toolTurn = 0
 
-
+  // Memory-preview decisions and relevance predictions are separate
+  // append-only entries; fold each into its matching memory_preview message
+  // so a preview renders as one card.
   const previewDecisions = new Map<string, { decision: Extract<TranscriptEntry, { kind: "memory_preview_decision" }>["decision"]; auto?: boolean; selectedIds?: string[]; expectedUses?: Array<{ id: string; expectedUse: string }> }>()
   const previewRelevance = new Map<string, { revision: number; relevant: Array<{ id: string; why: string }>; expectedUses?: Array<{ id: string; expectedUse: string }>; error?: string }>()
   const previewUpdates = new Map<string, Extract<TranscriptEntry, { kind: "memory_preview_update" }>>()
   const previewRefreshing = new Set<string>()
   const previewRefreshVersions = new Map<string, number>()
-
-
+  // Step-one gates fold the same way: results and decisions ride their parent
+  // container so each gate renders as one card.
   const proposalsDecisions = new Map<string, Extract<TranscriptEntry, { kind: "memory_proposals_decision" }>["decision"]>()
   const proposalsResults = new Map<string, Extract<TranscriptEntry, { kind: "memory_proposals_result" }>["candidates"]>()
   const checkupResults = new Map<string, Extract<TranscriptEntry, { kind: "memory_checkup_result" }>["suggestions"]>()
   const checkupFailedKinds = new Map<string, NonNullable<Extract<TranscriptEntry, { kind: "memory_checkup_result" }>["failedKinds"]>>()
   const checkupDecisions = new Map<string, Extract<TranscriptEntry, { kind: "memory_checkup_decision" }>["decision"]>()
   const transferDecisions = new Map<string, Extract<TranscriptEntry, { kind: "memory_transfer_decision" }>["decision"]>()
-
-
+  // Streaming: result entries are cumulative (each carries everything so
+  // far); the last one wins, and only a `done` result clears the scan state.
   const transferResults = new Map<string, Extract<TranscriptEntry, { kind: "memory_transfer_result" }>["suggestions"]>()
   const transferResultsDone = new Set<string>()
   const checkupResetStates = new Map<string, "waiting" | "pending">()
-
-
+  // Audit skeletons: a pending memory_trace is superseded by the terminal
+  // entry for the same turn — only the last entry per turn renders.
   const settledTraceTurns = new Set<number | undefined>()
   const interruptResolutions = new Map<string, { action?: "content_fixed" | "usage_correction" | "removed_only"; correction?: string; selectedIds: string[]; enforced?: boolean }>()
   for (const entry of entries) {
@@ -106,8 +109,8 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
         checkupResults.delete(entry.checkupId)
         checkupFailedKinds.delete(entry.checkupId)
         checkupDecisions.delete(entry.checkupId)
-
-
+        // Step 2 waits while an EARLIER stage is being reworked; a direct
+        // Step 2 reopen goes straight to the scanning skeleton.
         checkupResetStates.set(entry.checkupId, entry.from === "checkup" ? "pending" : "waiting")
       }
       if ((entry.from === "proposals" || entry.openingReviewId) && entry.proposalsId) {
@@ -123,6 +126,7 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
   for (const entry of entries) {
     switch (entry.kind) {
       case "user_prompt":
+        if (!entry.steered) toolTurn++
         messages.push({
           ...createBaseMessage(entry),
           kind: "user_prompt",
@@ -159,8 +163,10 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
         })
         break
       case "tool_call": {
+        const previous = pendingToolCalls.get(entry.tool.toolId)
+        if (previous?.turn === toolTurn && !("rawResult" in previous.hydrated)) break
         const toolCall = hydrateToolCall(entry)
-        pendingToolCalls.set(entry.tool.toolId, { hydrated: toolCall, normalized: entry.tool })
+        pendingToolCalls.set(entry.tool.toolId, { hydrated: toolCall, normalized: entry.tool, turn: toolTurn })
         messages.push(toolCall)
         break
       }
@@ -239,7 +245,7 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
         })
         break
       case "memory_trace":
-
+        // Skip a pending skeleton whose terminal entry already landed.
         if (entry.status === "pending" && settledTraceTurns.has(entry.turn)) break
         messages.push({
           ...createBaseMessage(entry),
@@ -305,8 +311,10 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
           checkupId: entry.checkupId,
           openingReviewId: entry.openingReviewId,
           turn: entry.turn,
-
-
+          // Pending only until the result entry lands (skeleton state).
+          // A Step-1 reset deliberately parks Step 2 in WAITING. Do not let
+          // the parent's historical `pending:true` make it look as if the
+          // checkup has already started.
           pending:
             resetState === "pending"
             || (resetState === undefined && entry.pending && !checkupResults.has(entry.checkupId)),
@@ -325,8 +333,8 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
           openingReviewId: entry.openingReviewId,
           suggestions: transferResults.get(entry.transferId) ?? entry.suggestions,
           turn: entry.turn,
-
-
+          // Pending until the live search's FINAL result lands — streamed
+          // partial results render as rows with the scan still running.
           pending: entry.pending && !transferResultsDone.has(entry.transferId),
           decision: transferDecisions.get(entry.transferId),
         })
@@ -356,7 +364,7 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
       case "memory_transfer_result":
       case "memory_transfer_decision":
       case "memory_preparation_reset":
-
+        // Folded into the matching parent message above — no row of its own.
         break
       default:
         messages.push({

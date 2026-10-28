@@ -38,7 +38,7 @@ const DECODE_REPLY = {
   note: 'Generalized the underlying lesson.',
 };
 
-
+/** Stub that answers the encode and decode prompts differently and records both. */
 function dispatchingStub(replies: { encode?: Record<string, unknown>; decode?: Record<string, unknown> }) {
   const seen: { encode?: DeepSeekJsonRequest; decode?: DeepSeekJsonRequest } = {};
   const callJson = async (req: DeepSeekJsonRequest) => {
@@ -144,7 +144,7 @@ describe('transfer decode (abstract rule → target)', () => {
     const bound = await svc.decode(encoding, { target: { scope: 'personal', existing } });
     expect(bound.landing).toEqual({ route: 'reinforces', targetId: 'M-20', targetContent: 'pnpm is the package manager' });
 
-
+    // A hallucinated id (not in the short-list) degrades to a plain "new" landing.
     const halluc = await svc.decode(encoding, {
       target: { scope: 'personal', existing: [{ id: 'M-99', content: 'unrelated' }] },
     });
@@ -195,7 +195,7 @@ describe('transfer propose (encode → decode chain, Board compat)', () => {
     const out = await svc.propose(mem(), { scope: 'personal' }, { projectTitle: 'Alpha' });
     expect(seen.encode).toBeDefined();
     expect(seen.decode).toBeDefined();
-    expect(seen.decode!.user).toContain(ENCODE_REPLY.rule);
+    expect(seen.decode!.user).toContain(ENCODE_REPLY.rule); // decode consumed the encoding
     expect(out.verdict).toBe('rewrite');
     expect(out.portable).toBe(ENCODE_REPLY.rule);
     expect(out.applicability).toBe(ENCODE_REPLY.applicability);
@@ -232,7 +232,7 @@ describe('transfer propose (encode → decode chain, Board compat)', () => {
     const svc = createTransferService({ callJson });
     await svc.propose(mem(), { scope: 'personal', existing: [{ id: 'M-30', content: 'existing personal rule' }] });
     expect(seen.decode!.user).toContain('existing personal rule');
-    expect(seen.encode!.user).not.toContain('existing personal rule');
+    expect(seen.encode!.user).not.toContain('existing personal rule'); // encoder never sees the target
   });
 
   it('propagates LLM failures (caller decides the fallback)', async () => {

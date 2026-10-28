@@ -193,7 +193,8 @@ describe("study prompt project admission", () => {
       content: copied,
     })).toBeNull()
 
-
+    // The QA exception skips only overlap scoring. It does not bypass the
+    // guide/brief receipt or project/lifecycle authority.
     expect(gate(new Set(), true)({ chatId: "chat-apartment", content: copied })).toContain("study guide")
     expect(gate(undefined, true)({ chatId: "chat-car", content: copied })).toContain("Apartment rentals")
   })

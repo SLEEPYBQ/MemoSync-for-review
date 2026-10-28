@@ -1,13 +1,15 @@
-
-
+// A single memory as an operable board card (SPEC §4.9): candidates get an
+// amber accent + sensitive badge, scoped (active) cards get a scope tint and
+// are natively draggable for drag-to-rescope. Clicking the card (outside its
+// footer actions) opens the detail panel.
 import type { DragEvent, MouseEvent, ReactNode } from "react"
 import { ShieldAlert } from "lucide-react"
 import type { MemoryItem } from "../../lib/memoriesApi"
 import { formatSidebarAgeLabel } from "../../lib/formatters"
 import { cn } from "../../lib/utils"
 import { Chip, scopeCardClasses, scopeRingClasses } from "./ScopeBadge"
-
-
+// Trace-dot and freshness color maps live in memoryVocab so this card and the
+// MemoryLegend render the exact same swatches (they can no longer drift).
 import { FRESHNESS_CLASSES, TRACE_DOT_CLASSES } from "./memoryVocab"
 
 interface MemoryCardProps {
@@ -19,18 +21,18 @@ interface MemoryCardProps {
   onDragEnd?: (e: DragEvent<HTMLDivElement>) => void
   onClick?: () => void
   footer?: ReactNode
-
+  /** Where the memory binds: the project title (project scope) or the source chat title (session scope). */
   originLabel?: string
-
+  /** Which chat captured it (provenance) — distinct from where it binds. */
   capturedIn?: string
-
+  /** Touched since the user's last board visit — the meta-model diff marker. */
   freshness?: "new" | "changed"
 }
 
 export function MemoryCard({ item, variant, selected, draggable, onDragStart, onDragEnd, onClick, footer, originLabel, capturedIn, freshness }: MemoryCardProps) {
   const age = formatSidebarAgeLabel(Date.parse(item.createdAt) || undefined, Date.now())
   function handleFooterClick(e: MouseEvent<HTMLDivElement>) {
-
+    // Footer buttons handle their own actions; don't also open the panel.
     e.stopPropagation()
   }
 
@@ -45,8 +47,8 @@ export function MemoryCard({ item, variant, selected, draggable, onDragStart, on
       onKeyDown={
         onClick
           ? (e) => {
-
-
+              // Keyboard events from footer actions bubble through the card.
+              // Only activate the card when the card itself has focus.
               if (e.target !== e.currentTarget) return
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault()

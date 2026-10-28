@@ -254,7 +254,7 @@ export function ToolCallMessage({ message, isLoading = false, localPath }: Props
             if (message.isError) {
               return <X className="size-4 text-destructive" />
             }
-
+            // A running tool spins — the shimmer on the label alone is easy to miss.
             if (showLoadingState) {
               return <Loader2 className="size-4 animate-spin text-muted-icon" />
             }
@@ -274,6 +274,7 @@ export function ToolCallMessage({ message, isLoading = false, localPath }: Props
             {description || name}
           </AnimatedShinyText>
         </MetaLabel>
+
 
 
       </ExpandableRow>

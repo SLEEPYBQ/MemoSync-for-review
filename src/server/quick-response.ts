@@ -122,8 +122,12 @@ export function getClaudeStructuredQueryOptions(
   assertIsolatedClaudeCredentials(runtimeEnv)
   return {
     cwd: args.cwd,
-
-
+    // Honor ANTHROPIC_MODEL (the pilot points the Claude engine at a DeepSeek-
+    // compatible endpoint via ANTHROPIC_BASE_URL/ANTHROPIC_MODEL — see
+    // agent.ts). A hardcoded Anthropic-only id got rejected there, so title /
+    // commit-message generation silently fell back to crude heuristics with no
+    // user-visible reason (BUG AGENT-6). The literal id stays as the default
+    // for a real Anthropic deployment.
     model,
     tools: [],
     systemPrompt: "",
@@ -135,8 +139,8 @@ export function getClaudeStructuredQueryOptions(
     },
     env: runtimeEnv,
     ...(isolated ? { settingSources: [] } : {}),
-
-
+    // Title and commit-message calls are one-shot helpers. Persisting them
+    // creates visible ~/.claude project sessions containing the source prompt.
     persistSession: false,
   }
 }
@@ -172,7 +176,7 @@ export async function runClaudeStructured(args: Omit<StructuredQuickResponseArgs
     try {
       q.close()
     } catch {
-
+      // Ignore close failures on timed-out or failed quick responses.
     }
   }
 }

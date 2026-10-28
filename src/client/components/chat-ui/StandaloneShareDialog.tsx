@@ -55,7 +55,7 @@ export function StandaloneShareDialog({
         </DialogHeader>
         <DialogBody className="space-y-3">
           <div className="flex w-full items-center gap-2 rounded-2xl border border-border bg-muted/40 pl-4 px-3 py-2.5">
-
+            {/* <Globe className="h-4 w-4 flex-shrink-0 text-muted-foreground" /> */}
             <span className="min-w-0 flex-1 truncate font-mono text-sm text-foreground">{shareUrl}</span>
             <button
               type="button"

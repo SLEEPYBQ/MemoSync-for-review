@@ -26,8 +26,8 @@ const buttonVariants = cva(
         icon: "h-9 w-9 rounded-full",
         none: "",
         "icon-sm": "h-5.5 w-5.5 rounded-md",
-
-
+        // Compact card-row actions (memory flow): the button must not outweigh
+        // the 12px content it operates on.
         xs: "h-7 rounded-lg px-2.5 text-xs",
       },
     },

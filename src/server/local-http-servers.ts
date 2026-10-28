@@ -4,8 +4,9 @@ import path from "node:path"
 import { promisify } from "node:util"
 
 const execFileAsync = promisify(execFile)
-
-
+// Cold Next/Turbopack listeners often accept TCP before the first page compile
+// can answer. Keep a bounded but realistic probe; failed probes are not put in
+// the long-lived positive cache, so the next Browser poll can observe readiness.
 const LOCAL_HTTP_SCAN_TIMEOUT_MS = 2_000
 const LOCAL_HTTP_CACHE_TTL_MS = 30_000
 
@@ -224,7 +225,7 @@ export async function listListeningTcpEntries() {
     })
     lsofEntries = parseLsofListeningEntries(stdout)
   } catch {
-
+    // Linux /proc remains available when lsof is absent or incomplete.
   }
   if (process.platform !== "linux") return lsofEntries
   const procEntries = await listProcListeningTcpEntries(new Set(lsofEntries.map((entry) => entry.port)))
@@ -277,14 +278,14 @@ export async function readProcessCwd(pid: number) {
     const cwd = stdout.split("\n").find((line) => line.startsWith("n"))?.slice(1)
     if (cwd) return cwd
   } catch {
-
-
+    // Fall through to /proc on Linux. Debian lsof can omit listeners and cwd
+    // for Next's worker even though the process owns a visible socket.
   }
   if (process.platform === "linux") {
     try {
       return await readlink(`/proc/${pid}/cwd`)
     } catch {
-
+      // Process exit and permission races are normal during discovery.
     }
   }
   return undefined
@@ -306,7 +307,7 @@ async function readParentProcessMap() {
       }
     }
   } catch {
-
+    // Process ancestry is an enrichment only; discovery still works without it.
   }
   return parentByPid
 }
@@ -360,12 +361,12 @@ export async function listLocalHttpServers(options: {
   fetchImpl?: typeof fetch
   projectPath?: string
   projectTerminalRootPids?: number[]
-
-
+  /** Ports to omit — chiefly the app's own serving port, which the in-container
+   * lsof scan would otherwise "discover" as a local server. */
   excludePorts?: number[]
-
+  /** Injectable discovery boundary for deterministic cold-start regressions. */
   listEntries?: () => Promise<ListeningPortEntry[]>
-
+  /** Test/embedding override; production uses the bounded cold-start window. */
   probeTimeoutMs?: number
 } = {}) {
   const fetchImpl = options.fetchImpl ?? fetch

@@ -1,5 +1,17 @@
-
-
+// REAL end-to-end verification: a live Claude model, driven through the
+// production `startClaudeSession`, must READ the versioned boot snapshot
+// (delta-model injection, REDESIGN D1/D2), CALL the registered memory tools
+// (mcp__memory__load_memory_detail / mcp__memory__propose_memory), use the
+// returned content, and cite it. This is NOT a unit test — it makes a real
+// model call, needs your Claude auth (~/.claude), and costs a few tokens:
+//   bun run scripts/e2e-claude-memory.ts
+//
+// The propose_memory routing gate's LLM is STUBBED (route: new) — this script
+// verifies the Claude-side behavior; the gate itself is unit-tested.
+//
+// Isolation: a throwaway temp git workspace (never touches your projects). Auth
+// uses the real ~/.claude (OAuth lives there and isn't portable to a copy); the
+// only side effect is a discardable session-history entry keyed to the temp cwd.
 import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -31,7 +43,8 @@ mem.store.create({
 }, { actor: 'system' })
 mem.store.create({ id: "M-03", content: "The dev server runs on port 5175.", scope: "project", type: "fact", projectId: "testproj" }, { actor: 'system' })
 
-
+// Routing gate with a stubbed LLM: every agent proposal routes "new" —
+// deterministic, so the E2E hinges only on the real model's behavior.
 const capture = createCaptureService({
   memory: mem,
   callJson: async () => ({ decisions: [{ index: 0, route: "new", targetId: null }] }),
@@ -43,7 +56,7 @@ const session = await startClaudeSession({
   onToolRequest: async () => ({}), memory: mem, capture, projectId: "testproj", chatId: "e2e-1",
 })
 
-
+// The boot block is the D1 contract: versioned snapshot + supersession rule.
 const bootBlock = session.memoryPlan?.block ?? ""
 const bootOk =
   session.memoryPlan?.mode === "skills" &&

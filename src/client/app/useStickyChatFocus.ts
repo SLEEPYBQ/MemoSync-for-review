@@ -66,11 +66,12 @@ export function useStickyChatFocus({ rootRef, fallbackRef, enabled, canCancel }:
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return
-
-
+      // Esc during pinyin composition cancels the IME candidate — moving
+      // focus would eat the cancel and teleport the caret.
       if (isImeComposingKeyEvent(event)) return
-
-
+      // A parked preview gate owns Esc (Dismiss turn). This capture-phase
+      // listener runs before the gate's, so bailing here keeps it from
+      // preventDefault-ing Esc away from the gate (BUG CORE-1).
       if (hasPendingPreviewGate(document)) return
 
       const fallback = fallbackRef.current

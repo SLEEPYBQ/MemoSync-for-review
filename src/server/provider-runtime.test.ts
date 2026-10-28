@@ -39,7 +39,7 @@ describe("isolated CLI provider profiles", () => {
         subprocessEnv: {
           ANTHROPIC_MODEL: "claude-opus-4-6",
           GLM_API_KEY: "test-only-key",
-
+          // Even an accidental mock failure cannot reach a real provider or host profile.
           GLM_BASE_URL: "http://127.0.0.1:1",
           CLAUDE_CONFIG_DIR: join(profile, "claude"),
           PATH: "",

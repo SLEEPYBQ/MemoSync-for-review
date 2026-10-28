@@ -1,5 +1,10 @@
-
-
+// HTTP routes for the memory layer — ported from MemoSync's Express router
+// (apps/backend/src/routes/memory.ts) into Kanna's Bun.serve fetch-handler
+// style: a single `handleMemoryRequest(req, url, memory)` that returns a
+// Response for a matched `/api/memories*` route, or `null` to fall through.
+//
+// Envelope matches MemoSync: `{ data }` on success, `{ error: { code, message } }`
+// on failure, so the ported frontend data layer works unchanged.
 import type { MemoryService } from './index';
 import { rankMemories } from './retrieval';
 import type { TransferService } from './transfer';
@@ -7,7 +12,6 @@ import { TRANSFER_DECLINED_PREFIX } from './transfer-detect';
 import type { RevisionService } from './evolution';
 import type { SanitizeService } from './sanitize';
 import type { AttentionKind, MaintenanceService } from './maintenance';
-import type { SummaryService } from './summary';
 import type { ReviseInjectionService } from './revise-injection';
 import type { UsePlanService } from './use-plan';
 import type {
@@ -21,32 +25,27 @@ import type { ExpectedMemoryUse } from '../../shared/types';
 import type { AbstractionLevel, MemoryItem, MemoryScope, MemoryStatus, MemoryType } from './types';
 import { resolveConditionPolicy, type ConditionPolicy } from '../experiment/condition';
 import type { StudySessionAttribution, StudySessionAttributionResolver } from '../study-session-attribution';
-import { StudyTelemetryError } from '../study-telemetry';
-import { CandidateDismissalTransitionError } from './MemoryStore';
+import { CandidateDismissalTransitionError, RevisionConflictError } from './MemoryStore';
 
-
+/** Optional LLM-backed services a caller can plug into the routes. */
 export interface MemoryRouteServices {
   transfer?: TransferService | null;
   sanitize?: SanitizeService | null;
-
+  /** Maintenance actions used by the in-chat Checkup and Board conflict resolution. */
   maintenance?: MaintenanceService | null;
-
-  summary?: SummaryService | null;
-
-  summaryProjectRefusal?: (projectId: string) => string | null;
-
+  /** "Ask agent to revise" on the Step 2 gate (redesign 2026-08-07). */
   reviseInjection?: ReviseInjectionService | null;
-
+  /** Turn-scoped explanation of how the agent should use selected memories. */
   usePlan?: UsePlanService | null;
-
+  /** Audit-row "draft a fix" (redesign 2026-08-07). */
   revision?: RevisionService | null;
-
+  /** Atomic study boundary: returns a release callback, or null once freeze starts. */
   beginStudyMemoryMutation?: () => (() => void) | null;
-
+  /** Durable projection of skipped-but-unresolved Transfer/Checkup transcript rows. */
   boardBacklog?: MemoryBoardBacklogService | null;
-
+  /** Server-authoritative study lifecycle admission for the session-start Board. */
   boardReviewAdmission?: (taskId: string) => string | null;
-
+  /** Full canonical prompt gate before the opening payload can become immutable. */
   openingPromptAdmission?: (input: {
     chatId: string;
     reviewId: string;
@@ -56,30 +55,30 @@ export interface MemoryRouteServices {
     refusal: string | null;
     attachmentSnapshots?: import('../study-opening-attachments').StudyOpeningAttachmentSnapshot[];
   };
-
+  /** Re-prime the private durable opening payload after browser/server restart. */
   resumeOpeningBoardPreparation?: () => void;
-
+  /** True while the active MemoSync task still owns its blocking opening Board. */
   blockingBoardReviewRequired?: () => boolean;
-
+  /** Server-authoritative admission for Audit Enforce/Draft on a visible memory in the active Claude study chat. */
   auditAdmission?: (input: { chatId: string; memoryId: string }) => string | null;
-
+  /** Active task-window identity for formal-study memory interaction telemetry. */
   studySessionAttribution?: StudySessionAttributionResolver;
-
+  /** Active MemoSync preview + chat/project/Visible-Pool admission for one manual selection toggle. */
   workingMemorySelectionAdmission?: (input: {
     chatId: string;
     previewId: string;
     memoryId?: string;
   }) => string | null;
-
+  /** Durable preview-lineage authority for Add/Remove evidence, including delayed delivery after freeze. */
   workingMemoryEvidenceAdmission?: (input: {
     chatId: string;
     previewId: string;
     memoryId: string;
     clientTimestamp: string;
   }) => { attribution: StudySessionAttribution } | { refusal: string };
-
+  /** Server-held pool for the exact active Working Memory preview. */
   workingMemoryPool?: (input: { chatId: string; previewId: string }) => string[] | null;
-
+  /** Server-authoritative expected-use planner for one exact pending preview. */
   workingMemoryUsePlan?: (input: {
     chatId: string;
     previewId: string;
@@ -93,7 +92,7 @@ const MEMORY_TYPES: MemoryType[] = ['constraint', 'preference', 'lesson', 'fact'
 const MEMORY_STATUSES: MemoryStatus[] = ['active', 'candidate', 'archived', 'discarded'];
 const ABSTRACTION_LEVELS: AbstractionLevel[] = ['concrete', 'contextual', 'general'];
 
-
+/** All HTTP mutations are user actions (the UI is the user's surface). */
 const UI_ACTOR = { actor: 'user' as const };
 
 class RouteError extends Error {
@@ -132,7 +131,7 @@ function studyInteractionAttribution(
   policy: ConditionPolicy,
   services: MemoryRouteServices,
 ): Partial<StudySessionAttribution> {
-  if (!policy.studyMode || policy.condition !== 'memosync') {
+  if (!policy.studyMode) {
     return {};
   }
   if (!services.studySessionAttribution) {
@@ -162,8 +161,8 @@ function durableOperationId(input: {
     }
     return input.provided.trim();
   }
-
-
+  // Server fallback for old clients and Board-row restart recovery. Every
+  // phase derives from the same task/surface/domain identity.
   return `control:${input.attribution.taskId}:${input.surface}:${input.controlType}:${input.identity}`;
 }
 
@@ -224,16 +223,16 @@ async function runDurableControlOperation<T>(input: {
         errorClass: error instanceof Error ? error.constructor.name : typeof error,
       });
     } catch {
-
-
+      // A failed telemetry projection must not replace the domain error that
+      // explains why no treatment mutation completed.
     }
     throw error;
   }
   try {
     input.memory.logger.event({ ...base, phase: 'completed' });
   } catch {
-
-
+    // The mutation already succeeded. Returning a 500 would induce a retry;
+    // leave telemetry honestly attempted/unknown and return domain success.
   }
   return result;
 }
@@ -266,7 +265,7 @@ function boardResolutionBase(
   if (body.surface !== 'board') {
     throw new RouteError(400, 'BAD_REQUEST', 'boardResolution requires surface=board');
   }
-  if (!policy.studyMode || policy.condition !== 'memosync') {
+  if (!policy.studyMode) {
     throw new RouteError(404, 'NOT_AVAILABLE', 'Board backlog actions only exist in the MemoSync study condition');
   }
   if (!body.boardResolution || typeof body.boardResolution !== 'object') {
@@ -319,7 +318,10 @@ function assertBoardTransferCommitSnapshot(
   if (body.sourceVersion !== suggestion.sourceVersion) mismatch('sourceVersion');
   if (body.chatId !== trusted.chatId) mismatch('chatId');
   if (typeof suggestion.content !== 'string' || !suggestion.landing) mismatch('snapshot');
-  const landing = suggestion.landing!;
+  const targetScope = body.targetScope;
+  const landing = targetScope === (suggestion.suggestedScope ?? 'project')
+    ? suggestion.landing!
+    : { route: 'new' as const };
   if (body.detail !== suggestion.detail) mismatch('detail');
   if (body.abstractionLevel !== (suggestion.abstractionLevel ?? 'contextual')) mismatch('abstractionLevel');
   if (body.rule !== suggestion.rule) mismatch('rule');
@@ -329,7 +331,6 @@ function assertBoardTransferCommitSnapshot(
   if (body.landingTargetVersion !== landing.targetVersion) mismatch('landingTargetVersion');
   if (body.archiveOriginal === true) mismatch('archiveOriginal');
 
-  const targetScope = body.targetScope;
   if (targetScope === 'project') {
     if (!trusted.projectId || body.targetProjectId !== trusted.projectId || body.targetSessionId !== undefined) {
       mismatch('project destination');
@@ -340,9 +341,6 @@ function assertBoardTransferCommitSnapshot(
     if (body.targetProjectId !== undefined || body.targetSessionId !== undefined) mismatch('personal destination');
   } else {
     mismatch('targetScope');
-  }
-  if (landing.route !== 'new' && targetScope !== (suggestion.suggestedScope ?? 'project')) {
-    mismatch('landing scope');
   }
   const edited = typeof body.content === 'string' && body.content.trim() !== suggestion.content;
   if (body.edited !== edited) mismatch('edited state');
@@ -361,7 +359,11 @@ function resolveBoardRow(
   }
 }
 
-
+/**
+ * Handle an `/api/memories*` request. Returns a Response when the path belongs
+ * to the memory API (matched or a 4xx/5xx for a bad request), or `null` when
+ * the path is not a memory route (so the caller falls through to other handlers).
+ */
 export async function handleMemoryRequest(
   req: Request,
   url: URL,
@@ -371,47 +373,33 @@ export async function handleMemoryRequest(
 ): Promise<Response | null> {
   const { pathname } = url;
   if (pathname !== '/api/memories' && !pathname.startsWith('/api/memories/')) return null;
-
+  if (pathname === '/api/memories/summary' || pathname.startsWith('/api/memories/summary/')) {
+    return fail(404, 'NOT_FOUND', 'route not found');
+  }
 
   const isMutation = req.method !== 'GET';
   const isBoardReviewSurface = pathname === '/api/memories/board-review'
     || pathname === '/api/memories/board-review/prepare'
     || pathname === '/api/memories/board-review/resume';
-  if (isBoardReviewSurface && (policy.condition !== 'memosync' || !policy.studyMode)) {
+  if (isBoardReviewSurface && !policy.studyMode) {
     return fail(404, 'NOT_AVAILABLE', 'the blocking Memory Board only exists in the MemoSync study condition');
   }
-  const isEnforce = pathname === '/api/memories/pay-attention';
-  if (isEnforce && policy.condition !== 'memosync') {
-    return fail(404, 'NOT_AVAILABLE', 'Enforce only exists in the MemoSync condition');
-  }
   const isWorkingMemorySelection = pathname === '/api/memories/working-memory-selection';
-  if (isWorkingMemorySelection && policy.condition !== 'memosync') {
-    return fail(404, 'NOT_AVAILABLE', 'Working Memory selection telemetry only exists in the MemoSync condition');
-  }
-
-
+  // Working-set curation (session exclusions, REDESIGN D7) shares the old
+  // bring-in policy flag — same class of control act, same arms allow it.
   const isWorkingSetCuration = pathname.startsWith('/api/memories/session-exclusions/');
-
+  // Monitoring-act telemetry is pure logging — never condition-locked.
   const isTelemetry = pathname === '/api/memories/ui-monitor'
     || pathname === '/api/memories/surface-exposure';
-
-
-  const isDerivedSummaryRefresh = pathname === '/api/memories/summary/refresh' && req.method === 'POST';
-
-
-  const isAutoSummary = pathname === '/api/memories/summary' || pathname.startsWith('/api/memories/summary/');
-  if (isAutoSummary && policy.condition !== 'auto') {
-    return fail(404, 'NOT_AVAILABLE', `the memory summary surface only exists in the 'auto' condition`);
-  }
   if (isWorkingSetCuration && !policy.bringIn && req.method !== 'GET') {
     return fail(403, 'CONDITION_LOCKED', `working-set curation is not available in the '${policy.condition}' condition`);
   }
-  if (!isWorkingSetCuration && !isTelemetry && !isAutoSummary && isMutation && !policy.boardWritable) {
+  if (!isWorkingSetCuration && !isTelemetry && isMutation && !policy.boardWritable) {
     return fail(403, 'CONDITION_LOCKED', `memory is not user-operable in the '${policy.condition}' condition`);
   }
 
   let releaseStudyMutation: (() => void) | undefined;
-  if (isMutation && !isTelemetry && !isDerivedSummaryRefresh && !isWorkingMemorySelection && services.beginStudyMemoryMutation) {
+  if (isMutation && !isTelemetry && !isWorkingMemorySelection && services.beginStudyMemoryMutation) {
     const release = services.beginStudyMemoryMutation();
     if (!release) {
       return fail(409, 'STUDY_FROZEN', 'The current session is ending. Memory can no longer be changed.');
@@ -420,7 +408,7 @@ export async function handleMemoryRequest(
   }
 
   try {
-
+    // GET /api/memories/search?q=&project=&k=
     if (pathname === '/api/memories/search') {
       if (req.method !== 'GET') return fail(405, 'METHOD_NOT_ALLOWED', 'use GET');
       const q = url.searchParams.get('q') ?? '';
@@ -445,62 +433,9 @@ export async function handleMemoryRequest(
       return ok({ query: q, memories });
     }
 
-
-    if (pathname === '/api/memories/summary') {
-      if (req.method !== 'GET') return fail(405, 'METHOD_NOT_ALLOWED', 'use GET');
-      if (!services?.summary) return fail(503, 'NOT_AVAILABLE', 'summary service is not running (no LLM configured)');
-      const project = url.searchParams.get('project') || undefined;
-      if (!project) return fail(400, 'BAD_REQUEST', 'project is required');
-      const projectRefusal = services.summaryProjectRefusal?.(project);
-      if (projectRefusal) return fail(409, 'STUDY_PROJECT_LOCKED', projectRefusal);
-      return ok(services.summary.get(project));
-    }
-    if (pathname === '/api/memories/summary/refresh') {
-      if (req.method !== 'POST') return fail(405, 'METHOD_NOT_ALLOWED', 'use POST');
-      if (!services?.summary) return fail(503, 'NOT_AVAILABLE', 'summary service is not running (no LLM configured)');
-      const b = await readBody(req);
-      if (typeof b.projectId !== 'string' || !b.projectId.trim()) {
-        throw new RouteError(400, 'BAD_REQUEST', 'projectId is required');
-      }
-      const projectRefusal = services.summaryProjectRefusal?.(b.projectId);
-      if (projectRefusal) return fail(409, 'STUDY_PROJECT_LOCKED', projectRefusal);
-      try {
-        return ok(await services.summary.refresh(b.projectId));
-      } catch (e) {
-        return fail(502, 'LLM_FAILED', e instanceof Error ? e.message : 'summary generation failed');
-      }
-    }
-    if (pathname === '/api/memories/summary/chat') {
-      if (req.method !== 'POST') return fail(405, 'METHOD_NOT_ALLOWED', 'use POST');
-      if (!services?.summary) return fail(503, 'NOT_AVAILABLE', 'summary service is not running (no LLM configured)');
-      const b = await readBody(req);
-      if (typeof b.message !== 'string' || !b.message.trim()) {
-        throw new RouteError(400, 'BAD_REQUEST', 'message is required');
-      }
-      if (typeof b.projectId !== 'string' || !b.projectId.trim()) {
-        throw new RouteError(400, 'BAD_REQUEST', 'projectId is required');
-      }
-      const projectRefusal = services.summaryProjectRefusal?.(b.projectId);
-      if (projectRefusal) {
-        return fail(409, 'STUDY_PROJECT_LOCKED', projectRefusal);
-      }
-      try {
-        return ok(
-          await services.summary.chat(b.message, {
-            projectId: b.projectId,
-            sessionId: typeof b.sessionId === 'string' ? b.sessionId : undefined,
-            eventId: typeof b.eventId === 'string' && b.eventId.trim() ? b.eventId.trim() : undefined,
-          }),
-        );
-      } catch (e) {
-        if (e instanceof StudyTelemetryError) {
-          return fail(e.status, e.status === 422 ? 'TELEMETRY_CONFLICT' : 'TELEMETRY_WRITE_FAILED', e.message);
-        }
-        return fail(502, 'LLM_FAILED', e instanceof Error ? e.message : 'memory chat failed');
-      }
-    }
-
-
+    // GET /api/memories/needs-attention?project= — memories a drift event has
+    // left contested (target of a conflicts_with), each with the item(s) that
+    // supersede it. Backs the Board "needs attention" section (A1). Read-only.
     if (pathname === '/api/memories/needs-attention') {
       if (req.method !== 'GET') return fail(405, 'METHOD_NOT_ALLOWED', 'use GET');
       const project = url.searchParams.get('project') || undefined;
@@ -511,7 +446,10 @@ export async function handleMemoryRequest(
       return ok({ items });
     }
 
-
+    // POST /api/memories/working-memory-selection — semantic evidence for a
+    // participant-observed Add/Remove toggle. Selection remains client-local
+    // until Start; this route records the control act without creating a
+    // second treatment-state store.
     if (pathname === '/api/memories/working-memory-selection') {
       if (req.method !== 'POST') return fail(405, 'METHOD_NOT_ALLOWED', 'use POST');
       const b = await readBody(req);
@@ -527,8 +465,8 @@ export async function handleMemoryRequest(
       if (b.action !== 'add' && b.action !== 'remove') {
         throw new RouteError(400, 'BAD_REQUEST', 'action must be add or remove');
       }
-
-
+      // Outside study mode there is no durable evidence store — keep the
+      // control act in the longitudinal record as a plain logger event.
       if (!policy.studyMode) {
         memory.logger.event({
           type: 'memory.working_memory_selection',
@@ -574,7 +512,9 @@ export async function handleMemoryRequest(
       return ok({ observed: true });
     }
 
-
+    // GET /api/memories/muted — the dismissal fingerprints, joined to their
+    // discarded rows. POST /api/memories/muted/:id/unmute lifts only rows that
+    // report canUnmute; sensitive secure erasure is permanent.
     if (pathname === '/api/memories/muted') {
       if (req.method !== 'GET') return fail(405, 'METHOD_NOT_ALLOWED', 'use GET');
       return ok({ items: memory.store.listMutedProposals() });
@@ -588,7 +528,7 @@ export async function handleMemoryRequest(
       return ok({ ok: true });
     }
 
-
+    // Collection: /api/memories
     if (pathname === '/api/memories') {
       if (req.method === 'GET') {
         const scope = url.searchParams.get('scope') ?? undefined;
@@ -601,13 +541,14 @@ export async function handleMemoryRequest(
           sessionId,
           status: status as MemoryStatus | undefined,
         });
-
+        // Health decoration: the latest trace verdict per item (Board dot).
         const traceLabels = memory.store.latestTraceLabels();
         return ok(
           items.map((m) => {
             let out = traceLabels.has(m.id) ? { ...m, lastTraceLabel: traceLabels.get(m.id) } : m;
-
-
+            // Revision decoration: a pending candidate that proposes to replace
+            // an existing memory carries its target so the review card can show
+            // the before → after contrast.
             if (out.status === 'candidate') {
               const target = memory.store.revisionTargetOf(out.id);
               if (target) out = { ...out, revisionOf: { id: target.id, content: target.content } };
@@ -624,8 +565,8 @@ export async function handleMemoryRequest(
         if (!b.content || !b.scope) {
           throw new RouteError(400, 'BAD_REQUEST', 'content and scope are required');
         }
-
-
+        // `type` stays a DB column (capture still classifies), but the UI no
+        // longer surfaces it — manual creations default to 'fact'.
         if (b.type === undefined) b.type = 'fact';
         assertEnum(b.scope, MEMORY_SCOPES, 'scope');
         assertEnum(b.type, MEMORY_TYPES, 'type');
@@ -668,18 +609,21 @@ export async function handleMemoryRequest(
             provenanceTurn: b.provenanceTurn as number | undefined,
           }, UI_ACTOR),
         });
-
-
+        // Decision first, projection second: syncProjection may ingest a dirty
+        // file and emit derived events — the causal order in the log must be
+        // decision → derived, never the reverse.
         memory.logger.event({ type: 'memory.decision', ...attribution, action: 'create', id: created.id, toScope: created.scope, via });
-
-
+        // Candidates are projected too (Pending review section), so every
+        // create refreshes the file, not just active ones.
         memory.syncProjection(created.projectId);
         return ok(created, 201);
       }
       return fail(405, 'METHOD_NOT_ALLOWED', 'use GET or POST');
     }
 
-
+    // Session exclusion set (REDESIGN D7): GET/PUT
+    // /api/memories/session-exclusions/:sessionId — the ids muted for this
+    // session. Default (no row / []) = everything active injects.
     const exclusionsMatch = pathname.match(/^\/api\/memories\/session-exclusions\/([^/]+)$/);
     if (exclusionsMatch) {
       const sessionId = decodeURIComponent(exclusionsMatch[1]);
@@ -699,7 +643,7 @@ export async function handleMemoryRequest(
       return fail(405, 'METHOD_NOT_ALLOWED', 'use GET or PUT');
     }
 
-
+    // POST /api/memories/find-duplicates { projectId? }
     if (pathname === '/api/memories/find-duplicates' && req.method === 'POST') {
       const b = await readBody(req);
       const projectId = typeof b.projectId === 'string' ? b.projectId : undefined;
@@ -717,7 +661,7 @@ export async function handleMemoryRequest(
       return ok({ duplicates });
     }
 
-
+    // POST /api/memories/merge-duplicates { ids, keepId }
     if (pathname === '/api/memories/merge-duplicates' && req.method === 'POST') {
       const b = await readBody(req);
       const ids = b.ids;
@@ -739,7 +683,9 @@ export async function handleMemoryRequest(
       return ok(memory.store.getById(keepId));
     }
 
-
+    // GET /api/memories/:id/history — the full append-only version/usage log
+    // (SPEC §4.11 option 乙): every change with before→after + actor + session,
+    // and every use.
     const histMatch = pathname.match(/^\/api\/memories\/([^/]+)\/history$/);
     if (histMatch && req.method === 'GET') {
       const id = decodeURIComponent(histMatch[1]);
@@ -748,7 +694,9 @@ export async function handleMemoryRequest(
       return ok({ memory: mem, events: memory.store.getEvents(id) });
     }
 
-
+    // POST /api/memories/:id/revert { toSeq } — roll back to a prior version
+    // (a change event's snapshot). History is preserved; the rollback itself
+    // is appended as a 'revert' event.
     const revertMatch = pathname.match(/^\/api\/memories\/([^/]+)\/revert$/);
     if (revertMatch && req.method === 'POST') {
       const id = decodeURIComponent(revertMatch[1]);
@@ -793,7 +741,16 @@ export async function handleMemoryRequest(
       return ok(reverted);
     }
 
-
+    // POST /api/memories/attention-resolve { kind, id, action, otherId? }
+    // — the gate attention row's domain actions: validated against live
+    // state, logged as memory.attention (never a generic edit).
+    // conflict/revision/stale: action keep|archive. redundant: action
+    // merge|keep with otherId (merge → LLM-drafted merge proposal on the
+    // review lane; keep → similar_to acknowledgment, pair never re-rides).
+    // POST /api/memories/pay-attention { id, sessionId } — audit follow-up ①:
+    // the memory is right, the agent didn't comply. Queue the id; the NEXT
+    // turn's injected list seeds it (source "pay attention") and the boot
+    // reminder names it. Consumed once.
     if (pathname === '/api/memories/pay-attention' && req.method === 'POST') {
       const b = await readBody(req);
       if (typeof b.id !== 'string' || !b.id) throw new RouteError(400, 'BAD_REQUEST', 'id is required');
@@ -806,8 +763,9 @@ export async function handleMemoryRequest(
       const attribution = studyInteractionAttribution(policy, services);
       const item = memory.store.getById(b.id);
       if (!item || item.status !== 'active') throw new RouteError(409, 'CONFLICT', 'only an active memory can be flagged');
-
-
+      // Enforce (renamed from pay-attention, 2026-08-19 D1): entries carry the
+      // violation quote so next run's order can cite the evidence. Legacy
+      // queues of bare id strings still normalize on read.
       const quote = typeof b.quote === 'string' && b.quote.trim() ? b.quote.trim().slice(0, 300) : undefined;
       const operationId = durableOperationId({
         provided: b.operationId,
@@ -843,7 +801,10 @@ export async function handleMemoryRequest(
       return ok({ queued: b.id });
     }
 
-
+    // Session-start Memory Board gate receipt (2026-08-19 E1): the participant
+    // reviewed the library before entering this session. Stored per task in kv.
+    // The pending count is server-authoritative and intentionally ignores every
+    // Board search/project lens: a hidden row cannot make the blocking gate pass.
     if (pathname === '/api/memories/board-review' && req.method === 'GET') {
       const taskId = url.searchParams.get('taskId');
       if (!taskId) throw new RouteError(400, 'BAD_REQUEST', 'taskId is required');
@@ -854,7 +815,7 @@ export async function handleMemoryRequest(
       return ok(services.boardBacklog.reviewState(taskId));
     }
     if (pathname === '/api/memories/board-review/prepare' && req.method === 'POST') {
-      if (!policy.studyMode || policy.condition !== 'memosync') {
+      if (!policy.studyMode) {
         return fail(409, 'BOARD_REVIEW_NOT_ALLOWED', 'Opening Memory Board preparation is only available in the MemoSync study condition');
       }
       const b = await readBody(req);
@@ -873,8 +834,9 @@ export async function handleMemoryRequest(
         return fail(503, 'NOT_AVAILABLE', 'Opening prompt admission is unavailable');
       }
       const attachments = b.attachments ?? [];
-
-
+      // A same-identity response-loss retry is owned by the already-durable
+      // snapshot. Never re-read the now-mutable upload path merely to
+      // acknowledge that exact claim.
       const existingOpeningPrompt = services.boardBacklog.recoverOpeningPrompt(b.taskId);
       let attachmentSnapshots: import('../study-opening-attachments').StudyOpeningAttachmentSnapshot[] | undefined;
       if (!existingOpeningPrompt) {
@@ -940,8 +902,9 @@ export async function handleMemoryRequest(
         : services.boardBacklog.completeReview(b.taskId);
       if (!completion.completed) {
         if (openingPrompt && completion.state.openingPrompt?.phase === 'preparing') {
-
-
+          // A Long-term-ready CAS can be invalidated by a Board mutation even
+          // when no original process waiter survived. Re-prime the durable
+          // preparation; coordinator ownership keeps this single-run.
           services.resumeOpeningBoardPreparation?.();
         }
         const { pending } = completion.state;
@@ -956,7 +919,9 @@ export async function handleMemoryRequest(
       return ok(completion.state);
     }
 
-
+    // POST /api/memories/:id/draft-revision { sessionId? } — audit follow-up
+    // ②: the memory itself is at fault. Draft a fix immediately (no streak
+    // required); the proposal parks for the next step-one gate.
     const draftMatch = pathname.match(/^\/api\/memories\/([^/]+)\/draft-revision$/);
     if (draftMatch && req.method === 'POST') {
       if (!services?.revision) throw new RouteError(503, 'NO_LLM', 'revision drafting needs the LLM service');
@@ -964,7 +929,7 @@ export async function handleMemoryRequest(
       const b = await readBody(req);
       const sessionId = typeof b.sessionId === 'string' ? b.sessionId : undefined;
       const attribution = studyInteractionAttribution(policy, services);
-      if (policy.studyMode && policy.condition === 'memosync') {
+      if (policy.studyMode) {
         if (!sessionId) throw new RouteError(400, 'BAD_REQUEST', 'sessionId is required');
         if (!services.auditAdmission) {
           throw new RouteError(503, 'NOT_AVAILABLE', 'Study Audit admission is unavailable');
@@ -1006,7 +971,11 @@ export async function handleMemoryRequest(
       return ok(proposal);
     }
 
-
+    // POST /api/memories/revise-injection { instruction, selectedIds, poolIds }
+    // — the Step 2 card's talking assistant: instructions change the
+    // selection, questions get answered; either way a reply comes back. Pure
+    // suggestion machinery: nothing is persisted here; the gate's Start is
+    // the only commit point.
     if (pathname === '/api/memories/revise-injection' && req.method === 'POST') {
       if (!services?.reviseInjection) throw new RouteError(503, 'NO_LLM', 'injection revision needs the LLM service');
       const b = await readBody(req);
@@ -1019,7 +988,7 @@ export async function handleMemoryRequest(
       const sessionId = typeof b.sessionId === 'string' ? b.sessionId : undefined;
       const previewId = typeof b.previewId === 'string' ? b.previewId : undefined;
       let effectivePoolIds = requestedPoolIds;
-      if (policy.studyMode && policy.condition === 'memosync') {
+      if (policy.studyMode) {
         if (!sessionId || !previewId) {
           throw new RouteError(400, 'BAD_REQUEST', 'sessionId and previewId are required');
         }
@@ -1077,8 +1046,8 @@ export async function handleMemoryRequest(
         ...result,
         selectedIds: livePoolIds.filter((id) => revisedSelection.has(id)),
       };
-
-
+      // The Adjusting-stage act itself (selection still commits via Start →
+      // memory.preview; without this the instruction would leave no trace).
       const before = new Set(effectiveIds);
       memory.logger.event({
         type: 'memory.revise_injection',
@@ -1092,7 +1061,11 @@ export async function handleMemoryRequest(
       return ok(effectiveResult);
     }
 
-
+    // POST /api/memories/plan-injection-uses
+    // In the formal MemoSync arm, task text and pool membership are owned by
+    // the exact pending preview. Client text is display input only and never
+    // becomes a treatment instruction. Non-study callers retain the legacy
+    // task + selectedIds planning API.
     if (pathname === '/api/memories/plan-injection-uses' && req.method === 'POST') {
       const b = await readBody(req);
       const selectedIds = Array.isArray(b.selectedIds)
@@ -1104,11 +1077,11 @@ export async function handleMemoryRequest(
         seen.add(id);
         return true;
       });
-      if (!policy.studyMode && policy.condition === 'memosync' && services.workingMemoryUsePlan
+      if (!policy.studyMode && services.workingMemoryUsePlan
         && typeof b.sessionId === 'string' && typeof b.previewId === 'string') {
         return ok(await services.workingMemoryUsePlan({ chatId: b.sessionId, previewId: b.previewId, selectedIds: uniqueIds }));
       }
-      if (policy.studyMode && policy.condition === 'memosync') {
+      if (policy.studyMode) {
         if (typeof b.sessionId !== 'string' || !b.sessionId) {
           throw new RouteError(400, 'BAD_REQUEST', 'sessionId is required');
         }
@@ -1188,7 +1161,8 @@ export async function handleMemoryRequest(
       const attribution = studyInteractionAttribution(policy, services);
       const meta = { ...UI_ACTOR, sessionId, surface, studyAttribution: attribution };
 
-
+      // Retry after mutation-before-receipt: canonical memory state already
+      // invalidated this transcript row and materialized a durable receipt.
       if (boardAdmission?.pending === false) {
         return ok(memory.store.getById(b.id) ?? { resolved: true });
       }
@@ -1218,7 +1192,7 @@ export async function handleMemoryRequest(
               }
               const proposal = await services.maintenance!.merge(b.id as string, b.otherId as string, meta);
               if (!proposal) {
-
+                // Drafting raced a concurrent edit/revision — the card is stale.
                 throw new RouteError(409, 'CONFLICT', 'merge draft could not bind (a memory moved) — re-open the card');
               }
               resolveBoardRow(services, boardResolution);
@@ -1257,14 +1231,17 @@ export async function handleMemoryRequest(
       });
     }
 
-
+    // POST /api/memories/:id/transfer-preview { targetScope, targetProjectId? }
+    // — cross-context transfer judgment (DG3): as_is / rewrite / context_bound,
+    // with the adapted form. LLM when available; verbatim as_is otherwise.
     const sanitizeMatch = pathname.match(/^\/api\/memories\/([^/]+)\/sanitize-preview$/);
     if (sanitizeMatch && req.method === 'POST') {
       const id = decodeURIComponent(sanitizeMatch[1]);
       const source = memory.store.getById(id);
       if (!source) throw new RouteError(404, 'NOT_FOUND', `memory not found: ${id}`);
-
-
+      // Never degrade to the raw text: a failed redaction that LOOKS clean is
+      // exactly the accident this instrument exists to prevent (DG1). The
+      // client's fallback is manual editing, not a fake proposal.
       if (!services.sanitize) {
         throw new RouteError(503, 'NO_LLM', 'sanitize needs the LLM service and none is configured');
       }
@@ -1281,15 +1258,19 @@ export async function handleMemoryRequest(
     const previewMatch = pathname.match(/^\/api\/memories\/([^/]+)\/transfer-preview$/);
     if (previewMatch && req.method === 'POST') {
       const id = decodeURIComponent(previewMatch[1]);
+      if (!memory.store.getById(id)) throw new RouteError(404, 'NOT_FOUND', `memory not found: ${id}`);
+      const b = await readBody(req);
       const source = memory.store.getById(id);
       if (!source) throw new RouteError(404, 'NOT_FOUND', `memory not found: ${id}`);
-      const b = await readBody(req);
+      if (source.status !== 'active') {
+        throw new RouteError(409, 'CONFLICT', 'source memory is no longer active; review Transfer again');
+      }
       assertEnum(b.targetScope, MEMORY_SCOPES, 'targetScope');
       const targetScope = b.targetScope as MemoryScope;
       const targetProjectId = typeof b.targetProjectId === 'string' ? b.targetProjectId : undefined;
       const targetSessionId = typeof b.targetSessionId === 'string' ? b.targetSessionId : undefined;
-
-
+      // The landing judgment needs the target context's existing actives
+      // (excluding the source itself when moving within a scope).
       const targetExisting = (
         targetScope === 'personal'
           ? memory.store.list({ scope: 'personal', status: 'active' })
@@ -1307,6 +1288,7 @@ export async function handleMemoryRequest(
       };
       const fallback = {
         verdict: 'as_is',
+        sourceVersion: source.version,
         portable: source.content,
         content: source.content,
         detail: source.detail,
@@ -1315,8 +1297,9 @@ export async function handleMemoryRequest(
         landing: { route: 'new' },
       };
       if (!services.transfer) return ok(fallback);
-
-
+      // Encoder input (Transfer design 2026-08-08): the source context
+      // profile — a few representative memories from the source's own shelf —
+      // shows what is source-local and must be stripped.
       const profile = (
         source.scope === 'project' && source.projectId
           ? memory.store.list({ scope: 'project', projectId: source.projectId, status: 'active' })
@@ -1328,24 +1311,50 @@ export async function handleMemoryRequest(
         .sort((a, b2) => b2.usageCount + b2.reinforcedCount - (a.usageCount + a.reinforcedCount))
         .slice(0, 5);
       try {
-        return ok(
-          await services.transfer.propose(source, target, {
-            projectTitle: typeof b.sourceProjectTitle === 'string' ? b.sourceProjectTitle : undefined,
-            representative: profile,
-          }),
-        );
+        const proposal = await services.transfer.propose(source, target, {
+          projectTitle: typeof b.sourceProjectTitle === 'string' ? b.sourceProjectTitle : undefined,
+          representative: profile,
+        });
+        if (proposal.landing.route === 'new') {
+          return ok({ ...proposal, sourceVersion: source.version, landing: { route: 'new' } });
+        }
+        if (proposal.landing.route !== 'reinforces' && proposal.landing.route !== 'conflicts') {
+          return ok(fallback);
+        }
+        const landingTarget = targetExisting.find((item) => item.id === proposal.landing.targetId);
+        if (!landingTarget || !Number.isInteger(landingTarget.version) || landingTarget.version < 1) {
+          return ok(fallback);
+        }
+        return ok({
+          ...proposal,
+          sourceVersion: source.version,
+          landing: {
+            ...proposal.landing,
+            targetVersion: landingTarget.version,
+            targetContent: landingTarget.content,
+          },
+        });
       } catch {
         return ok(fallback);
       }
     }
 
-
+    // POST /api/memories/:id/transfer — commit a cross-context transfer: a NEW
+    // memory in the target context, linked derived_from the source (the source
+    // keeps serving its own context unless archiveOriginal).
     const transferMatch = pathname.match(/^\/api\/memories\/([^/]+)\/transfer$/);
     if (transferMatch && req.method === 'POST') {
       const id = decodeURIComponent(transferMatch[1]);
+      if (!memory.store.getById(id)) throw new RouteError(404, 'NOT_FOUND', `memory not found: ${id}`);
+      const b = await readBody(req);
       const source = memory.store.getById(id);
       if (!source) throw new RouteError(404, 'NOT_FOUND', `memory not found: ${id}`);
-      const b = await readBody(req);
+      if (typeof b.sourceVersion !== 'number' || !Number.isInteger(b.sourceVersion) || b.sourceVersion < 1) {
+        throw new RouteError(400, 'BAD_REQUEST', 'sourceVersion must be a positive integer');
+      }
+      if (source.status !== 'active' || source.version !== b.sourceVersion) {
+        throw new RouteError(409, 'CONFLICT', 'source memory changed or is no longer active; review Transfer again');
+      }
       const surface = controlSurface(b.surface);
       const attribution = studyInteractionAttribution(policy, services);
       const boardBase = boardResolutionBase(b, policy, services);
@@ -1358,22 +1367,13 @@ export async function handleMemoryRequest(
         return ok(result ? { ...result, relations: memory.store.getRelations(result.id) } : source);
       }
       if (boardAdmission?.pending === true) assertBoardTransferCommitSnapshot(b, boardAdmission.trusted);
-
-
-      if (b.sourceVersion !== undefined) {
-        if (typeof b.sourceVersion !== 'number' || !Number.isInteger(b.sourceVersion) || b.sourceVersion < 1) {
-          throw new RouteError(400, 'BAD_REQUEST', 'sourceVersion must be a positive integer');
-        }
-        if (source.status !== 'active' || source.version !== b.sourceVersion) {
-          throw new RouteError(409, 'CONFLICT', 'source memory changed or is no longer active; review Transfer again');
-        }
-      }
       assertEnum(b.targetScope, MEMORY_SCOPES, 'targetScope');
       assertString(b.content, 'content');
       assertEnum(b.abstractionLevel, ABSTRACTION_LEVELS, 'abstractionLevel');
       const targetScope = b.targetScope as MemoryScope;
-
-
+      // Session landings arrive from the in-flow Transfer card (the decode
+      // step may judge a rule as only serving the current conversation).
+      // Board-initiated transfers never offer session.
       if (targetScope === 'session' && typeof b.targetSessionId !== 'string') {
         throw new RouteError(400, 'BAD_REQUEST', "targetScope 'session' requires targetSessionId");
       }
@@ -1383,17 +1383,20 @@ export async function handleMemoryRequest(
       if (typeof b.content !== 'string' || !b.content.trim()) {
         throw new RouteError(400, 'BAD_REQUEST', 'content is required');
       }
-
-
-      const landingRoute =
-        b.landingRoute === 'reinforces' || b.landingRoute === 'conflicts' ? b.landingRoute : 'new';
-      const landingTarget =
-        landingRoute !== 'new' && typeof b.landingTargetId === 'string'
-          ? memory.store.getById(b.landingTargetId)
-          : null;
-
-
-      if (b.landingTargetVersion !== undefined) {
+      // Landing (REDESIGN, paper §4.5): how the transferred form meets the
+      // target's EXISTING memories — the capture gate's routing vocabulary,
+      // reused. "reinforces" bumps the existing equivalent instead of
+      // duplicating it; "conflicts" keeps both, linked and flagged for
+      // arbitration; "new"/absent is the plain path.
+      const landingRoute = b.landingRoute === undefined ? 'new' : b.landingRoute;
+      if (landingRoute !== 'new' && landingRoute !== 'reinforces' && landingRoute !== 'conflicts') {
+        throw new RouteError(400, 'BAD_REQUEST', 'landingRoute must be new, reinforces, or conflicts');
+      }
+      let landingTarget = null;
+      if (landingRoute !== 'new') {
+        if (typeof b.landingTargetId !== 'string' || !b.landingTargetId) {
+          throw new RouteError(400, 'BAD_REQUEST', 'landingTargetId is required for a reviewed landing');
+        }
         if (
           typeof b.landingTargetVersion !== 'number'
           || !Number.isInteger(b.landingTargetVersion)
@@ -1401,17 +1404,26 @@ export async function handleMemoryRequest(
         ) {
           throw new RouteError(400, 'BAD_REQUEST', 'landingTargetVersion must be a positive integer');
         }
-        if (
-          !landingTarget
-          || landingTarget.status !== 'active'
-          || landingTarget.version !== b.landingTargetVersion
-        ) {
+        if (b.landingTargetId === source.id) {
+          throw new RouteError(409, 'CONFLICT', 'source memory cannot be its own landing target');
+        }
+        landingTarget = memory.store.getById(b.landingTargetId);
+        if (!landingTarget || landingTarget.status !== 'active' || landingTarget.version !== b.landingTargetVersion) {
           throw new RouteError(409, 'CONFLICT', 'landing target changed or is no longer active; review Transfer again');
         }
+        const selectedProjectId = targetScope === 'project' ? b.targetProjectId : undefined;
+        const selectedSessionId = targetScope === 'session' ? b.targetSessionId : undefined;
+        if (
+          landingTarget.scope !== targetScope
+          || (landingTarget.projectId ?? undefined) !== selectedProjectId
+          || (landingTarget.sessionId ?? undefined) !== selectedSessionId
+        ) {
+          throw new RouteError(409, 'CONFLICT', 'landing target is outside the selected destination; review Transfer again');
+        }
+      } else if (b.landingTargetId !== undefined || b.landingTargetVersion !== undefined) {
+        throw new RouteError(400, 'BAD_REQUEST', 'new landing cannot include a target');
       }
-
-
-      const landingBinds = Boolean(landingTarget && landingTarget.status === 'active');
+      const landingBinds = landingRoute !== 'new';
 
       return await runDurableControlOperation({
         memory,
@@ -1432,12 +1444,14 @@ export async function handleMemoryRequest(
         }
       };
 
-
+      // The preview receipt badges what THIS turn's transfer stage landed —
+      // including reinforce-merges, which otherwise leave no visible trace.
       const landingChatId = typeof b.chatId === 'string' ? b.chatId : undefined;
 
       if (landingRoute === 'reinforces' && landingBinds) {
-
-
+        // No new item: the target context already knows this — the transfer
+        // is a re-observation of the existing memory (evidence it holds
+        // across projects), linked for provenance.
         memory.store.recordDerivedReinforce(landingTarget!.id, source.id, UI_ACTOR);
         if (landingChatId) memory.noteTransferLanding(landingChatId, landingTarget!.id);
         archiveOriginalIfAsked();
@@ -1511,8 +1525,8 @@ export async function handleMemoryRequest(
         archivedOriginal,
         surface,
       });
-
-
+      // The middle representation rides the transferred item as metadata
+      // (Transfer design 2026-08-08: shown on cards, never a standalone item).
       if (typeof b.rule === 'string' && b.rule.trim()) {
         memory.store.setKv(`transfer_rule:${created.id}`, {
           rule: b.rule.trim(),
@@ -1523,14 +1537,17 @@ export async function handleMemoryRequest(
         });
       }
       resolveBoardRow(services, boardResolution, { resultId: created.id });
-
-
+      // getById doesn't hydrate relations — attach the links so the client can
+      // render provenance (and any conflict) immediately.
       return ok({ ...memory.store.getById(created.id)!, relations: memory.store.getRelations(created.id) }, 201);
         },
       });
     }
 
-
+    // POST /api/memories/:id/transfer-decline { contextKey } — "not this one"
+    // on the Transfer card: the (source, destination-context) pair is never
+    // suggested again. contextKey = the destination projectId (or sessionId
+    // for projectless chats).
     const declineMatch = pathname.match(/^\/api\/memories\/([^/]+)\/transfer-decline$/);
     if (declineMatch && req.method === 'POST') {
       const id = decodeURIComponent(declineMatch[1]);
@@ -1570,7 +1587,9 @@ export async function handleMemoryRequest(
       });
     }
 
-
+    // GET /api/memories/md-status — every projection file (personal + each
+    // project); the Board's file picker reads this. The files are a generated
+    // export of SQLite state — read-only, never ingested.
     if (pathname === '/api/memories/md-status') {
       if (req.method !== 'GET') return fail(405, 'METHOD_NOT_ALLOWED', 'use GET');
       const projectIds = new Set([
@@ -1592,7 +1611,7 @@ export async function handleMemoryRequest(
       });
     }
 
-
+    // GET /api/memories/md-file — read-only view of a projection file.
     if (pathname === '/api/memories/md-file') {
       if (req.method !== 'GET') return fail(405, 'METHOD_NOT_ALLOWED', 'use GET');
       const project = url.searchParams.get('project') || undefined;
@@ -1606,7 +1625,8 @@ export async function handleMemoryRequest(
       }
     }
 
-
+    // POST /api/memories/md-import { text, scope, projectId? } — ingest an
+    // external CLAUDE.md/.cursorrules: every bullet line becomes a candidate.
     if (pathname === '/api/memories/md-import' && req.method === 'POST') {
       const b = await readBody(req);
       if (typeof b.text !== 'string' || !b.text.trim()) throw new RouteError(400, 'BAD_REQUEST', 'text is required');
@@ -1625,7 +1645,10 @@ export async function handleMemoryRequest(
       return ok(result);
     }
 
-
+    // GET/PUT /api/memories/evolution-policy — delegating mode (F4's two
+    // control styles): Ask parks every proposal for review; Auto applies
+    // non-sensitive proposals immediately with an "auto" badge + revert.
+    // The setting is a control act — switching it is itself study data.
     if (pathname === '/api/memories/evolution-policy') {
       const KV_KEY = 'evolution_policy';
       if (req.method === 'GET') {
@@ -1644,7 +1667,10 @@ export async function handleMemoryRequest(
       return fail(405, 'METHOD_NOT_ALLOWED', 'use GET or PUT');
     }
 
-
+    // POST /api/memories/:id/restore-candidate — inverse of a non-sensitive
+    // soft dismissal, used by the reopened Candidate gate. Authority comes
+    // from the server-side discarded row + suppression record; a sensitive
+    // dismissal has no row or text left to reconstruct.
     const restoreCandidateMatch = pathname.match(/^\/api\/memories\/([^/]+)\/restore-candidate$/);
     if (restoreCandidateMatch && req.method === 'POST') {
       const id = decodeURIComponent(restoreCandidateMatch[1]);
@@ -1686,7 +1712,9 @@ export async function handleMemoryRequest(
       return ok(restored);
     }
 
-
+    // POST /api/memories/:id/revert-auto — one-click inverse of an
+    // auto-applied proposal: back to the review lane; a revision's archived
+    // target comes back to life in the same transaction.
     const revertAutoMatch = pathname.match(/^\/api\/memories\/([^/]+)\/revert-auto$/);
     if (revertAutoMatch && req.method === 'POST') {
       const id = decodeURIComponent(revertAutoMatch[1]);
@@ -1721,7 +1749,9 @@ export async function handleMemoryRequest(
       return ok(outcome);
     }
 
-
+    // POST /api/memories/ui-monitor — monitoring-act telemetry (board visits,
+    // trace expansions, citation hovers…). Pure logging: exempt from the
+    // mutation lock so every arm records whatever surfaces it has.
     if (pathname === '/api/memories/ui-monitor' && req.method === 'POST') {
       const b = await readBody(req);
       if (typeof b.surface !== 'string' || !b.surface) {
@@ -1744,7 +1774,10 @@ export async function handleMemoryRequest(
       return ok({});
     }
 
-
+    // POST /api/memories/surface-exposure — one client-observed visibility
+    // transition for a memory surface (board, record, audit rows…). Pure
+    // logging like ui-monitor; the client outbox delivers these in every
+    // deployment, study or not.
     if (pathname === '/api/memories/surface-exposure' && req.method === 'POST') {
       const b = await readBody(req);
       if (typeof b.surface !== 'string' || !b.surface) {
@@ -1776,18 +1809,19 @@ export async function handleMemoryRequest(
       return ok({});
     }
 
-
+    // Item: /api/memories/:id  (PATCH | DELETE)
     const idMatch = pathname.match(/^\/api\/memories\/([^/]+)$/);
     if (idMatch) {
       const id = decodeURIComponent(idMatch[1]);
       if (req.method === 'PATCH') {
-
-
+        // Read the request before inspecting status so the discarded guard and
+        // the synchronous store update share one current-state critical path.
         const rawPatch = await readBody(req);
         const existing = memory.store.getById(id);
         if (!existing) throw new RouteError(404, 'NOT_FOUND', `memory not found: ${id}`);
-
-
+        // Surface is useful telemetry, but it is client-controlled. During the
+        // blocking opening Board the durable receipt remains the authority, so
+        // F12 cannot claim chat_gate and raw-accept a sensitive draft.
         const requestedSurface = controlSurface(rawPatch.surface);
         const blockingBoardReview = requestedSurface === 'board' || services.blockingBoardReviewRequired?.() === true;
         const via = blockingBoardReview ? 'board' : requestedSurface ?? 'ui';
@@ -1841,16 +1875,18 @@ export async function handleMemoryRequest(
                 'Edit or prepare a sanitized version, then accept that reviewed content in the same action.',
               );
             }
-
-
+            // Persist only normalized reviewed text. replaceCandidateDraft
+            // erases the sensitive predecessor from the item event history.
             patch.content = reviewedContent;
             patch.detail = reviewedDetail;
           }
         }
         const accepted = existing.status === 'candidate' && (patch.status as string) === 'active';
         const controlAction = accepted ? 'accept' : nextScope !== existing.scope ? 'rescope' : 'edit';
-
-
+        // Accepting a REVISION candidate replaces its target(s): activation
+        // and the archival(s) commit in ONE transaction (a mid-way failure
+        // must never leave both memories active with the candidate spent).
+        // A MERGE proposal revises two originals and archives both.
         let updated!: MemoryItem;
         let replaced: MemoryItem[] = [];
         await runDurableControlOperation({
@@ -1874,15 +1910,15 @@ export async function handleMemoryRequest(
                 replaced = outcome.replaced;
               } else {
                 const { status: nextStatus, ...draftPatch } = patch;
-                updated = Object.keys(draftPatch).length > 0
-                  ? memory.store.replaceCandidateDraft(id, draftPatch as Partial<MemoryItem>, UI_ACTOR)
-                  : existing;
-                if (nextStatus !== undefined) {
-                  if (accepted && memory.store.revisionTargetOf(id)) {
-                    const outcome = memory.store.acceptRevision(id, UI_ACTOR);
-                    updated = outcome.updated;
-                    replaced = outcome.replaced;
-                  } else {
+                if (accepted) {
+                  const outcome = memory.store.acceptRevision(id, UI_ACTOR, draftPatch as Partial<MemoryItem>);
+                  updated = outcome.updated;
+                  replaced = outcome.replaced;
+                } else {
+                  updated = Object.keys(draftPatch).length > 0
+                    ? memory.store.replaceCandidateDraft(id, draftPatch as Partial<MemoryItem>, UI_ACTOR)
+                    : existing;
+                  if (nextStatus !== undefined) {
                     updated = memory.store.update(id, { status: nextStatus as MemoryStatus }, UI_ACTOR);
                   }
                 }
@@ -1892,8 +1928,9 @@ export async function handleMemoryRequest(
             }
           },
         });
-
-
+        // Decisions log BEFORE the projections they trigger — syncProjection
+        // may ingest a dirty file and emit derived memory.propose events, and
+        // the log's order must reflect causality (decision unblocks derived).
         for (const r of replaced) {
           memory.logger.event({
             type: 'memory.decision',
@@ -1936,8 +1973,10 @@ export async function handleMemoryRequest(
           payload: { memoryId: id, fromScope: existing.scope },
           run: () => {
             if (existing.status === 'candidate') {
-
-
+              // The store owns the privacy decision: a durable sensitive tombstone
+              // still requires hard erasure even if a legacy row was relabelled.
+              // Ordinary candidates remain soft-dismissed so the gate can learn
+              // from them (self-evolution M1).
               memory.store.dismissCandidateByPolicy(id, UI_ACTOR);
             } else {
               memory.store.archive(id, UI_ACTOR);
@@ -1952,8 +1991,9 @@ export async function handleMemoryRequest(
           fromScope: existing.scope,
           via,
         });
-
-
+        // Candidates are projected too (Pending review section) — a dismissed
+        // one must leave the file now, not at the next unrelated mutation.
+        // After the decision event: projection may emit derived events.
         memory.syncProjection(existing.projectId);
         return ok({ id });
       }
@@ -1964,6 +2004,7 @@ export async function handleMemoryRequest(
   } catch (e) {
     if (e instanceof RouteError) return fail(e.status, e.code, e.message);
     if (e instanceof CandidateDismissalTransitionError) return fail(409, e.code, e.message);
+    if (e instanceof RevisionConflictError) return fail(409, e.code, e.message);
     console.error('[memory] route error', e);
     return fail(500, 'INTERNAL_ERROR', 'Internal server error');
   } finally {

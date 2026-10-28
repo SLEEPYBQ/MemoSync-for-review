@@ -368,7 +368,9 @@ function shouldShowLegacyQuestion(
   return true
 }
 
-
+/** Frozen v1 compatibility surface. It intentionally preserves the old
+ * categorical instrument for an unfinished legacy snapshot; it never maps
+ * old categories onto the v2 ordinal scale. */
 export function StudyLegacyMemoryQuestionnaireSurface({
   item,
   itemIndex,
@@ -574,8 +576,9 @@ export function RawTlxForm({
                   "[&::-webkit-slider-thumb]:-mt-1 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-foreground",
                   "[&::-moz-range-track]:h-2 [&::-moz-range-track]:rounded-full [&::-moz-range-track]:bg-muted",
                   "[&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-foreground",
-
-
+                  // The internal 50 only anchors the first pointer interaction.
+                  // A fully neutral track plus an invisible thumb prevents that
+                  // anchor from looking like a preselected midpoint answer.
                   !answered
                     && "opacity-70 [&::-moz-range-thumb]:opacity-0 [&::-webkit-slider-thumb]:opacity-0",
                 )}
@@ -680,8 +683,9 @@ export function StudyCompleteSurface({
   completionCode: string | null
   completionUrl?: string | null
 }) {
-
-
+  // The code value is server-owned: it arrives only in the production
+  // post-session payload after the final SUS is durably accepted. The Guide
+  // preview passes null and therefore never renders a usable code.
   return (
     <div className="mt-8 flex flex-col items-start gap-3">
       <span className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-500/15">

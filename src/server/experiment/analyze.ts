@@ -1,4 +1,7 @@
-
+// Experiment-log analysis (SPEC §6): turn events.jsonl into per-session and
+// aggregate metamemory metrics — the study's manipulation checks and core
+// measures (Write / Structure / Utilization / Maintenance signals). Pure
+// function over log lines; the CLI wrapper lives in scripts/analyze-experiment.ts.
 
 export interface InteractionSurfaceCounts {
   board: number
@@ -28,36 +31,36 @@ export interface SessionMetrics {
   previewDecisions: { go_on: number; dismiss: number; without_memory: number; auto_go_on: number }
   traceLabels: { operational: number; injected_without_effect: number; violated: number; not_applicable: number }
   bringIns: number
-
+  /** Step-one proposals gates (redesign 2026-08-07): parked reviews + how each settled. */
   proposalsGates: number
   proposalsCandidates: number
   proposalsDecisions: { reviewed: number; skipped: number; cancelled: number; expired: number; empty: number }
-
+  /** Step-one library checkups: runs, suggestion volume, cache hits, outcomes. */
   checkups: number
   checkupSuggestions: number
   checkupCacheHits: number
-
+  /** Complete and partial Checkups whose raw event names one or more failed lanes. */
   checkupIncomplete: number
   checkupDecisions: { clear: number; handled: number; skipped: number; cancelled: number; expired: number; failed: number }
-
+  /** Transfer cards (Transfer design 2026-08-08): shown cards, suggestion volume, outcomes, row actions. */
   transferCards: number
   transferSuggestions: number
   transferDecisions: { handled: number; skipped: number; cancelled: number; expired: number; empty: number }
   transferAccepts: number
   transferDeclines: number
-
+  /** Review-again reopens of the pre-turn preparation. */
   preparationReopens: number
-
+  /** Participant stopped a running turn over one delivered memory. */
   memoryInterrupts: number
-
+  /** Claude accepted a continuation whose delivery links to an interrupt. */
   resumeLinkedDeliveries: number
-
+  /** Participant armed one-turn Enforce from audit or interrupt recovery. */
   memoryEnforces: number
-
+  /** Participant memory mutations, separated from passive inspection. */
   controlInteractions: InteractionSurfaceCounts
-
+  /** Raw ui.monitor acts, never folded into Control. */
   monitoringInteractions: InteractionSurfaceCounts
-
+  /** Participant-reported time between entering and submitting Static Markdown edits. */
   staticEditDurationMs: number
 }
 
@@ -66,12 +69,12 @@ export interface AnalysisReport {
   totals: {
     sessions: number
     events: number
-
+    /** Valid QA events intentionally omitted from this report. */
     excludedInternalQaEvents: number
     skippedLines: number
     conditions: Record<string, number>
     decisions: { create: number; accept: number; edit: number; dismiss: number; rescope: number; archive: number; revert: number }
-
+    /** accepts / (accepts + dismisses) over UI decisions. NaN-safe: 0 when no reviews. */
     acceptRate: number
     citations: number
     detailLoads: number
@@ -273,7 +276,9 @@ export function analyzeEvents(
     if (isResumeLinkedDelivery(e)) totals.resumeLinkedDeliveries++
     if (e.type === "memory.audit_action" && e.action === "enforce") totals.memoryEnforces++
 
-
+    // Formal study sessions are task windows and may include several chats.
+    // New production events carry taskId; sessionId remains the legacy chat
+    // key only when no authoritative task identity exists.
     const legacySessionId = typeof e.sessionId === "string" && e.sessionId ? e.sessionId : undefined
     const analysisSessionId = typeof e.taskId === "string" && e.taskId
       ? e.taskId
@@ -281,7 +286,7 @@ export function analyzeEvents(
         ? taskWindowByChat.get(legacySessionId) ?? legacySessionId
         : undefined
 
-
+    // Global (session-less) events: UI decisions come from HTTP routes.
     if (e.type === "memory.decision") {
       const action = e.action as keyof typeof totals.decisions
       if (action in totals.decisions) totals.decisions[action]++
@@ -323,7 +328,7 @@ export function analyzeEvents(
         totals.captureSurfaced += e.surfaced ?? 0
         break
       case "memory.conflict":
-
+        // Drift detected: a captured item superseded an existing memory.
         s.conflicts++
         break
       case "memory.preview": {

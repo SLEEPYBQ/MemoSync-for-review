@@ -66,7 +66,7 @@ describe('memory tools (engine-neutral)', () => {
     };
     const specs = buildMemoryToolSpecs(memory, { capture: captureStub });
     expect(specs.map((s) => s.name)).toEqual(['propose_memory', 'load_memory_detail']);
-
+    // Still no search tool — the receipt stays the complete surface.
     expect(specs.map((s) => s.name)).not.toContain('search_memory');
     const propose = specs.find((spec) => spec.name === 'propose_memory')!;
     const contentDescription = (propose.schema.content as unknown as { description?: string }).description;
@@ -373,9 +373,9 @@ describe('memory prompt block (memory-as-skills)', () => {
     expect(block).toContain('cite it inline at the point of influence as [M-07]');
     expect(block).toContain('Do not leave an influence uncited');
     expect(block).toContain('load_memory_detail');
-
+    // the injected list is the complete memory surface — no search reaching past it
     expect(block).not.toContain('search_memory');
-
+    // capture is a forced system hook now — the model must not be told to propose
     expect(block).not.toContain('propose_memory');
   });
 

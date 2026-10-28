@@ -3,7 +3,7 @@ export const ALLOW_FOCUS_RETAIN_ATTRIBUTE = "data-allow-focus-retain"
 export const RESTORE_CHAT_INPUT_FOCUS_EVENT = "memosync:restore-chat-input-focus"
 export const CHAT_INPUT_ATTRIBUTE = "data-chat-input"
 export const CHAT_SELECTION_ZONE_ATTRIBUTE = "data-chat-selection-zone"
-
+/** Marks a preview gate that is awaiting a keyboard decision (Enter/Esc). */
 export const PREVIEW_GATE_PENDING_ATTRIBUTE = "data-preview-gate-pending"
 
 export type ChatFocusAction = "restore" | "escape-focus" | "none"
@@ -48,7 +48,11 @@ export function hasActiveFocusOverlay(document: Document): boolean {
   return Boolean(document.querySelector(`[${FOCUS_FALLBACK_IGNORE_ATTRIBUTE}][data-state='open']`))
 }
 
-
+/**
+ * A preview gate is parked waiting for the user's keyboard decision. While it
+ * is, the gate owns Esc (= Dismiss turn); sticky-focus must not swallow Esc to
+ * refocus the composer, which reversed the gate's Esc shortcut (BUG CORE-1).
+ */
 export function hasPendingPreviewGate(document: Document): boolean {
   return Boolean(document.querySelector(`[${PREVIEW_GATE_PENDING_ATTRIBUTE}]`))
 }

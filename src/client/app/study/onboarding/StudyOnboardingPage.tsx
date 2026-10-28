@@ -280,7 +280,11 @@ export function StudyOnboardingPage({ initialState }: { initialState?: StudyOnbo
   return <InformationPage information={state.information} prolificId={state.prolificId ?? null} saving={saving} error={error} onSave={(information) => save(() => saveStudyInformation(information))} />
 }
 
-
+/**
+ * A top-level authenticated route rather than an AppLayout child. This keeps
+ * the workspace, sidebar, dock, and Board out of both the visual tree and
+ * the accessibility tree until the participant has finished onboarding.
+ */
 export function StudyOnboardingRoute() {
   const policy = useConditionPolicyResolved()
   const failed = useConditionPolicyLoadFailed()

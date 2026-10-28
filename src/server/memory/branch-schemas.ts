@@ -29,7 +29,7 @@ const collections: Record<'candidate' | 'transfer' | 'changes', Record<string, S
   changes: { conflicts: list(pair), redundancy: list(pair), staleness: list(stale) },
 };
 
-
+/** Strict schemas work with both CLI runtimes; the domain parsers still validate IDs and versions. */
 export function memoryStageSchema(stage: 'candidate' | 'transfer' | 'changes' | 'working-memory' | 'audit'): Schema {
   if (stage === 'working-memory') return object({ selected: list(object({ id: text, why: text, expectedUse: text })), reply: text });
   if (stage === 'audit') return object({ labels: list(object({
@@ -42,4 +42,24 @@ export function memoryStageSchema(stage: 'candidate' | 'transfer' | 'changes' | 
 
 export function memoryStageDeltaSchema(stage: 'transfer' | 'changes'): Schema {
   return object({ upsert: object(collections[stage]), remove: object(Object.fromEntries(Object.keys(collections[stage]).map(key => [key, ids]))) });
+}
+
+/** Bind model-visible IDs/versions to the actual source snapshot. An empty
+ * source set admits no suggestions, rather than inviting invented examples. */
+export function memoryTransferSchema(sources: readonly { sourceId: string; sourceVersion: number }[], delta = false): Schema {
+  const schema = delta ? memoryStageDeltaSchema('transfer') : memoryStageSchema('transfer');
+  const allowedItems = sources.length ? {
+    ...transfer,
+    properties: { ...(transfer.properties as Record<string, Schema>),
+      sourceId: { type: 'string', enum: [...new Set(sources.map(source => source.sourceId))] },
+      sourceVersion: { type: 'integer', enum: [...new Set(sources.map(source => source.sourceVersion))] },
+      proposalId: { type: 'string', enum: [...new Set(sources.map(source => `T:${source.sourceId}`))] },
+    },
+  } : transfer;
+  const suggestions = { ...list(allowedItems), maxItems: sources.length ? 3 : 0 };
+  if (delta) {
+    const upsert = (schema.properties as Record<string, Schema>).upsert!;
+    (upsert.properties as Record<string, Schema>).suggestions = suggestions;
+  } else (schema.properties as Record<string, Schema>).suggestions = suggestions;
+  return schema;
 }

@@ -1,5 +1,5 @@
-
-
+// Colored per-type file icons for the Files workbench tree and tabs,
+// approximating the Codex/Seti look with lucide glyphs.
 import type { LucideIcon } from "lucide-react"
 import {
   Braces, Cog, Container, Database, File, FileCode, FileText, GitBranch, Hash,

@@ -134,6 +134,13 @@ const DEFAULT_APP_SETTINGS_SNAPSHOT: AppSettingsSnapshot = {
       },
       planMode: false,
     },
+    pi: {
+      model: "anthropic/claude-sonnet-4-6",
+      modelOptions: {
+        reasoningEffort: "medium",
+      },
+      planMode: false,
+    },
   },
   memoryPreview: {
     enabled: true,
@@ -1238,7 +1245,9 @@ describe("ws-router", () => {
       },
     })
 
-
+    // Reusing the same subscription id is the client self-heal path for a
+    // dropped terminal snapshot. It must force one fresh response without
+    // creating another server-side subscription.
     await router.handleMessage(
       ws as never,
       JSON.stringify({

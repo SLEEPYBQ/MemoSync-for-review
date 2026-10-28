@@ -30,7 +30,7 @@ describe('memory retrieval', () => {
     ];
     const ranked = rankMemories('why do the jest tests hang when I run them?', pool);
     expect(ranked[0].memory.id).toBe('M-01');
-    expect(ranked.find((r) => r.memory.id === 'M-02')).toBeUndefined();
+    expect(ranked.find((r) => r.memory.id === 'M-02')).toBeUndefined(); // zero overlap
   });
 
   it('outcome boost: a cited memory outranks an equally-matching uncited one', () => {

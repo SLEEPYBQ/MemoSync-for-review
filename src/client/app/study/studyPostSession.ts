@@ -34,9 +34,9 @@ export interface StudyPostSessionPayload {
   controlSubmitted: boolean
   sessionCompleted: boolean
   susSubmitted: boolean
-
+  /** Server-issued Prolific code; present only after study completion. */
   completionCode?: string | null
-
+  /** Server-configured Prolific return URL; present only after completion. */
   completionUrl?: string | null
 }
 

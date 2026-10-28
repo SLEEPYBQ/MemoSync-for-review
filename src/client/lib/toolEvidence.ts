@@ -22,12 +22,16 @@ function transcriptRoot(origin: HTMLElement | null, chatId?: string): HTMLElemen
   return roots.find((root) => !chatId || root.dataset.transcriptChatId === chatId) ?? null
 }
 
-
+/**
+ * Reveal the containing virtual row, then the group and individual tool. The
+ * anchor is a server-validated tool id, so uncited and tool-only violations
+ * do not depend on an assistant paragraph being mounted or containing a chip.
+ */
 export async function revealToolEvidence(target: ToolEvidenceTarget, origin: HTMLElement | null): Promise<HTMLElement | null> {
   const root = transcriptRoot(origin, target.chatId)
   if (!root) return null
   window.dispatchEvent(new CustomEvent<ToolEvidenceTarget>(TOOL_EVIDENCE_EVENT, { detail: target }))
-
+  // LegendList mounts the requested row asynchronously after scrollToIndex.
   for (let frame = 0; frame < 60; frame += 1) {
     if (!root.isConnected) return null
     for (const group of Array.from(root.querySelectorAll<HTMLElement>("[data-tool-group-ids]"))) {

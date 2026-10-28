@@ -93,6 +93,8 @@ interface PendingTurn {
   todoSequence: number
   pendingWebSearchResultToolId: string | null
   resolved: boolean
+  completionInProgress: boolean
+  bufferedNotifications: ServerNotification[]
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   onApprovalRequest?: (
     request:
@@ -107,7 +109,7 @@ interface PendingTurn {
           params: FileChangeRequestApprovalParams
         }
   ) => Promise<CommandExecutionApprovalDecision | FileChangeApprovalDecision>
-
+  /** Execute a client-declared dynamic tool (e.g. memory tools) by name. */
   onDynamicToolCall?: (
     name: string,
     args: Record<string, unknown>,
@@ -121,7 +123,7 @@ interface SessionContext {
   pendingRequests: Map<CodexRequestId, PendingRequest<unknown>>
   pendingTurn: PendingTurn | null
   sessionToken: string | null
-  stderrLines: string[]
+  lastStderrLine: string | null
   closed: boolean
   subprocessEnv?: Record<string, string | undefined>
   externalToolsDisabled?: boolean
@@ -135,27 +137,28 @@ export interface StartCodexSessionArgs {
   serviceTier?: ServiceTier
   sessionToken: string | null
   pendingForkSessionToken?: string | null
-
+  /** Client-declared dynamic tools (e.g. memory tools) to register on the thread. */
   dynamicTools?: DynamicToolFunctionSpec[]
-
+  /** Memory branches inspect the shared workspace without changing it. */
   sandbox?: "read-only" | "workspace-write" | "danger-full-access"
   subprocessEnv?: Record<string, string | undefined>
-
+  /** Memory retries must fail if their child disappeared instead of losing its analysis. */
   allowResumeFallback?: boolean
-
+  /** Branch-only: disable configured MCP servers, native subagents, and web search. */
   disableExternalTools?: boolean
 }
 
 export interface StartCodexTurnArgs {
   chatId: string
   model: string
+  signal?: AbortSignal
   effort?: CodexReasoningEffort
   serviceTier?: ServiceTier
   content: string
   planMode: boolean
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   onApprovalRequest?: PendingTurn["onApprovalRequest"]
-
+  /** Memory block injected as Codex developer_instructions for this turn. */
   developerInstructions?: string | null
   onDynamicToolCall?: PendingTurn["onDynamicToolCall"]
   outputSchema?: Record<string, unknown>
@@ -180,12 +183,24 @@ function timestamped<T extends Omit<TranscriptEntry, "_id" | "createdAt">>(
   } as TranscriptEntry
 }
 
-
+/**
+ * CODEX_MODEL overrides the per-chat model when set — this is how the Codex
+ * engine runs against a custom model_provider (e.g. DeepSeek in Docker, with
+ * the provider defined in CODEX_HOME/config.toml). Mirrors ANTHROPIC_MODEL
+ * for the Claude engine (agent.ts).
+ */
 function resolveCodexModel(model: string, env?: Record<string, string | undefined>): string {
   return resolveCodexRuntimeModel(model, env)
 }
 
-
+/**
+ * CODEX_PROTOCOL_COMPAT=0.9x adapts the app-server protocol for the PINNED
+ * codex 0.92–0.94 window — the only versions that speak BOTH wire_api="chat"
+ * (needed for DeepSeek, which has no /v1/responses) AND dynamicTools. Two
+ * skews vs the vendored (newer) protocol:
+ *   - collaborationMode.mode: "default" does not exist yet → "code"
+ *   - item/tool/call response: { output, success } instead of { contentItems, success }
+ */
 function codexProtocolCompat09x(): boolean {
   return process.env.CODEX_PROTOCOL_COMPAT === "0.9x"
 }
@@ -778,7 +793,7 @@ class AsyncQueue<T> implements AsyncIterable<T> {
 
 const runtimeStarts = new Map<string, Promise<unknown>>()
 
-
+/** A fresh CODEX_HOME has one SQLite migration owner. Model turns remain concurrent. */
 export async function serializeCodexRuntimeStart<T>(profile: string, start: () => Promise<T>): Promise<T> {
   const previous = runtimeStarts.get(profile) ?? Promise.resolve()
   const current = previous.catch(() => {}).then(start)
@@ -790,10 +805,10 @@ export async function serializeCodexRuntimeStart<T>(profile: string, start: () =
 export class CodexAppServerManager {
   private readonly sessions = new Map<string, SessionContext>()
   private readonly spawnProcess: SpawnCodexAppServer
-  private readonly usesRealProcess: boolean
+  private readonly serializeStarts: boolean
 
-  constructor(args: { spawnProcess?: SpawnCodexAppServer } = {}) {
-    this.usesRealProcess = !args.spawnProcess
+  constructor(args: { spawnProcess?: SpawnCodexAppServer; serializeStarts?: boolean } = {}) {
+    this.serializeStarts = args.serializeStarts ?? !args.spawnProcess
     this.spawnProcess = args.spawnProcess ?? ((cwd, env) => {
       const runtime = prepareCodexRuntime(env)
       return spawn("codex", runtime.args, {
@@ -805,7 +820,7 @@ export class CodexAppServerManager {
   }
 
   async startSession(args: StartCodexSessionArgs) {
-    if (!this.usesRealProcess) return this.startSessionUnlocked(args)
+    if (!this.serializeStarts) return this.startSessionUnlocked(args)
     const env = args.subprocessEnv ?? process.env
     const profile = env.MEMOSYNC_CLI_PROFILE_DIR || env.CODEX_HOME || join(homedir(), ".codex")
     return serializeCodexRuntimeStart(profile, () => this.startSessionUnlocked(args))
@@ -831,20 +846,27 @@ export class CodexAppServerManager {
       pendingRequests: new Map(),
       pendingTurn: null,
       sessionToken: null,
-      stderrLines: [],
+      lastStderrLine: null,
       closed: false,
       subprocessEnv: args.subprocessEnv,
     }
     this.sessions.set(args.chatId, context)
     this.attachListeners(context)
+    const stopForAbort = () => {
+      if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
+    }
+    args.signal?.addEventListener("abort", stopForAbort, { once: true })
+    if (args.signal?.aborted) stopForAbort()
 
     try {
       return await this.initializeSession(args, context)
     } catch (error) {
-
-
+      // A rejected handshake must not remain reusable with a null thread ID.
+      // Do not stop a replacement session if an older request fails late.
       if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
       throw error
+    } finally {
+      args.signal?.removeEventListener("abort", stopForAbort)
     }
   }
 
@@ -865,8 +887,9 @@ export class CodexAppServerManager {
 
     let branchConfig: Record<string, unknown> | undefined
     if (args.disableExternalTools) {
-
-
+      // Sandbox policy covers local commands, not an MCP server's external
+      // side effects. Inspect names only, then override each server on this
+      // thread; never write config.toml or forward its credentials as config.
       let effective: ConfigReadResponse
       try {
         effective = await this.sendRequest<ConfigReadResponse>(context, "config/read", {
@@ -882,18 +905,20 @@ export class CodexAppServerManager {
       if (!servers) throw new Error("Cannot establish read-only memory branch: invalid MCP configuration")
       branchConfig = { "features.multi_agent": false, web_search: "disabled" }
       for (const name of Object.keys(servers)) {
-
-
+        // Config overrides use dotted paths. Ambiguous names must not disable
+        // the wrong server and silently leave the intended one available.
         if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error("Cannot establish read-only memory branch: unsupported MCP server identifier")
         branchConfig[`mcp_servers.${name}.enabled`] = false
       }
     }
 
+    // An omitted tier inherits Codex configuration; null explicitly selects Standard.
+    const serviceTier = args.serviceTier ?? null
     const threadParams = {
       config: branchConfig,
       model: resolveCodexModel(args.model, args.subprocessEnv),
       cwd: args.cwd,
-      serviceTier: args.serviceTier,
+      serviceTier,
       approvalPolicy: "never",
       sandbox: args.sandbox ?? "danger-full-access",
       experimentalRawEvents: false,
@@ -908,7 +933,7 @@ export class CodexAppServerManager {
         threadId: args.pendingForkSessionToken,
         model: resolveCodexModel(args.model, args.subprocessEnv),
         cwd: args.cwd,
-        serviceTier: args.serviceTier,
+        serviceTier,
         approvalPolicy: "never",
         sandbox: args.sandbox ?? "danger-full-access",
         persistExtendedHistory: false,
@@ -921,7 +946,7 @@ export class CodexAppServerManager {
           threadId: args.sessionToken,
           model: resolveCodexModel(args.model, args.subprocessEnv),
           cwd: args.cwd,
-          serviceTier: args.serviceTier,
+          serviceTier,
           approvalPolicy: "never",
           sandbox: args.sandbox ?? "danger-full-access",
           persistExtendedHistory: false,
@@ -969,13 +994,24 @@ export class CodexAppServerManager {
       todoSequence: 0,
       pendingWebSearchResultToolId: null,
       resolved: false,
+      completionInProgress: false,
+      bufferedNotifications: [],
       onToolRequest: args.onToolRequest,
       onApprovalRequest: args.onApprovalRequest,
       onDynamicToolCall: args.onDynamicToolCall,
     }
     context.pendingTurn = pendingTurn
 
+    const stopForAbort = () => {
+      if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
+    }
+    args.signal?.addEventListener("abort", stopForAbort, { once: true })
+
     try {
+      if (args.signal?.aborted) {
+        stopForAbort()
+        args.signal.throwIfAborted()
+      }
       const response = await this.sendRequest<TurnStartResponse>(context, "turn/start", {
         threadId: context.sessionToken ?? "",
         input: [
@@ -988,7 +1024,7 @@ export class CodexAppServerManager {
         approvalPolicy: "never",
         model: resolveCodexModel(args.model, context.subprocessEnv),
         effort: args.effort,
-        serviceTier: args.serviceTier,
+        serviceTier: args.serviceTier ?? null,
         outputSchema: args.outputSchema,
         collaborationMode: {
           mode: args.planMode ? "plan" : codexProtocolCompat09x() ? "code" : "default",
@@ -999,25 +1035,30 @@ export class CodexAppServerManager {
           },
         },
       } satisfies TurnStartParams)
-      if (context.pendingTurn) {
-        context.pendingTurn.turnId = response.turn.id
-      } else {
-        pendingTurn.turnId = response.turn.id
+      pendingTurn.turnId = response.turn.id
+      if (context.pendingTurn === pendingTurn && !pendingTurn.resolved) {
+        const buffered = pendingTurn.bufferedNotifications.splice(0)
+        for (const notification of buffered) {
+          if (this.notificationTurnId(notification) !== pendingTurn.turnId) continue
+          void this.handleNotification(context, notification)
+          if (context.pendingTurn !== pendingTurn || pendingTurn.resolved) break
+        }
       }
     } catch (error) {
-      context.pendingTurn = null
+      if (context.pendingTurn === pendingTurn) context.pendingTurn = null
+      pendingTurn.resolved = true
       queue.finish()
       throw error
+    } finally {
+      args.signal?.removeEventListener("abort", stopForAbort)
     }
 
     return {
       provider: "codex",
       stream: queue,
       interrupt: async () => {
-        const pendingTurn = context.pendingTurn
-        if (!pendingTurn) return
-
-        context.pendingTurn = null
+        if (pendingTurn.resolved) return
+        if (context.pendingTurn === pendingTurn) context.pendingTurn = null
         pendingTurn.resolved = true
         pendingTurn.queue.finish()
 
@@ -1088,7 +1129,7 @@ export class CodexAppServerManager {
     try {
       context.child.kill("SIGKILL")
     } catch {
-
+      // ignore kill failures
     }
   }
 
@@ -1133,7 +1174,7 @@ export class CodexAppServerManager {
     void (async () => {
       for await (const line of stderr) {
         if (line.trim()) {
-          context.stderrLines.push(line.trim())
+          context.lastStderrLine = line.trim().slice(-4096)
         }
       }
     })()
@@ -1146,7 +1187,7 @@ export class CodexAppServerManager {
       if (context.closed) return
       queueMicrotask(() => {
         if (context.closed) return
-        const message = context.stderrLines.at(-1) || `Codex app-server exited with code ${code ?? 1}`
+        const message = context.lastStderrLine || `Codex app-server exited with code ${code ?? 1}`
         this.failContext(context, message)
       })
     })
@@ -1253,12 +1294,17 @@ export class CodexAppServerManager {
       }
 
       const payload = dynamicToolPayload(request.params.arguments)
-      pendingTurn.queue.push({
-        type: "transcript",
-        entry: genericDynamicToolCall(request.params.callId, request.params.tool, payload),
-      })
+      if (!pendingTurn.startedToolIds.has(request.params.callId)) {
+        pendingTurn.startedToolIds.add(request.params.callId)
+        pendingTurn.queue.push({
+          type: "transcript",
+          entry: genericDynamicToolCall(request.params.callId, request.params.tool, payload),
+        })
+      }
 
-
+      // Client-declared dynamic tools (e.g. MemoSync memory tools): dispatch to
+      // the registered handler instead of rejecting. (Kanna's default is the
+      // rejection below when no handler is wired.)
       if (pendingTurn.onDynamicToolCall) {
         const toolArgs = asRecord(request.params.arguments) ?? {}
         let text: string
@@ -1332,6 +1378,22 @@ export class CodexAppServerManager {
     })
   }
 
+  private notificationTurnId(notification: ServerNotification) {
+    switch (notification.method) {
+      case "turn/started":
+      case "turn/completed":
+        return notification.params.turn.id
+      case "thread/started":
+        return null
+      default:
+        return "turnId" in notification.params ? notification.params.turnId : null
+    }
+  }
+
+  private notificationThreadId(notification: ServerNotification) {
+    return "threadId" in notification.params ? notification.params.threadId : null
+  }
+
   private async handleNotification(context: SessionContext, notification: ServerNotification) {
     if (notification.method === "thread/started") {
       context.sessionToken = notification.params.thread.id
@@ -1346,6 +1408,16 @@ export class CodexAppServerManager {
 
     const pendingTurn = context.pendingTurn
     if (!pendingTurn) return
+    const notificationThreadId = this.notificationThreadId(notification)
+    if (notificationThreadId && context.sessionToken && notificationThreadId !== context.sessionToken) return
+    const notificationTurnId = this.notificationTurnId(notification)
+    if (notificationTurnId) {
+      if (pendingTurn.turnId === null) {
+        pendingTurn.bufferedNotifications.push(notification)
+        return
+      }
+      if (pendingTurn.turnId !== notificationTurnId || pendingTurn.resolved) return
+    }
 
     switch (notification.method) {
       case "thread/tokenUsage/updated":
@@ -1371,12 +1443,13 @@ export class CodexAppServerManager {
         })
         return
       case "turn/completed":
-        await this.handleTurnCompleted(context, notification.params)
+        await this.handleTurnCompleted(context, pendingTurn, notification.params)
         return
       case "thread/compacted":
         this.handleContextCompacted(pendingTurn, notification.params)
         return
       case "error":
+        if (notification.params.willRetry) return
         this.failContext(context, notification.params.error.message)
         return
       default:
@@ -1519,9 +1592,8 @@ export class CodexAppServerManager {
     })
   }
 
-  private async handleTurnCompleted(context: SessionContext, notification: TurnCompletedNotification) {
-    const pendingTurn = context.pendingTurn
-    if (!pendingTurn) return
+  private async handleTurnCompleted(context: SessionContext, pendingTurn: PendingTurn, notification: TurnCompletedNotification) {
+    if (context.pendingTurn !== pendingTurn || pendingTurn.resolved || pendingTurn.completionInProgress) return
     const status = notification.turn.status
     const isCancelled = status === "interrupted"
     const isError = status === "failed"
@@ -1532,6 +1604,7 @@ export class CodexAppServerManager {
         || renderPlanMarkdownFromSteps(pendingTurn.latestPlanSteps).trim()
 
       if (planText) {
+        pendingTurn.completionInProgress = true
         pendingTurn.turnId = null
         const tool = {
           kind: "tool" as const,
@@ -1555,9 +1628,10 @@ export class CodexAppServerManager {
           }),
         })
         await pendingTurn.onToolRequest({ tool })
+        if (context.pendingTurn !== pendingTurn || pendingTurn.resolved) return
         pendingTurn.resolved = true
         pendingTurn.queue.finish()
-        context.pendingTurn = null
+        if (context.pendingTurn === pendingTurn) context.pendingTurn = null
         return
       }
     }
@@ -1574,10 +1648,12 @@ export class CodexAppServerManager {
       }),
     })
     pendingTurn.queue.finish()
-    context.pendingTurn = null
+    if (context.pendingTurn === pendingTurn) context.pendingTurn = null
   }
 
   private failContext(context: SessionContext, message: string) {
+    if (context.closed) return
+    context.closed = true
     const pendingTurn = context.pendingTurn
     if (pendingTurn && !pendingTurn.resolved) {
       pendingTurn.queue.push({
@@ -1591,14 +1667,22 @@ export class CodexAppServerManager {
         }),
       })
       pendingTurn.queue.finish()
-      context.pendingTurn = null
+      pendingTurn.resolved = true
+      if (context.pendingTurn === pendingTurn) context.pendingTurn = null
     }
 
     for (const pending of context.pendingRequests.values()) {
       pending.reject(new Error(message))
     }
     context.pendingRequests.clear()
-    context.closed = true
+    if (this.sessions.get(context.chatId) === context) {
+      this.sessions.delete(context.chatId)
+    }
+    try {
+      context.child.kill("SIGKILL")
+    } catch {
+      // Preserve the original failure if the child has already exited.
+    }
   }
 
   private async sendRequest<TResult>(context: SessionContext, method: string, params: unknown): Promise<TResult> {

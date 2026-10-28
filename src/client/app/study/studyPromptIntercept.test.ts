@@ -73,7 +73,7 @@ describe("study prompt interception seam (2026-08-19 evening revision)", () => {
 
   test("an eager server preparation settles the composer without dispatching the first prompt a second time", async () => {
     const dispatchedReviewIds: Array<string | undefined> = []
-    let providerPromptCount = 1
+    let providerPromptCount = 1 // the eager `/prepare` server owner
     const hold = createHeldStudyPrompt({
       content: "Build the booking flow",
       dispatch: async (openingReviewId?: string) => {
@@ -84,7 +84,9 @@ describe("study prompt interception seam (2026-08-19 evening revision)", () => {
     let settled = false
     void hold.promise.finally(() => { settled = true })
 
-
+    // `/prepare` already claimed and dispatched this exact review on the
+    // server, and its response came back as `preparing` rather than
+    // `dispatch_pending`. Continue must only settle ChatInput's promise.
     hold.markExternallyPrepared("opening-review-eager")
     expect(settled).toBe(false)
     await hold.release()
@@ -169,6 +171,29 @@ describe("study prompt interception seam (2026-08-19 evening revision)", () => {
     expect(cleared).toBe(1)
   })
 
+  test("clears an exact restored draft on HTTP without WebCrypto digests", async () => {
+    const originalCrypto = globalThis.crypto
+    Object.defineProperty(globalThis, "crypto", { value: {}, configurable: true, writable: true })
+    try {
+      const current = {
+        content: "Build the booking flow",
+        attachments: [{ id: "upload-1", relativePath: "brief.md" }],
+      }
+      const promptHash = await hashStudyPromptDraft(current)
+      expect(promptHash).toBe(hashMemoryBoardOpeningPrompt(current))
+
+      let cleared = 0
+      await expect(settleServerOwnedStudyPromptDraft({
+        promptHash,
+        getCurrent: () => current,
+        clear: () => { cleared += 1 },
+      })).resolves.toBe(true)
+      expect(cleared).toBe(1)
+    } finally {
+      Object.defineProperty(globalThis, "crypto", { value: originalCrypto, configurable: true, writable: true })
+    }
+  })
+
   test("never erases a draft changed while delayed ownership status is arriving", async () => {
     const owned = {
       content: "Build the booking flow",
@@ -198,8 +223,8 @@ describe("study prompt interception seam (2026-08-19 evening revision)", () => {
   })
 
   test("the gate is fail-closed: only an explicitly admitted state passes", () => {
-
-
+    // checking and error must CAPTURE (the modal shows progress/retry), never
+    // let the prompt race the review receipt.
     expect(studyGateCapturesPrompt("checking")).toBe(true)
     expect(studyGateCapturesPrompt("error")).toBe(true)
     expect(studyGateCapturesPrompt("review_required")).toBe(true)

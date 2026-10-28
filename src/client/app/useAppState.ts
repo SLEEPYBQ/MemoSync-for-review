@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router-dom"
+import { copyTextToClipboard } from "../lib/clipboard"
 import { useShallow } from "zustand/react/shallow"
-import { normalizeClaudeContextWindow, type AgentProvider, type AppSettingsPatch, type AppSettingsSnapshot, type AskUserQuestionAnswerMap, type ChatAttachment, type ChatDiffSnapshot, type ChatHistoryPage, type ExpectedMemoryUse, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type MemoryPreviewDecision, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateInstallResult, type UpdateSnapshot, type UserPromptEntry } from "../../shared/types"
+import { isPiReasoningEffort, normalizeClaudeContextWindow, type AgentProvider, type AppSettingsPatch, type AppSettingsSnapshot, type AskUserQuestionAnswerMap, type ChatAttachment, type ChatDiffSnapshot, type ChatHistoryPage, type ExpectedMemoryUse, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type MemoryPreviewDecision, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateInstallResult, type UpdateSnapshot, type UserPromptEntry } from "../../shared/types"
 import { NEW_CHAT_COMPOSER_ID, type ComposerState, useChatPreferencesStore } from "../stores/chatPreferencesStore"
 import { useRightSidebarStore } from "../stores/rightSidebarStore"
 import { useTerminalLayoutStore } from "../stores/terminalLayoutStore"
@@ -58,7 +59,7 @@ function sameTranscriptEntries(left: ChatSnapshot["messages"] | null | undefined
   if (left === right) return true
   if (!left || !right) return false
   if (left.length !== right.length) return false
-  return left.every((entry, index) => entry._id === right[index]?._id)
+  return left.every((entry, index) => entry === right[index] || JSON.stringify(entry) === JSON.stringify(right[index]))
 }
 
 function sameMemoryRecordEntries(
@@ -558,6 +559,19 @@ function composerStateFromSendOptions(options?: {
     }
   }
 
+  if (options?.provider === "pi" && options.model && options.modelOptions?.pi) {
+    return {
+      provider: "pi",
+      model: options.model,
+      modelOptions: {
+        reasoningEffort: isPiReasoningEffort(options.modelOptions.pi.reasoningEffort)
+          ? options.modelOptions.pi.reasoningEffort
+          : "medium",
+      },
+      planMode: false,
+    }
+  }
+
   return null
 }
 
@@ -667,7 +681,7 @@ export async function runChatStartAction(
 }
 
 export function resolveComposeIntent(params: {
-
+  /** A project the user explicitly picked (landing composer) — beats any remembered selection. */
   explicitLocalPath?: string | null
   selectedProjectId: string | null
   sidebarProjectId?: string | null
@@ -814,8 +828,16 @@ export function useAppState(activeChatId: string | null): AppState {
   const [chatSnapshot, setChatSnapshot] = useState<ChatSnapshot | null>(null)
   const [olderHistoryEntries, setOlderHistoryEntries] = useState<TranscriptEntry[]>([])
   const [isHistoryLoading, setIsHistoryLoading] = useState(false)
-  const [historyCursor, setHistoryCursor] = useState<string | null>(null)
   const [hasOlderHistory, setHasOlderHistory] = useState(false)
+  const historyOwnerRef = useRef<{
+    chatId: string | null
+    paged: boolean
+    request: object | null
+    cursor: string | null
+    recentMessages: TranscriptEntry[]
+    windowGeneration: object
+    windowUpdates: Promise<void>
+  } | null>(null)
   const [projectDiffSnapshots, setProjectDiffSnapshots] = useState<Record<string, ChatDiffSnapshot | null>>({})
   const [keybindings, setKeybindings] = useState<KeybindingsSnapshot | null>(null)
   const [appSettings, setAppSettings] = useState<AppSettingsSnapshot | null>(null)
@@ -829,8 +851,8 @@ export function useAppState(activeChatId: string | null): AppState {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [addProjectModalOpen, setAddProjectModalOpen] = useState(false)
   const [commandError, setCommandError] = useState<string | null>(null)
-
-
+  // A command error belongs to the surface it happened on — it must not
+  // follow the user to the landing page or the next chat.
   useEffect(() => {
     setCommandError(null)
   }, [activeChatId])
@@ -851,7 +873,7 @@ export function useAppState(activeChatId: string | null): AppState {
   const lastChatSnapshotAtRef = useRef(0)
   const lastChatRefreshAtRef = useRef(0)
   const lastStartingRenderedTraceIdRef = useRef<string | null>(null)
-
+  // In-flight guard so a double-click never creates two chats (BUG LAND-3).
   const creatingChatRef = useRef(false)
   const lastActiveProjectDiffRef = useRef<{ projectId: string | null; diffs: ChatDiffSnapshot | null }>({
     projectId: null,
@@ -960,7 +982,7 @@ export function useAppState(activeChatId: string | null): AppState {
           return
         }
       } catch {
-
+        // Keep polling while the process restarts.
       }
 
       if (cancelled) return
@@ -1115,12 +1137,25 @@ export function useAppState(activeChatId: string | null): AppState {
     }
   }, [])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    const owner = {
+      chatId: activeChatId,
+      paged: false,
+      request: null as object | null,
+      cursor: null as string | null,
+      recentMessages: [] as TranscriptEntry[],
+      windowGeneration: {},
+      windowUpdates: Promise.resolve(),
+    }
+    historyOwnerRef.current = owner
+    setOlderHistoryEntries([])
+    setIsHistoryLoading(false)
+    setHasOlderHistory(false)
     if (!activeChatId) {
       logAppState("clearing chat snapshot for non-chat route")
       setChatSnapshot(null)
       setChatReady(true)
-      return
+      return () => { historyOwnerRef.current = null }
     }
 
     const subscriptionId = ++chatSubscriptionDebugRef.current
@@ -1135,6 +1170,7 @@ export function useAppState(activeChatId: string | null): AppState {
     setChatSnapshot(null)
     setChatReady(false)
     const unsubscribe = socket.subscribe<ChatSnapshot | null>({ type: "chat", chatId: activeChatId, recentLimit: INITIAL_CHAT_RECENT_LIMIT }, (snapshot) => {
+      if (historyOwnerRef.current !== owner) return
       lastChatSnapshotAtRef.current = Date.now()
       if (snapshot?.runtime.chatId) {
         const matchingTrace = [...sendToStartingProfilesRef.current.values()]
@@ -1161,14 +1197,75 @@ export function useAppState(activeChatId: string | null): AppState {
           diffFileCount: 0,
           reusedSnapshot: reused,
         })
-        return reused ? current : snapshot
+        if (reused) return current
+        if (current && snapshot && sameTranscriptEntries(current.messages, snapshot.messages)) {
+          return { ...snapshot, messages: current.messages }
+        }
+        return snapshot
       })
-      setHistoryCursor(snapshot?.history.olderCursor ?? null)
-      setHasOlderHistory(snapshot?.history.hasOlder ?? false)
+      if (!snapshot) {
+        owner.paged = false
+        owner.request = null
+        owner.recentMessages = []
+        owner.windowGeneration = {}
+        owner.windowUpdates = Promise.resolve()
+        setOlderHistoryEntries([])
+        setIsHistoryLoading(false)
+      }
+      if (!owner.paged) {
+        owner.recentMessages = snapshot?.messages ?? []
+        owner.cursor = snapshot?.history.olderCursor ?? null
+        setHasOlderHistory(snapshot?.history.hasOlder ?? false)
+      } else if (snapshot) {
+        const generation = owner.windowGeneration
+        const isCurrent = () => historyOwnerRef.current === owner && owner.windowGeneration === generation
+        // Backfill live windows in order without moving the user's older-page cursor.
+        owner.windowUpdates = owner.windowUpdates.then(async () => {
+          if (!isCurrent()) return
+          if (sameTranscriptEntries(owner.recentMessages, snapshot.messages)) return
+          const anchorId = owner.recentMessages.at(-1)?._id
+          let bridge: TranscriptEntry[] = []
+          if (anchorId && snapshot.messages.length > 0 && !snapshot.messages.some((entry) => entry._id === anchorId)) {
+            let cursor = snapshot.history.olderCursor
+            let foundAnchor = false
+            const visited = new Set<string>()
+            while (cursor && !visited.has(cursor)) {
+              visited.add(cursor)
+              const page = await socket.command<ChatHistoryPage>({
+                type: "chat.loadHistory",
+                chatId: activeChatId,
+                beforeCursor: cursor,
+                limit: CHAT_HISTORY_PAGE_SIZE,
+              })
+              if (!isCurrent()) return
+              const anchorIndex = page.messages.findIndex((entry) => entry._id === anchorId)
+              bridge = mergeTranscriptEntries(
+                anchorIndex >= 0 ? page.messages.slice(anchorIndex + 1) : page.messages,
+                bridge,
+              )
+              if (anchorIndex >= 0) {
+                foundAnchor = true
+                break
+              }
+              cursor = page.hasOlder ? page.olderCursor : null
+            }
+            if (!foundAnchor) throw new Error("Chat history changed while loading. Reopen the chat to reload it.")
+          }
+          owner.recentMessages = snapshot.messages
+          setOlderHistoryEntries((current) => mergeTranscriptEntries(
+            current,
+            mergeTranscriptEntries(bridge, snapshot.messages),
+          ))
+        }).catch((error) => {
+          if (!isCurrent()) return
+          setCommandError(error instanceof Error ? error.message : "Failed to load intervening chat history")
+        })
+      }
       setChatReady(true)
       setCommandError(null)
     })
     return () => {
+      historyOwnerRef.current = null
       logAppState("unsubscribing from chat", {
         subscriptionId,
         activeChatId,
@@ -1222,13 +1319,6 @@ export function useAppState(activeChatId: string | null): AppState {
       setCommandError(error instanceof Error ? error.message : String(error))
     })
   }, [activeChatId, focusEpoch, sidebarProjectGroups, sidebarReady, socket])
-
-  useEffect(() => {
-    setOlderHistoryEntries([])
-    setIsHistoryLoading(false)
-    setHistoryCursor(null)
-    setHasOlderHistory(false)
-  }, [activeChatId])
 
   const activeChatSnapshot = useMemo(
     () => getActiveChatSnapshot(chatSnapshot, activeChatId),
@@ -1320,12 +1410,16 @@ export function useAppState(activeChatId: string | null): AppState {
     ? "starting"
     : null
   const effectiveRuntimeStatus = optimisticRuntimeStatus ?? runtime?.status ?? null
-
-
+  // Launcher fallback honors the server catalog (study pin included) — the
+  // static client-side PROVIDERS list only bridges the very first fetch.
   const availableProviders = activeChatSnapshot?.availableProviders ?? serverProviders
   const isProcessing = isProcessingStatus(effectiveRuntimeStatus ?? undefined)
 
-
+  // A live WebSocket can still lose one terminal chat snapshot under
+  // backpressure. If that snapshot was the transition to idle, the UI would
+  // otherwise display Running forever even though the server is done. While
+  // this chat is visibly processing, periodically rebuild only its snapshot;
+  // the server clears the subscription signature and returns current truth.
   useEffect(() => {
     if (!activeChatId || !isProcessing || connectionStatus !== "connected") return
     const refreshIfStale = () => {
@@ -1345,7 +1439,8 @@ export function useAppState(activeChatId: string | null): AppState {
     return () => window.clearInterval(timer)
   }, [activeChatId, connectionStatus, isProcessing, socket])
 
-
+  // A parked preview gate has no ActiveTurn (status reads idle) but the turn
+  // IS busy server-side — sends must queue, not pretend to deliver.
   const pendingMemoryPreview = useMemo(() => hasPendingMemoryPreview(messages), [messages])
   const canCancel = canCancelStatus(effectiveRuntimeStatus ?? undefined)
   const isDraining = runtime?.isDraining ?? false
@@ -1459,29 +1554,43 @@ export function useAppState(activeChatId: string | null): AppState {
   }, [optimisticScopeId, serverTranscriptEntries])
 
   const loadOlderHistory = useCallback(async () => {
-    if (!activeChatId || !historyCursor || isHistoryLoading || !hasOlderHistory) {
+    const owner = historyOwnerRef.current
+    if (!activeChatId || isHistoryLoading || !hasOlderHistory
+      || !owner || owner.chatId !== activeChatId || owner.request || !owner.cursor) {
       return
     }
 
+    const request = {}
+    owner.request = request
+    if (!owner.paged) {
+      setOlderHistoryEntries((current) => mergeTranscriptEntries(current, owner.recentMessages))
+    }
+    owner.paged = true
+    const isCurrent = () => historyOwnerRef.current === owner && owner.request === request
     setIsHistoryLoading(true)
     try {
       const page = await socket.command<ChatHistoryPage>({
         type: "chat.loadHistory",
         chatId: activeChatId,
-        beforeCursor: historyCursor,
+        beforeCursor: owner.cursor,
         limit: CHAT_HISTORY_PAGE_SIZE,
       })
+      if (!isCurrent()) return
       setOlderHistoryEntries((current) => mergeTranscriptEntries(page.messages, current))
-      setHistoryCursor(page.olderCursor)
+      owner.cursor = page.olderCursor
       setHasOlderHistory(page.hasOlder)
       setCommandError(null)
     } catch (error) {
+      if (!isCurrent()) return
       const message = error instanceof Error ? error.message : String(error)
       setCommandError(message)
     } finally {
-      setIsHistoryLoading(false)
+      if (isCurrent()) {
+        owner.request = null
+        setIsHistoryLoading(false)
+      }
     }
-  }, [activeChatId, hasOlderHistory, historyCursor, isHistoryLoading, socket])
+  }, [activeChatId, hasOlderHistory, isHistoryLoading, socket])
 
   const createChatForProject = useCallback(async (projectId: string) => {
     const chatPreferences = useChatPreferencesStore.getState()
@@ -1516,8 +1625,11 @@ export function useAppState(activeChatId: string | null): AppState {
   }, [socket])
 
   const startChatFromIntent = useCallback(async (intent: StartChatIntent): Promise<ChatStartResult> => {
-
-
+    // Guard every new-chat entry point against a double-click / concurrent
+    // invocation during the async create window. The sidebar's "New Chat"
+    // button had no disabled state wired for the project_id path, so two quick
+    // clicks created two chats (BUG LAND-3). This source-level guard covers all
+    // callers regardless of per-button UI plumbing.
     if (creatingChatRef.current) {
       return { ok: false, error: "Another chat is already being created. Please wait and try again." }
     }
@@ -1966,10 +2078,9 @@ export function useAppState(activeChatId: string | null): AppState {
 
   const handleCopyPath = useCallback(async (localPath: string) => {
     try {
-      if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
-        throw new Error("Clipboard is not available")
+      if (!await copyTextToClipboard(localPath)) {
+        throw new Error("Copy failed. Select the path and copy it manually.")
       }
-      await navigator.clipboard.writeText(localPath)
       setCommandError(null)
     } catch (error) {
       setCommandError(error instanceof Error ? error.message : String(error))
@@ -2062,10 +2173,9 @@ export function useAppState(activeChatId: string | null): AppState {
     }
 
     try {
-      if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
-        throw new Error("Clipboard is not available")
+      if (!await copyTextToClipboard(standaloneShareUrl)) {
+        throw new Error("Copy failed. Select the link and copy it manually.")
       }
-      await navigator.clipboard.writeText(standaloneShareUrl)
       return true
     } catch (error) {
       await dialog.alert({
@@ -2137,12 +2247,12 @@ export function useAppState(activeChatId: string | null): AppState {
         decision,
         memoryIds,
         expectedUses,
-        operationId: `control:working-memory-${decision}:${previewId}:${crypto.randomUUID()}`,
+        operationId: `control:working-memory-${decision}:${previewId}:${generateUUID()}`,
       })
     } catch (error) {
       setCommandError(error instanceof Error ? error.message : String(error))
-
-
+      // Re-throw so the gate card can re-enable its buttons instead of being
+      // stuck on a spinner forever when the send fails (BUG MSG-5).
       throw error
     }
   }, [activeChatId, socket])

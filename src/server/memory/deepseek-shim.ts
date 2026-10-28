@@ -1,7 +1,19 @@
-
+// In-container chat-completions shim for the Codex engine on DeepSeek.
+//
+// Why this exists: codex ≥0.84 speaks ONLY the OpenAI Responses API, which
+// DeepSeek does not serve (404 on /v1/responses); codex ≤0.81 still speaks
+// chat/completions but emits `role: "developer"` messages, which DeepSeek's
+// chat API rejects. So the image pins codex 0.81 and points its provider at
+// this shim (docker/codex-config.toml → http://127.0.0.1:<port>/v1), which
+// rewrites developer→system in the REQUEST and byte-pipes everything else —
+// responses (incl. SSE streams) pass through untouched.
+//
+// This is engine plumbing, not memory logic; it lives here beside deepseek.ts
+// because it shares the "DeepSeek runtime" concern. Revisit when DeepSeek
+// ships a Responses endpoint or the Codex arm moves to an OpenAI key.
 
 export interface DeepSeekChatShimOptions {
-
+  /** 0 = pick an ephemeral port (tests). */
   port?: number;
   upstreamBaseUrl?: string;
   fetchImpl?: typeof fetch;
@@ -12,7 +24,7 @@ export interface DeepSeekChatShim {
   stop(): void;
 }
 
-
+/** Rewrite a chat-completions request body: `developer` role → `system`. */
 export function rewriteChatBody(raw: string): string {
   try {
     const body = JSON.parse(raw);
@@ -39,7 +51,7 @@ export function startDeepSeekChatShim(opts: DeepSeekChatShimOptions = {}): DeepS
     port: opts.port ?? 3979,
     async fetch(req) {
       const url = new URL(req.url);
-
+      // codex calls <base_url>/chat/completions (and /models on startup).
       const path = url.pathname.replace(/^\/v1/, '');
       const forwardHeaders = new Headers();
       const auth = req.headers.get('authorization');
@@ -51,7 +63,7 @@ export function startDeepSeekChatShim(opts: DeepSeekChatShimOptions = {}): DeepS
         init.body = rewriteChatBody(await req.text());
       }
       const res = await fetchImpl(`${upstream}${path}${url.search}`, init);
-
+      // Byte-pipe the upstream response (SSE streaming included).
       return new Response(res.body, { status: res.status, headers: res.headers });
     },
   });

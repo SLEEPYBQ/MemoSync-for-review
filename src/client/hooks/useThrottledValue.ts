@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState } from "react"
 
-
+/**
+ * Re-emits `value` at most once per `intervalMs`, always landing on the
+ * latest value (trailing edge). The initial value renders immediately.
+ *
+ * Built for the streaming reply preview: text deltas arrive up to ~50/s and
+ * each re-render reparses the full accumulated markdown — O(n²) over a long
+ * reply. Ten repaints a second is indistinguishable to the reader and keeps
+ * the parse cost bounded.
+ */
 export function useThrottledValue<T>(value: T, intervalMs: number): T {
   const [throttled, setThrottled] = useState(value)
   const lastEmitRef = useRef(Number.NEGATIVE_INFINITY)

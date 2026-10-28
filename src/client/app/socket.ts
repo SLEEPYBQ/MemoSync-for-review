@@ -13,10 +13,10 @@ type SnapshotListener<T> = (value: T) => void
 type EventListener<T> = (value: T) => void
 export type SocketStatus = "connecting" | "connected" | "disconnected"
 
-
+/** Fired on window when a reconnect probe finds the session locked out. */
 export const WS_UNAUTHORIZED_EVENT = "memosync:ws-unauthorized"
 
-
+/** True when the server says password auth is on and this session is not in. */
 export function isLockedOutAuthStatus(payload: unknown): boolean {
   if (!payload || typeof payload !== "object") return false
   const status = payload as { enabled?: unknown; authenticated?: unknown }
@@ -27,8 +27,11 @@ type StatusListener = (status: SocketStatus) => void
 const STALE_CONNECTION_MS = 25_000
 const HEARTBEAT_INTERVAL_MS = 15_000
 const PING_TIMEOUT_MS = 4_000
-
-
+// Acks are fast (chat.send acks even before the engine boots — the preview
+// gate parks instead of blocking), so a missing ack means the connection is
+// gone even when the transport never says so (zombie TCP after a container
+// restart: no error, no close event). Reject on a local timer the transport
+// can't stall, so callers' error paths (draft restore, banner) actually run.
 const COMMAND_ACK_TIMEOUT_MS = 10_000
 const SEND_TO_STARTING_PROFILE_STORAGE_KEY = "memosync:profile-send-to-starting"
 
@@ -138,7 +141,13 @@ export class AppSocket {
     }
   }
 
-
+  /**
+   * Ask the server to rebuild the latest snapshot for an existing topic.
+   * Reusing the subscription id is intentional: the server clears that id's
+   * snapshot signature before replying, so this repairs a single dropped
+   * terminal snapshot without tearing down the socket or duplicating
+   * listeners.
+   */
   refreshTopic(topic: SubscriptionTopic): boolean {
     const wanted = JSON.stringify(topic)
     let refreshed = false
@@ -232,8 +241,12 @@ export class AppSocket {
       while (this.outboundQueue.length > 0) {
         const envelope = this.outboundQueue.shift()
         if (!envelope) continue
-
-
+        // Only still-pending commands cross a reconnect. A settled command
+        // (close-rejected or ack-timed-out) was already reported failed — the
+        // draft came back and the user may have re-sent it, so replaying the
+        // queued envelope would deliver the "failed" message twice. Queued
+        // (un)subscribes are stale here too: the loop above already
+        // re-subscribed every live topic on this fresh connection.
         if (envelope.type !== "command") continue
         if (!this.pending.has(envelope.id)) continue
         this.sendNow(envelope)
@@ -302,8 +315,10 @@ export class AppSocket {
           pending.reject(new Error(payload.message))
           return
         }
-
-
+        // A scoped subscription error (the server could not derive this
+        // topic's snapshot). For nullable-data topics, deliver null so the
+        // UI shows its empty/not-found state instead of freezing on the
+        // last good snapshot.
         const subscription = this.subscriptions.get(payload.id)
         if (subscription) {
           console.error(LOG_PREFIX, `subscription ${subscription.topic.type} failed:`, payload.message)
@@ -328,8 +343,10 @@ export class AppSocket {
         pending.reject(new Error("Disconnected"))
       }
       this.pending.clear()
-
-
+      // In parallel with the reconnect loop: a handshake 401 (expired or
+      // rotated password cookie) closes the socket with no readable status,
+      // so without this probe the client reconnects forever instead of
+      // returning to the password gate.
       void this.probeAuthLockout()
       if (reconnectImmediately) {
         this.connect()
@@ -353,8 +370,8 @@ export class AppSocket {
       if (!response.ok) return
       if (!isLockedOutAuthStatus(await response.json())) return
     } catch {
-
-
+      // Network trouble — indistinguishable from a real outage; let the
+      // normal reconnect loop keep trying.
       return
     }
     if (!this.started) return

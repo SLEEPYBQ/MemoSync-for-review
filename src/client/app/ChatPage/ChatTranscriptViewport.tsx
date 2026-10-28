@@ -45,7 +45,7 @@ interface ChatTranscriptViewportProps {
   isProcessing: boolean
   canCancel: boolean
   runtimeStatus: string | null
-
+  /** The in-flight assistant reply (ChatRuntime.streamingText). */
   streamingText?: string | null
   isDraining: boolean
   commandError: string | null
@@ -127,8 +127,10 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
     () => hasOpenMemoryPreparationStepIn(messages),
     [messages],
   )
-
-
+  // The footer's spinner is the single live indicator while it renders; the
+  // trailing SDK status row would duplicate it (a "Requesting…" row above a
+  // "Running…" spinner), so it is suppressed and its label moves into the
+  // footer below.
   const showsLiveFooter = isProcessing && !hasOpenMemoryPreparationStep
   const rawRows = useMemo(() => buildResolvedTranscriptRows(messages, {
     isLoading: isProcessing,
@@ -141,11 +143,14 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
     () => getCurrentTurnAssistantMessageIds(messages, canCancel),
     [canCancel, messages],
   )
-
-
+  // One label for the whole working phase: the activity status ("Running…").
+  // SDK statuses like "requesting" are hidden entirely (user decision
+  // 2026-08-11) — participants should never have to interpret them.
   const footerStatus = runtimeStatus ?? undefined
 
-
+  // Violated trace verdicts folded onto their replies (drift at the sentence
+  // itself). Identity pinned to the fold's signature — verdicts land once per
+  // turn, and only then should memoized text rows re-read the context.
   const violatedMap = useMemo(() => buildViolatedCitationsByMessageId(messages), [messages])
   const stableViolatedRef = useRef<{ sig: string; map: Map<string, Set<string>> | null }>({ sig: "", map: null })
   const violatedSig = violatedCitationsSignature(violatedMap)
@@ -219,7 +224,10 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
     }
   }, [listRef, onIsAtEndChange])
 
-
+  // Depend on WHETHER rows exist, not how many: re-running per row change
+  // tears the listener down and rebuilds it behind an rAF, leaving windows
+  // where a user scroll goes uncaptured during tool-heavy churn. The boolean
+  // still covers the late scroller mount on the empty→first-row transition.
   const hasResolvedRows = resolvedRows.length > 0
   useEffect(() => {
     let cleanup: (() => void) | undefined
@@ -276,7 +284,9 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
       return
     }
 
-
+    // Source and text links used to jump straight into Cursor. They now open
+    // the non-IDE destination menu (Preview / Finder / Default App), matching
+    // the product decision to expose no external-editor entry points.
     openLocalLinkMenu(target)
   }, [onOpenLocalLink, openLocalLinkMenu])
 
@@ -317,12 +327,14 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
 
   const listFooter = (
     <div className="mx-auto w-full max-w-[800px]">
-
+      {/* The reply streams here while it is written; the spinner row below it
+          keeps signalling "still going" until the final entry lands. */}
       {isProcessing && !hasOpenMemoryPreparationStep && streamingText ? (
         <StreamingAssistantText text={streamingText} />
       ) : null}
       {showsLiveFooter ? <ProcessingMessage status={footerStatus} /> : null}
-
+      {/* "failed" is a persistent outcome (lastTurnOutcome), not a processing
+          state — without this row a dead turn just ends in silence. */}
       {!isProcessing && runtimeStatus === "failed" ? <ProcessingMessage status="failed" /> : null}
       {queuedMessages.map((message) => (
         <QueuedUserMessage
@@ -416,7 +428,10 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
             bottom: transcriptPaddingBottom,
           }}
         >
-
+          {/* REDESIGN D7: no session-start bring-in gate — every active memory
+              is in by default (a zero-evidence moment deserves no forced
+              curation decision); the Session memories panel owns the
+              restorable per-session exclusions instead. */}
           <div className="mx-auto flex h-full max-w-[800px] items-center justify-center">
               <div className="flex flex-col items-center justify-center gap-4 text-muted-foreground opacity-70">
                 <BrandIcon animated="loop" className="memosync-empty-state-flower size-24" />

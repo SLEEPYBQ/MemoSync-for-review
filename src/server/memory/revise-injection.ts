@@ -1,5 +1,10 @@
-
-
+// "Ask agent to revise" on the Step 2 gate (redesign 2026-08-07 §3): the
+// developer adjusts the injected set in natural language without leaving the
+// card. The pass gets the pool, the current selection, and the instruction;
+// it returns a new selection plus a concise Markdown-capable reply naming what
+// changed — the card applies it live, and the final confirm stays where it
+// always was (Start). Fast path: reasoning off, hard timeout, minimal-change
+// bias.
 import type { LlmJsonCaller } from './deepseek';
 
 export interface ReviseInjectionInput {
@@ -10,8 +15,8 @@ export interface ReviseInjectionInput {
 
 export interface ReviseInjectionResult {
   selectedIds: string[];
-
-
+  /** The assistant's short reply: names the changes, or ANSWERS a question
+   * about the pool ("[M-12] and [M-31] cover testing; added [M-12]"). */
   reply: string;
 }
 

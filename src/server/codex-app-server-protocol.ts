@@ -1,4 +1,5 @@
-
+// Minimal typed subset vendored from `codex app-server generate-ts`.
+// Keep names and field shapes aligned with the official app-server protocol.
 
 import type { CodexReasoningEffort, ServiceTier } from "../shared/types"
 
@@ -24,7 +25,11 @@ export interface InitializeParams {
   }
 }
 
-
+/**
+ * A client-declared dynamic tool (experimental). Declared on thread start; when
+ * the model calls it, the app-server sends a server->client `item/tool/call`
+ * request the client must answer. Requires `capabilities.experimentalApi`.
+ */
 export interface DynamicToolFunctionSpec {
   type: "function"
   name: string
@@ -71,7 +76,7 @@ export interface ThreadForkParams {
 
 export interface ConfigReadParams {
   includeLayers?: boolean
-
+  /** Include project configuration visible from this working directory. */
   cwd?: string | null
 }
 
@@ -88,7 +93,7 @@ export interface TextUserInput {
 export type CodexUserInput = TextUserInput
 
 export interface CollaborationMode {
-
+  /** "code" is the pre-0.95 protocol's name for the default mode (CODEX_PROTOCOL_COMPAT=0.9x). */
   mode: "default" | "plan" | "code"
   settings: {
     model: string | null
@@ -107,7 +112,7 @@ export interface TurnStartParams {
   effort?: ReasoningEffort | null
   serviceTier?: ServiceTier | null
   collaborationMode?: CollaborationMode | null
-
+  /** JSON Schema for the final assistant response; applies to this turn only. */
   outputSchema?: Record<string, unknown> | null
 }
 
@@ -174,7 +179,7 @@ export interface PlanDeltaNotification {
   delta: string
 }
 
-
+/** Streaming chunk of an agentMessage item's text — same shape as plan deltas. */
 export interface AgentMessageDeltaNotification {
   threadId: string
   turnId: string

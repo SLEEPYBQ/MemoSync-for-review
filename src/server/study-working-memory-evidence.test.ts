@@ -60,8 +60,8 @@ test("a delayed Working Memory toggle survives freeze and restart with its origi
         : null,
       getSusSubmission: () => null,
     }
-
-
+    // Fresh registry + authority objects model a process restart after the
+    // original task froze and the next serial task became active.
     const registry = new StudyRegistry(undefined, ["038-S1", "038-S2"], lifecycle)
     const chats = new Map([
       ["chat-038-s1", {

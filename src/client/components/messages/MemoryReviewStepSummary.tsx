@@ -10,7 +10,11 @@ interface Props {
   onReopen?: () => Promise<void> | void
 }
 
-
+/**
+ * Shared settled-state layout for Step 1 and Step 2. The first line records
+ * what happened; the second line explains the downstream cost of reopening;
+ * the outlined control is the only actionable element in the row.
+ */
 export function MemoryReviewStepSummary({ title, outcome, consequence, reopening, onReopen }: Props) {
   return (
     <div className="rounded-xl border border-border bg-card px-4 py-3 shadow-sm">

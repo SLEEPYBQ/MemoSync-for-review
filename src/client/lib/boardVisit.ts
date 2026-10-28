@@ -1,5 +1,7 @@
-
-
+// The Board is the developer's externalized meta-level model of agent memory.
+// N&N's model is DYNAMIC: the system carries the "what changed since I last
+// looked" diff so the developer doesn't have to — otherwise the drift problem
+// recurs one level up (the developer's model of the Board goes stale).
 import type { MemoryItem } from "./memoriesApi"
 
 const KEY = "memosync:memory-board-last-visit"
@@ -18,7 +20,7 @@ export function markBoardVisit(timestampMs: number): void {
   try {
     window.localStorage.setItem(KEY, String(timestampMs))
   } catch {
-
+    // private mode etc. — markers just stay off
   }
 }
 

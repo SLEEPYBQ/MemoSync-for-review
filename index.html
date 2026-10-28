@@ -7,11 +7,15 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- Theme is locked to light — no dark-mode bootstrap. -->
     <style>
       :root {
         color-scheme: light;
       }
     </style>
+    <!-- Brand is condition-aware (study arms must not show the MemoSync
+         identity): the empty title and the favicon are filled in by
+         BrandMark once /api/condition resolves. -->
     <title></title>
   </head>
   <body>

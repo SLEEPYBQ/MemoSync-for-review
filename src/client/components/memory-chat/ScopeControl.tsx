@@ -1,5 +1,6 @@
-
-
+// Segmented scope selector for the in-chat memory review flow (SPEC §5 —
+// ported/re-skinned from v1's ScopeControl). Selected segment is tinted with
+// that scope's color; unselected segments look like ghost buttons.
 import { Check, FolderGit2, MessagesSquare, User } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
 import type { MemoryScope } from "../../lib/memoriesApi"
@@ -12,7 +13,8 @@ const SCOPE_OPTIONS: { value: MemoryScope; label: string; icon: LucideIcon }[] =
   { value: "personal", label: "Personal", icon: User },
 ]
 
-
+// What the choice DOES — where the memory injects and how long it lives.
+// The picker's labels alone made first-time users guess (friction #6).
 export const SCOPE_CONSEQUENCES: Record<MemoryScope, string> = {
   session: "Only this chat — gone when the session ends.",
   project: "Injected in every chat of this project.",
@@ -24,7 +26,7 @@ interface ScopeControlProps {
   onValueChange: (scope: MemoryScope) => void
   className?: string
   disabled?: boolean
-
+  /** Show a one-line consequence for the selected scope under the segments. */
   showConsequence?: boolean
 }
 

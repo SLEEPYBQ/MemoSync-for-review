@@ -687,7 +687,7 @@ function BranchSwitcher({
   const [isLoading, setIsLoading] = useState(false)
   const [isMutating, setIsMutating] = useState(false)
   const [query, setQuery] = useState("")
-
+  // Study deployments are local-only git: the PR view has nothing to show.
   const remoteGitEnabled = !useConditionPolicy().studyMode
   const [entryView, setEntryView] = useState<"branches" | "pull_requests">("branches")
   const [branchList, setBranchList] = useState<ChatBranchListResult | null>(null)
@@ -1004,7 +1004,10 @@ function DiffFileCard({
       return
     }
 
-
+    // Expand whether the load succeeds OR fails: on failure the error lives in
+    // patchError, which only renders in the expanded body. Keeping the card
+    // collapsed on failure (the old .catch(() => {})) left the file looking
+    // normal but permanently un-openable, with the error invisible (BUG PANEL-4).
     void onLoadPatch(file.path).then(
       () => onToggleCollapsed(),
       () => onToggleCollapsed(),
@@ -1212,7 +1215,7 @@ function GitPanelImpl({
     onCopyFilePath,
     onCopyRelativePath,
   }), [onOpenInFinder, onDiscardFile, onIgnoreFile, onIgnoreFolder, onCopyFilePath, onCopyRelativePath])
-
+  // Study deployments are local-only git: no publish/sync/PR affordances.
   const remoteGitEnabled = !useConditionPolicy().studyMode
   const hasChanges = diffs.files.length > 0
   const [isGenerating, setIsGenerating] = useState(false)
@@ -1474,8 +1477,8 @@ function GitPanelImpl({
             ) : null}
           </div>
           {diffs.status === "ready" ? (
-
-
+            // Local-only git: repos without a remote — or a study deployment
+            // with remote git turned off — get no publish/sync CTA.
             !hasRemoteOrigin || !remoteGitEnabled ? null : syncAction === "publish" ? (
               <Button
                 variant="ghost"

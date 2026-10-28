@@ -15,7 +15,7 @@ describe("buildEditorCommand", () => {
   test("builds a preset goto command for file links", () => {
     expect(
       buildEditorCommand({
-        localPath: "/Users/reviewer/Projects/example/src/client/app/App.tsx",
+        localPath: "/Users/user/Projects/sample-app/src/client/app/App.tsx",
         isDirectory: false,
         line: 12,
         column: 3,
@@ -24,28 +24,28 @@ describe("buildEditorCommand", () => {
       })
     ).toEqual({
       command: "code",
-      args: ["--goto", "/Users/reviewer/Projects/example/src/client/app/App.tsx:12:3"],
+      args: ["--goto", "/Users/user/Projects/sample-app/src/client/app/App.tsx:12:3"],
     })
   })
 
   test("builds a preset project command for directory opens", () => {
     expect(
       buildEditorCommand({
-        localPath: "/Users/reviewer/Projects/example",
+        localPath: "/Users/user/Projects/sample-app",
         isDirectory: true,
         editor: { preset: "cursor", commandTemplate: "cursor {path}" },
         platform: "linux",
       })
     ).toEqual({
       command: "cursor",
-      args: ["/Users/reviewer/Projects/example"],
+      args: ["/Users/user/Projects/sample-app"],
     })
   })
 
   test("uses the custom template for editor opens", () => {
     expect(
       buildEditorCommand({
-        localPath: "/Users/reviewer/Projects/example/src/client/app/App.tsx",
+        localPath: "/Users/user/Projects/sample-app/src/client/app/App.tsx",
         isDirectory: false,
         line: 12,
         column: 1,
@@ -54,14 +54,14 @@ describe("buildEditorCommand", () => {
       })
     ).toEqual({
       command: "my-editor",
-      args: ["/Users/reviewer/Projects/example/src/client/app/App.tsx", "--line", "12"],
+      args: ["/Users/user/Projects/sample-app/src/client/app/App.tsx", "--line", "12"],
     })
   })
 
   test("builds an Xcode line command with xed", () => {
     expect(
       buildEditorCommand({
-        localPath: "/Users/reviewer/Projects/example/App.swift",
+        localPath: "/Users/user/Projects/sample-app/App.swift",
         isDirectory: false,
         line: 24,
         column: 2,
@@ -70,7 +70,7 @@ describe("buildEditorCommand", () => {
       })
     ).toEqual({
       command: "xed",
-      args: ["-l", "24", "/Users/reviewer/Projects/example/App.swift"],
+      args: ["-l", "24", "/Users/user/Projects/sample-app/App.swift"],
     })
   })
 })
@@ -79,19 +79,19 @@ describe("buildPreviewCommand", () => {
   test("builds a native macOS Preview open command", () => {
     expect(
       buildPreviewCommand({
-        localPath: "/Users/reviewer/Projects/example/mock.png",
+        localPath: "/Users/user/Projects/sample-app/mock.png",
         isDirectory: false,
         platform: "darwin",
       })
     ).toEqual({
       command: "open",
-      args: ["-a", "Preview", "/Users/reviewer/Projects/example/mock.png"],
+      args: ["-a", "Preview", "/Users/user/Projects/sample-app/mock.png"],
     })
   })
 
   test("rejects non-macOS platforms", () => {
     expect(() => buildPreviewCommand({
-      localPath: "/Users/reviewer/Projects/example/mock.png",
+      localPath: "/Users/user/Projects/sample-app/mock.png",
       isDirectory: false,
       platform: "linux",
     })).toThrow("Preview is only available on macOS")
@@ -100,9 +100,9 @@ describe("buildPreviewCommand", () => {
 
 describe("buildDefaultOpenCommand", () => {
   test("builds default open commands for supported platforms", () => {
-    expect(buildDefaultOpenCommand({ localPath: "/Users/reviewer/Projects/example/mock.png", platform: "darwin" })).toEqual({
+    expect(buildDefaultOpenCommand({ localPath: "/Users/user/Projects/sample-app/mock.png", platform: "darwin" })).toEqual({
       command: "open",
-      args: ["/Users/reviewer/Projects/example/mock.png"],
+      args: ["/Users/user/Projects/sample-app/mock.png"],
     })
     expect(buildDefaultOpenCommand({ localPath: "/tmp/mock.png", platform: "linux" })).toEqual({
       command: "xdg-open",

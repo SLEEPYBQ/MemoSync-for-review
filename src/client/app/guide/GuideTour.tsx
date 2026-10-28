@@ -7,8 +7,6 @@ import { BrowserPanel } from "../../components/chat-ui/BrowserPanel"
 import { ChatNavbar } from "../../components/chat-ui/ChatNavbar"
 import { FilesPanel } from "../../components/chat-ui/FilesPanel"
 import { SessionMemoriesPanel } from "../../components/memory-chat/SessionMemoriesPanel"
-import { MemorySummaryPanel } from "../../components/memory-chat/MemorySummaryPanel"
-import { StaticMemoryPanel } from "../../components/memory-chat/StaticMemoryPanel"
 import { OpenLocalLinkProvider, TurnInterruptContext, type TurnInterruptApi } from "../../components/messages/shared"
 import {
   TranscriptChatContextProvider,
@@ -64,7 +62,12 @@ import {
   type GuideNavigationEvent,
 } from "./guideNavigation"
 
-
+/**
+ * A step's spotlight target inside the demo surface. Single rows are
+ * addressed by their entry id (TOUR_ANCHORS); grouped rows (tool runs, the
+ * memory review flow) by row kind + occurrence index; sub-elements of a card
+ * by a stable data-attribute selector; the side panel and composer directly.
+ */
 export type TourTarget =
   | { rowId: string }
   | { rowKind: "tool-group" | "memory-changes-review"; nth?: number }
@@ -72,7 +75,7 @@ export type TourTarget =
   | { css: string }
   | { panel: true }
 
-export type TourPanel = "memoryRecord" | "autoMemory" | "staticMemory" | "browser" | "files" | "board" | "studySessionSetup" | "studySessions" | "studyBrief" | "studySubmit" | "studyPostSession"
+export type TourPanel = "memoryRecord" | "browser" | "files" | "board" | "studySessionSetup" | "studySessions" | "studyBrief" | "studySubmit" | "studyPostSession"
 
 export const GUIDE_CHAPTERS = [
   {
@@ -161,37 +164,39 @@ export function GuideSectionTabs({
 }
 
 export interface TourStep {
-
+  /** Stable navigation and test identity. Copy edits must not change this value. */
   id: string
   chapter: GuideChapter
-
+  /** True only when all three conditions receive this exact lesson/UI contract. */
   sharedAcrossConditions: boolean
   title: string
-
+  /** Short paragraphs, hand-holding tone. */
   body: ReactNode
-
+  /** The conversation at this step's moment — advances with the clicks. */
   scene: GuideScene
   target?: TourTarget
-
-
+  /**
+   * Transcript rows become clickable on this step. The mounted production
+   * controls are routed to Guide-local reducers and the fetch sandbox.
+   */
   interactive?: boolean
-
+  /** Real side surface rendered next to the conversation ("board" replaces it). */
   panel?: TourPanel
-
+  /** Permit this one panel step to exercise navigation without unlocking adjacent steps. */
   panelInteractive?: boolean
-
+  /** Injection-preview card demo state while this step is shown. */
   previewDemo?: PreviewDemoOptions
-
-
+  /** Timed progression (mentor 2026-08-15): show `scene` first, then swap to
+   * this one — the "it ran for a moment, then the result landed" beat. */
   reveal?: { afterMs: number; scene: GuideScene }
-
-
+  /** Arm the per-memory interrupt affordance on this step's chips; the demo
+   * interrupt advances to the next step (the recovery card). */
   interruptDemo?: boolean
-
+  /** Show the real interrupt affordance as a read-only illustration. */
   interruptPreview?: boolean
-
+  /** Session-start Board state demonstrated by the real blocking overlay. */
   boardDemo?: GuideBoardDemo
-
+  /** One production post-session surface, hosted by the Guide's local journey. */
   postSessionPhase?: GuidePostSessionPhase
 }
 
@@ -202,7 +207,8 @@ export interface GuideManualBoardOverlayProps {
   onDismiss: () => void
 }
 
-
+/** One close boundary for the optional Board. Candidate station progress owns
+ * Guide navigation; closing this overlay only returns to the same lesson. */
 export function GuideManualBoardOverlay({
   request,
   boardSnapshot,
@@ -262,11 +268,10 @@ export function withResumeDecision(scene: GuideScene, resolution: GuideResumeArg
   }
 }
 
-
+// Panels that are always interactive when mounted. Browser steps opt in
+// individually; Board overlays own their local interaction policy.
 const INTERACTIVE_PANELS: ReadonlySet<TourPanel> = new Set([
   "memoryRecord",
-  "autoMemory",
-  "staticMemory",
   "files",
   "studySessionSetup",
 ])
@@ -286,7 +291,11 @@ function targetSelector(target: TourTarget): { selector: string; nth: number } {
   return { selector: `[data-guide-row-kind="${target.rowKind}"]`, nth: target.nth ?? 0 }
 }
 
-
+/**
+ * Guide-local adapter for the production transcript context. Keeping the demo
+ * identity in one place lets Candidate actions exercise the same scope guards
+ * as a real chat without ever touching participant state.
+ */
 export function GuideTranscriptContextProvider({ children }: { children: ReactNode }) {
   return (
     <TranscriptChatContextProvider value={{ chatId: GUIDE_CHAT_ID, projectId: GUIDE_PROJECT_ID }}>
@@ -312,7 +321,15 @@ export function GuidePrimaryButton({
   )
 }
 
-
+/**
+ * The interactive walkthrough: the demo conversation on the left advances
+ * with the participant's clicks (no autoplay — each step shows the turn at
+ * one real moment, gates open exactly like live usage), the Step-N-of-M
+ * panel on the right, and a spotlight that dims everything except the
+ * element the current step talks about. Steps can open the real side panels
+ * (Memory Record, Browser, Files) and the Memory Board, all rendered by the
+ * production components against demo data.
+ */
 export function GuideTour({
   brandName,
   steps,
@@ -353,7 +370,9 @@ export function GuideTour({
   const stepIndex = Math.max(0, sectionSteps.findIndex((candidate) => candidate.id === activeStepId))
   const isLast = sectionProgress.isLast
 
-
+  // Tour-wide demo plumbing: UI-monitoring beacons stay muted (tour clicks
+  // must never count as study monitoring acts). Install the isolated memory
+  // store and local HTTP shim before production panels mount.
   useLayoutEffect(() => {
     setUiMonitorSuppressed(true)
     const uninstallMemorySandbox = installGuideMemorySandbox()
@@ -368,8 +387,8 @@ export function GuideTour({
         pending: snapshot.status.pending,
       }))
     })
-
-
+    // A repeated tutorial always begins at Browser Home, never at a persisted
+    // address from a previous guide attempt.
     useRightSidebarStore.getState().navigateBrowser(GUIDE_PROJECT_ID, "")
     setDemoReady(true)
     return () => {
@@ -384,7 +403,10 @@ export function GuideTour({
     }
   }, [])
 
-
+  // A blocking Board lesson needs two server-like states: unresolved rows,
+  // then the exact same production overlay after the collection is clear.
+  // Only the isolated Guide store changes; the real participant snapshot is
+  // kept aside and restored when the tutorial unmounts.
   useEffect(() => {
     if (!demoReady) return
     if (step?.boardDemo) {
@@ -402,14 +424,15 @@ export function GuideTour({
       boardFixtureKeyRef.current = "memosync.current-long-term-review"
       fetchShimRef.current?.setBoardDemo(GUIDE_BOARD_CANDIDATE_DEMO)
     } else if (step?.id && CANDIDATE_JOURNEY_STEPS.has(step.id)) {
-
-
+      // Candidate actions are canonical store mutations. Preserve them through
+      // the settled summary, Review again, and the one Board projection.
     } else {
       memorySandboxRef.current?.setItems(DEMO_MEMORY_ITEMS)
     }
   }, [demoReady, dispatchFlow, step?.boardDemo, step?.id])
 
-
+  // Timed reveal: the base scene renders first; after the delay the step's
+  // reveal scene replaces it (used by the Transfer step's run-then-finish beat).
   const [revealed, setRevealed] = useState(false)
   useEffect(() => {
     setRevealed(false)
@@ -495,7 +518,8 @@ export function GuideTour({
     dispatchNavigation({ type: "go_to_step", id: "memosync.working-memory-ask" })
   }, [applyLocalTurnAction, dispatchFlow, dispatchNavigation])
 
-
+  // Interrupt demo: chips get their real stop entry; "stopping" simply walks
+  // the tour forward to the recovery-card step.
   const interruptApi = useMemo<TurnInterruptApi | null>(() => {
     if (step?.interruptPreview) {
       return {
@@ -542,8 +566,8 @@ export function GuideTour({
     () => buildResolvedTranscriptRows(hydrated, { isLoading: false, latestToolIds: NO_TOOL_IDS }),
     [hydrated]
   )
-
-
+  // Violated verdicts fold onto the reply's inline [M-NN] chips, exactly like
+  // the live transcript — the violated-audit step depends on this.
   const violatedMap = useMemo(() => buildViolatedCitationsByMessageId(hydrated), [hydrated])
 
   const renderOptions = useMemo(() => ({
@@ -554,7 +578,8 @@ export function GuideTour({
       : undefined,
   }), [handlePreviewDemoDecision, step?.previewDemo])
 
-
+  // While a scene shows the assistant mid-work, the real composer shows its
+  // stop square — the same control the step teaches.
   const composerCanCancel = Boolean(activeScene?.statusLabel)
   const handleLocalSubmit = useCallback(async (content: string) => {
     if (step?.id === "system.first-prompt") {
@@ -624,7 +649,9 @@ export function GuideTour({
     INTERACTIVE_PANELS.has(step.panel) || step.panelInteractive === true
   )
 
-
+  // Measure the target inside the demo area; keep the hole glued to it
+  // through scrolls and resizes. The overlay lives at the area level so it
+  // can highlight the transcript, the side panel, or the composer alike.
   const measure = useCallback(() => {
     const area = areaRef.current
     const target = step?.target
@@ -658,10 +685,10 @@ export function GuideTour({
       const node = area.querySelectorAll<HTMLElement>(selector)[nth]
       node?.scrollIntoView({ block: "center", behavior: "smooth" })
     } else if (pane) {
-
+      // No spotlight: follow the conversation like the live app does.
       pane.scrollTo({ top: pane.scrollHeight, behavior: "smooth" })
     }
-
+    // After the smooth scroll settles; cheap enough to run twice.
     const timer = window.setTimeout(measure, 350)
     measure()
     const handle = () => measure()
@@ -682,10 +709,6 @@ export function GuideTour({
         streamingText={activeScene?.streamingText ?? null}
         exposureInitiator="system"
       />
-    ) : step?.panel === "autoMemory" ? (
-      <MemorySummaryPanel chatId={GUIDE_CHAT_ID} projectId={GUIDE_PROJECT_ID} exposureInitiator="system" onClose={noop} />
-    ) : step?.panel === "staticMemory" ? (
-      <StaticMemoryPanel chatId={GUIDE_CHAT_ID} projectId={GUIDE_PROJECT_ID} exposureInitiator="system" onClose={noop} />
     ) : step?.panel === "browser" ? (
       <BrowserPanel
         projectId={GUIDE_PROJECT_ID}
@@ -738,7 +761,7 @@ export function GuideTour({
 
   return (
     <div className="fixed inset-0 z-50 flex bg-background">
-
+      {/* Demo area: transcript + optional real side panel, one spotlight. */}
       <div ref={areaRef} className="relative flex min-w-0 flex-1 overflow-hidden border-r border-border">
         <MemoryBoardLauncherProvider onOpenMemoryBoard={handleOpenMemoryBoard}>
         <TranscriptRenderOptionsProvider value={renderOptions}>
@@ -769,8 +792,9 @@ export function GuideTour({
                     </div>
                   </GuidePanelSurface>
                 ) : step?.panel === "studySessions" ? (
-
-
+                  // The real session-list page over shimmed study progress:
+                  // one completed, one active, two locked — the serial gate
+                  // the contract step is describing.
                   <GuidePanelSurface
                     readOnly
                     className="flex h-full min-w-0 flex-1 flex-col overflow-y-auto"
@@ -778,8 +802,8 @@ export function GuideTour({
                     <StudyIndexPage embedded />
                   </GuidePanelSurface>
                 ) : step?.panel === "studyBrief" ? (
-
-
+                  // The real protected-instructions surface with a demo brief:
+                  // participants read the task HERE, own-words warning included.
                   <GuidePanelSurface
                     readOnly
                     className="min-w-0 flex-1 overflow-y-auto"
@@ -800,8 +824,8 @@ export function GuideTour({
                     </div>
                   </GuidePanelSurface>
                 ) : step?.panel === "studySubmit" ? (
-
-
+                  // The real study bar (demo data): the bright Finish button
+                  // sits exactly where it lives during a session.
                   <GuidePanelSurface
                     readOnly
                     className="flex h-full min-w-0 flex-1 flex-col"
@@ -833,7 +857,7 @@ export function GuideTour({
                             ? "browser"
                             : step?.panel === "files"
                               ? "files"
-                              : step?.panel === "memoryRecord" || step?.panel === "autoMemory" || step?.panel === "staticMemory"
+                              : step?.panel === "memoryRecord"
                                 ? "memory"
                                 : "hidden"
                         }
@@ -876,7 +900,7 @@ export function GuideTour({
                           />
                         </div>
                       ))}
-
+                      {/* The live footer, frozen at this scene's moment. */}
                       {activeScene?.streamingText || activeScene?.statusLabel ? (
                         <div className={cn(
                           "mx-auto w-full max-w-[780px]",
@@ -886,7 +910,7 @@ export function GuideTour({
                           {activeScene.statusLabel ? <ProcessingMessage status={activeScene.statusLabel} /> : null}
                         </div>
                       ) : null}
-
+                      {/* The real composer: Send before a run, Stop while one is active. */}
                       <div className="mx-auto mt-6 w-full max-w-[820px]" data-guide-composer="true">
                         <ChatInput
                           ref={chatInputRef}
@@ -940,7 +964,7 @@ export function GuideTour({
                     onDismiss={() => setManualBoard(null)}
                   />
                 ) : null}
-
+                {/* Spotlight: a ringed hole whose shadow dims the rest. */}
                 {spot ? (
                   <div
                     aria-hidden
@@ -962,7 +986,7 @@ export function GuideTour({
         </MemoryBoardLauncherProvider>
       </div>
 
-
+      {/* Step panel */}
       <div className="flex w-[400px] shrink-0 flex-col bg-background">
         <div className="flex-1 overflow-y-auto px-8 pt-10">
           <GuideSectionTabs

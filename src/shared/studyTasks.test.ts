@@ -229,7 +229,7 @@ describe("study questionnaire answer schema v2", () => {
     const { parseStudyQuestionnaireAnswerV2 } = await import("./studyTasks")
     expect(parseStudyQuestionnaireAnswerV2(validV2)).toEqual(validV2)
 
-
+    // Q1 ratings 1..4 may carry an optional correction; 5 uses the frozen cue.
     for (const rating of [1, 2, 3, 4] as const) {
       expect(parseStudyQuestionnaireAnswerV2({
         ...validV2,
@@ -245,13 +245,13 @@ describe("study questionnaire answer schema v2", () => {
       assessed: { believedContent: null },
     })
 
-
+    // Q2 rating 1 = absent, no believed content, no scope.
     expect(parseStudyQuestionnaireAnswerV2({
       ...validV2,
       assessed: { rating: 1, presence: "absent", believedContent: null, scope: null },
     })?.assessed).toEqual({ rating: 1, presence: "absent", believedContent: null, scope: null })
 
-
+    // Q2 rating 5 uses the cue; one of the three concrete scopes is required.
     for (const scope of ["session", "project", "personal"] as const) {
       expect(parseStudyQuestionnaireAnswerV2({
         ...validV2,
@@ -259,13 +259,13 @@ describe("study questionnaire answer schema v2", () => {
       })?.assessed).toEqual({ rating: 5, presence: "present", believedContent: null, scope })
     }
 
-
+    // Q2 special unknown state: outside the ordinal scale, no content, no scope.
     expect(parseStudyQuestionnaireAnswerV2({
       ...validV2,
       assessed: { rating: "unknown", presence: "unknown", believedContent: null, scope: null },
     })?.assessed).toEqual({ rating: "unknown", presence: "unknown", believedContent: null, scope: null })
 
-
+    // Q3 accepts 1..5 and the distinct not-applicable state.
     for (const execution of [1, 2, 3, 4, 5, "not_applicable"] as const) {
       expect(parseStudyQuestionnaireAnswerV2({ ...validV2, execution })?.execution).toBe(execution)
     }
@@ -273,7 +273,7 @@ describe("study questionnaire answer schema v2", () => {
 
   test("accepts blank optional follow-ups as null and rejects illegal scope combinations", async () => {
     const { parseStudyQuestionnaireAnswerV2 } = await import("./studyTasks")
-
+    // Q1 1..4 and Q2 2..4 accept a missing optional explanation as null.
     expect(parseStudyQuestionnaireAnswerV2({
       ...validV2,
       desired: { rating: 2, presence: "present", correctedContent: null, scope: "project" },
@@ -282,7 +282,7 @@ describe("study questionnaire answer schema v2", () => {
       ...validV2,
       assessed: { rating: 4, presence: "present", believedContent: null, scope: "project" },
     })?.assessed).toEqual({ rating: 4, presence: "present", believedContent: null, scope: "project" })
-
+    // Q1 5 must not carry a follow-up; every Q1 value requires a scope.
     expect(parseStudyQuestionnaireAnswerV2({
       ...validV2,
       desired: { rating: 5, presence: "present", correctedContent: "extra", scope: "project" },
@@ -291,7 +291,7 @@ describe("study questionnaire answer schema v2", () => {
       ...validV2,
       desired: { rating: 5, presence: "present", correctedContent: null, scope: null },
     })).toBeNull()
-
+    // Q2 rating 1 and unknown must not carry a scope.
     expect(parseStudyQuestionnaireAnswerV2({
       ...validV2,
       assessed: { rating: 1, presence: "absent", believedContent: null, scope: "project" },
@@ -300,8 +300,8 @@ describe("study questionnaire answer schema v2", () => {
       ...validV2,
       assessed: { rating: "unknown", presence: "unknown", believedContent: null, scope: "unsure" },
     })).toBeNull()
-
-
+    // v2 has exactly one unknown branch: the item-level response above.
+    // A scope-level unsure value is invalid whenever A_i is present.
     expect(parseStudyQuestionnaireAnswerV2({
       ...validV2,
       assessed: { rating: 3, presence: "present", believedContent: "Partial memory.", scope: "unsure" },
@@ -310,7 +310,7 @@ describe("study questionnaire answer schema v2", () => {
       ...validV2,
       assessed: { rating: 5, presence: "present", believedContent: null, scope: "unsure" },
     })).toBeNull()
-
+    // Q2 5 with a leftover believed content.
     expect(parseStudyQuestionnaireAnswerV2({
       ...validV2,
       assessed: { rating: 5, presence: "present", believedContent: "stale", scope: "project" },
@@ -319,7 +319,7 @@ describe("study questionnaire answer schema v2", () => {
 
   test("rejects midpoint-encoded unknown and presence contradictions", async () => {
     const { parseStudyQuestionnaireAnswerV2 } = await import("./studyTasks")
-
+    // The unknown state is a distinct token, never the midpoint of the scale.
     expect(parseStudyQuestionnaireAnswerV2({
       ...validV2,
       assessed: { rating: 3, presence: "unknown", believedContent: null, scope: null },

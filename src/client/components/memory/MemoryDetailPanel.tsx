@@ -1,5 +1,6 @@
-
-
+// Right-side detail panel for a selected memory (SPEC §4.9, §4.11). Two tabs:
+// "Details" (editable fields + scope move + provenance/usage/sensitive) and
+// "History" (the per-item version/usage timeline with rollback, option 乙).
 import { useEffect, useMemo, useState } from "react"
 import {
   ArrowRightLeft,
@@ -33,7 +34,7 @@ const MOVE_SCOPES: MemoryScope[] = ["personal", "project"]
 interface MemoryDetailPanelProps {
   item: MemoryItem
   allItems: MemoryItem[]
-
+  /** The active transcript chat that owns this participant Monitoring act. */
   chatId?: string
   onClose: () => void
   onUpdated: (item: MemoryItem) => void
@@ -56,8 +57,8 @@ export function buildReviewedSensitiveCandidatePatch(
   const content = draft.content.trim()
   const detail = draft.detail.trim()
   if (!content) return null
-
-
+  // The captured sensitive Content itself must be replaced. A Detail-only
+  // edit would otherwise let the original raw Content become active.
   if (content === item.content.trim()) return null
   return { content, detail, status: "active" }
 }
@@ -68,14 +69,15 @@ export function MemoryDetailPanel({ item, allItems, chatId, onClose, onUpdated, 
   const [archiveArmed, setArchiveArmed] = useState(false)
   const [transferOpen, setTransferOpen] = useState(false)
   const [sanitized, setSanitized] = useState<Array<{ placeholder: string; kind: string }> | null>(null)
-
+  // Monitoring-act beacon: opening an item's detail is a monitoring behavior.
   useEffect(() => {
     if (chatId) recordUiMonitor("detail_open", { ids: [item.id], sessionId: chatId, interaction: "open" })
   }, [chatId, item.id])
   const [busy, setBusy] = useState<"save" | "scope" | "sensitive" | "sanitize" | "accept" | "archive" | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-
+  // A fresh selection (or an update landing from elsewhere) resets the draft
+  // and any armed confirmations.
   useEffect(() => {
     setDraft({ content: item.content, detail: item.detail ?? "" })
     setSanitized(null)
@@ -120,8 +122,9 @@ export function MemoryDetailPanel({ item, allItems, chatId, onClose, onUpdated, 
     try {
       const patch: Partial<CreateMemoryBody> = { scope: target }
       if (target === "project") {
-
-
+        // Only the item's OWN project binding counts — guessing a project
+        // (e.g. the first one in the list) would land the memory somewhere
+        // the user never chose. Transfer… has the explicit project picker.
         if (!item.projectId) {
           setError("Use Transfer… to move this into a specific project.")
           return
@@ -141,8 +144,9 @@ export function MemoryDetailPanel({ item, allItems, chatId, onClose, onUpdated, 
     setBusy("sensitive")
     setError(null)
     try {
-
-
+      // `sensitive` isn't (yet) in CreateMemoryBody's declared keys — the
+      // server forwards unrecognized PATCH fields through untyped, so this
+      // intersection keeps the call typed without touching memoriesApi.ts.
       const patch: Partial<CreateMemoryBody> & { sensitive: boolean } = { sensitive: !item.sensitive }
       const updated = await memoriesApi.update(item.id, patch, { surface })
       onUpdated(updated)

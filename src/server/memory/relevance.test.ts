@@ -94,7 +94,7 @@ describe('one-call fast path (relevance + expectedUse, 2026-08-08)', () => {
     const out = await svc.assess('write a script', items, { mustInclude: ['M-03'] });
     expect(out.map((r) => r.id)).toEqual(['M-01', 'M-03']);
     expect(out[0]!.expectedUse).toBe('Run every script with bun, not npm.');
-
+    // Dropped carryover rides along without an expectedUse (Use Planner tops it up).
     expect(out[1]!.expectedUse).toBeUndefined();
   });
 

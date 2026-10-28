@@ -89,7 +89,11 @@ export interface StudyAllocationManifest {
   claimedAt: string | null
 }
 
-
+/**
+ * Actual E_i is evaluator evidence from the frozen output, never the
+ * participant's questionnaire judgment. The current study database does not
+ * persist it, so callers supply an adapter only after a benchmark/judge run.
+ */
 export type ActualExecutionVerdict =
   | "fully_realized"
   | "partially_realized"
@@ -99,7 +103,7 @@ export type ActualExecutionVerdict =
 
 export interface ActualExecutionEvidence {
   verdict: ActualExecutionVerdict
-
+  /** Binary projection used only for fully/not realized; every other verdict is null. */
   realized: boolean | null
   evaluator: {
     name: string
@@ -124,11 +128,11 @@ export interface ActualExecutionEvidenceQuery {
   workspaceSnapshot: StudyFreezeSnapshot["workspaceSnapshot"] | null
 }
 
-
+/** The seam where a later FullStack-Bench-backed E_i judge plugs in. */
 export interface ActualExecutionEvidenceAdapter {
   readonly name: string
   resolve(query: ActualExecutionEvidenceQuery): ActualExecutionEvidence | null
-
+  /** Fail closed when signed evaluator rows did not bind to a canonical frozen probe. */
   assertFullyConsumed?(): void
 }
 
@@ -162,9 +166,9 @@ export interface ExportedDesiredMemory {
   presence: "present" | "absent"
   content: string | null
   scope: "session" | "project" | "personal" | null
-
+  /** v1 categorical response; null for a v2 (ordinal) answer. */
   responseKind: StudyDesiredMemoryAnswer["kind"] | null
-
+  /** v2 raw ordinal rating; null for a v1 (categorical) answer. */
   rating: StudyOrdinalRating | null
 }
 
@@ -172,9 +176,9 @@ export interface ExportedAssessedMemory {
   presence: "present" | "absent" | "unknown"
   content: string | null
   scope: "session" | "project" | "personal" | "unsure" | null
-
+  /** v1 categorical response; null for a v2 (ordinal) answer. */
   responseKind: StudyAssessedMemoryAnswer["kind"] | null
-
+  /** v2 raw rating or its explicit unknown state; null for a v1 answer. */
   rating: StudyOrdinalRating | "unknown" | null
 }
 
@@ -215,13 +219,13 @@ export interface ExportedControlAccuracy {
 }
 
 export interface ExportedMemoryMeasurements {
-
+  /** Strict equality of canonical A_i and O_i Memory States. */
   monitoringAccuracy: ExportedStateComparison
-
+  /** Strict equality of canonical D_i and O_i Memory States. */
   memoryAlignment: ExportedStateComparison
-
+  /** Strict inequality of canonical D_i and A_i Memory States. */
   perceivedDiscrepancy: ExportedPerceivedDiscrepancy
-
+  /** D_i realization, available only from external actual E_i evidence. */
   controlAccuracy: ExportedControlAccuracy
 }
 
@@ -250,7 +254,7 @@ export interface StudyParticipantRow {
   claimedAt: string | null
   onboarding: ExportedStudyOnboarding | null
   sus: ExportedSus | null
-
+  /** Durable Prolific completion-code issuance evidence. */
   completionReceipt: ExportedCompletionReceipt | null
 }
 
@@ -289,7 +293,7 @@ export interface StudySessionRow {
     questionnaireSubmittedAt: string | null
     completedAt: string | null
   }
-
+  /** Null only for pilot submissions created before the formal checks. */
   attentionCheck: StudyAttentionCheckResult | null
   workspaceSnapshot: StudyFreezeSnapshot["workspaceSnapshot"] | null
   freezeQualityFlags: string[]
@@ -316,12 +320,12 @@ export interface StudyMemoryItemRow {
   probeId: string
   identity: StudyFreezeItem["identity"]
   cue: StudyFreezeItem["cue"]
-
+  /** The questionnaire instrument governing this item's answers. */
   questionnaireVersion: StudyQuestionnaireVersion
   desired: ExportedDesiredMemory | null
   assessed: ExportedAssessedMemory | null
   object: FrozenStudyMemoryState
-
+  /** Self-report only (v1 categorical or v2 rating); never actual E_i. */
   participantExecutionJudgment: StudyExecutionAnswer | StudyExecutionAnswerV2 | null
   actualExecution: ActualExecutionEvidence | null
   actualExecutionStatus: "available" | "partial" | "missing" | "not_applicable" | "uncertain"
@@ -351,14 +355,14 @@ export interface StudyDataExport {
   participants: StudyParticipantRow[]
   sessions: StudySessionRow[]
   memoryItems: StudyMemoryItemRow[]
-
+  /** Raw server-authoritative behavior/timing rows; Raw TLX remains separate. */
   interactions: StudyTelemetryEvent[]
-
+  /** Every raw kind=control row across all arms; standalone actions stay observed. */
   controlActions: ExportedControlAction[]
-
+  /** Only operations that carry attempted/terminal phases. */
   controlOperations: ExportedControlOperation[]
   interactionIntervals: ExportedStudyInteractionInterval[]
-
+  /** Client-observed visibility intervals; not cognitive or active-thinking time. */
   surfaceExposureIntervals: ExportedStudySurfaceExposureInterval[]
   stageIntervals: ExportedStudyStageInterval[]
 }
@@ -635,12 +639,15 @@ function locateParticipantStudyPaths(inputPath: string): ParticipantStudyPaths {
   return { dataDir, experimentsDir, databasePath, allocationManifestPath }
 }
 
-
+/** Resolve the participant data root that owns a canonical study.sqlite source. */
 export function resolveParticipantStudyDataDir(inputPath: string): string {
   return locateParticipantStudyPaths(inputPath).dataDir
 }
 
-
+/**
+ * Accept either one participant data directory or an orchestrator data root.
+ * Discovery never reads events.jsonl.
+ */
 export function discoverParticipantDataDirs(sourcePath: string): string[] {
   const source = resolve(sourcePath)
   const participantsDir = join(source, "participants")
@@ -710,8 +717,8 @@ function readParticipantDatabase(path: string): ParticipantDatabaseRecords {
 
     db.exec("BEGIN")
     try {
-
-
+      // A legacy database that never ran the store migration has no
+      // questionnaire_version column; its rows are questionnaire v1.
       const questionnaireColumns = db
         .query("PRAGMA table_info(study_questionnaire_submissions)")
         .all() as Array<{ name: string }>
@@ -749,7 +756,7 @@ function readParticipantDatabase(path: string): ParticipantDatabaseRecords {
             FROM study_sus_submissions
            WHERE singleton = 1
         `).get() as SusRow | null,
-
+        // Legacy databases predate the durable completion receipt.
         completionReceipt: tables.has("study_completion_receipts")
           ? db.query(`
               SELECT participant_id, sus_submission_id, code, code_version, issued_at
@@ -837,8 +844,8 @@ function parseQuestionnaireAnswers(
   if (row.questionnaire_version !== 1 && row.questionnaire_version !== 2) {
     throw new StudyDataExportError(`Questionnaire ${row.submission_id} has invalid questionnaire version ${row.questionnaire_version}`)
   }
-
-
+  // The submission must use the instrument its immutable snapshot froze with;
+  // old categorical answers and new ordinal answers are never cross-parsed.
   if (row.questionnaire_version !== freezeQuestionnaireVersion(snapshot)) {
     throw new StudyDataExportError(
       `Questionnaire ${row.submission_id} questionnaire version ${row.questionnaire_version} `
@@ -958,7 +965,7 @@ function exportAssessed(answer: StudyAssessedMemoryAnswer, cueContent: string): 
   }
 }
 
-
+/** v2 D_i: rating 5 adopts the frozen cue; 1..4 carry the corrected content. */
 function exportDesiredV2(answer: StudyDesiredMemoryAnswerV2, cueContent: string): ExportedDesiredMemory {
   return {
     presence: "present",
@@ -969,7 +976,8 @@ function exportDesiredV2(answer: StudyDesiredMemoryAnswerV2, cueContent: string)
   }
 }
 
-
+/** v2 A_i: 5 adopts the cue, 2..4 carry believed content, 1 is absent, and
+ * the unknown state stays a separate non-ordinal export value. */
 function exportAssessedV2(answer: StudyAssessedMemoryAnswerV2, cueContent: string): ExportedAssessedMemory {
   if (answer.rating === "unknown") {
     return { presence: "unknown", content: null, scope: null, responseKind: null, rating: "unknown" }
@@ -1893,7 +1901,10 @@ export function buildStudyDataExport(input: BuildStudyDataExportInput): StudyDat
   return dataset
 }
 
-
+/**
+ * Canonical researcher export. When actual E_i is joined, re-verify every
+ * SQLite-bound frozen workspace immediately before building the dataset.
+ */
 export async function buildVerifiedStudyDataExport(input: BuildStudyDataExportInput): Promise<StudyDataExport> {
   if (input.actualExecutionEvidence) {
     for (const dataDir of [...new Set(input.participantDataDirs.map((value) => resolve(value)))].sort()) {
@@ -2227,7 +2238,7 @@ function verifyActualExecutionArtifact(
   return workspace
 }
 
-
+/** Load evaluator evidence and verify every referenced immutable artifact. */
 export function actualExecutionEvidenceFromFile(filePath: string): ActualExecutionEvidenceAdapter {
   const documentPath = resolve(filePath)
   let raw: unknown
@@ -2280,7 +2291,7 @@ function csv<T>(columns: Array<[string, (row: T) => unknown]>, rows: T[]): strin
     .join("\n")}${rows.length ? "\n" : ""}`
 }
 
-
+/** One row per allocated participant, including the pre-Guide intake record. */
 export function studyParticipantsCsv(dataset: StudyDataExport): string {
   return csv<StudyParticipantRow>([
     ["participant_id", (row) => row.participantId],

@@ -3,16 +3,16 @@ export const DISPLAY_NAME = "MemoSync"
 export const CLI_COMMAND = "memosync"
 export const DATA_ROOT_NAME = ".memosync"
 export const DEV_DATA_ROOT_NAME = ".memosync-dev"
-
-
+// Pre-rename data roots (the Kanna-era on-disk layout). Server startup
+// migrates these to the new names when the new root does not exist yet.
 export const LEGACY_DATA_ROOT_NAME = ".kanna"
 export const LEGACY_DEV_DATA_ROOT_NAME = ".kanna-dev"
 export const PACKAGE_NAME = "memosync"
-
-
+// MemoSync has no release channel yet; all automatic/self-service updates
+// stay disabled until it has its own signed releases.
 export const SELF_UPDATE_ENABLED = false
 export const RUNTIME_PROFILE_ENV_VAR = "MEMOSYNC_RUNTIME_PROFILE"
-
+// Read version from package.json — JSON import works in both Bun and Vite
 import pkg from "../../package.json"
 export const APP_VERSION = pkg.version
 export const SDK_CLIENT_APP = `memosync/${pkg.version}`

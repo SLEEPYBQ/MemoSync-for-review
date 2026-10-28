@@ -1,5 +1,6 @@
-
-
+// Participant-facing study shell routes. Memory focus, freeze snapshots, and
+// questionnaire submissions are delegated to StudyQuestionnaireService so
+// HTTP handlers never infer a DV from JSONL or re-read a live memory store.
 import { getStudyTask, STUDY_BRIEF_VERSION, STUDY_GUIDE_VERSION } from '../shared/studyTasks';
 import { STUDY_BRIEFS } from './study-briefs';
 import type { StudyQuestionnaireService } from './study-questionnaire-service';
@@ -15,11 +16,11 @@ export interface StudyRouteDeps {
   registry: StudyRegistry;
   questionnaire: StudyQuestionnaireService | null;
   survey: StudySurveyService | null;
-
+  /** Durable pre-guide intake. Absent only on an invalid/non-participant study runtime. */
   onboarding: StudyOnboardingService | null;
-
+  /** Authoritative participant interaction/timing sink. */
   telemetry?: StudyTelemetryService | null;
-
+  /** STUDY_ADMIN_KEY env — enables the experimenter's unfreeze endpoint. */
   adminKey?: string;
   instructionGuard?: {
     recordUiAttempt: (attempt: {
@@ -82,22 +83,16 @@ export async function handleStudyRequest(
   if (!pathname.startsWith('/api/study/')) return null;
   const { registry, questionnaire } = deps;
 
-
+  // A null telemetry service is a PERMANENT property of this deployment
+  // (non-study boot), not a transient outage — answer 404, not 503. The
+  // client outbox acknowledges-and-drops 4xx but retries 5xx forever, so a
+  // 503 here wedged the whole durable telemetry queue head-of-line the first
+  // time a normal-mode Files-panel edit touched a memory markdown file.
   if (pathname === '/api/study/telemetry' && req.method === 'POST') {
     if (!deps.telemetry) return bad(404, 'Study telemetry does not exist in this deployment.');
     const body = await bodyRecord(req);
     try {
       return ok(deps.telemetry.recordClient(body));
-    } catch (error) {
-      return serviceError(error);
-    }
-  }
-
-  if (pathname === '/api/study/static-edit-entered' && req.method === 'POST') {
-    if (!deps.telemetry) return bad(404, 'Study telemetry does not exist in this deployment.');
-    const body = await bodyRecord(req);
-    try {
-      return ok(deps.telemetry.recordStaticEditEntered(body));
     } catch (error) {
       return serviceError(error);
     }
@@ -117,8 +112,8 @@ export async function handleStudyRequest(
   if (pathname === '/api/study/onboarding/information' && req.method === 'PUT') {
     if (!deps.onboarding) return bad(503, 'Study onboarding is unavailable for this participant instance.');
     const body = await bodyRecord(req);
-
-
+    // Allocation identity is server-owned. It must never be accepted from a
+    // participant browser, even if it happens to match the current instance.
     if (!body || 'participantId' in body || 'participant_id' in body) {
       return bad(400, 'participant identity is assigned by the study server');
     }
@@ -294,7 +289,8 @@ export async function handleStudyRequest(
     }
   }
 
-
+  // `/injected` remains a short compatibility alias for older clients. Both
+  // routes return only the immutable public projection, never O_i/history.
   if (
     (pathname === '/api/study/questionnaire' || pathname === '/api/study/injected')
     && req.method === 'GET'

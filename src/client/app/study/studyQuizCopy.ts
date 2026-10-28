@@ -1,5 +1,7 @@
-
-
+// The post-session quiz wording, verbatim from the study-owner corrections
+// (2026-08-20 collaboration ledger §3.3, questionnaire v2) in blinding-safe
+// English: every arm says "the agent". Kept as data so the page renders it
+// and tests can lock it (option coverage, blinding, no em dashes).
 import {
   ASSESSED_UNKNOWN_OPTION,
   DESIRED_SCOPE_OPTIONS,
@@ -11,7 +13,7 @@ import type { StudyQuizQuestionField } from "./studyQuestionnaireDraft"
 export interface QuizQuestion {
   field: StudyQuizQuestionField
   prompt: string
-
+  /** Extra guidance under the prompt (scope explainers). */
   hint?: string
   options: Array<{ value: string; label: string }>
 }
@@ -128,7 +130,7 @@ export const QUIZ_SECTIONS: QuizSection[] = [
   },
 ]
 
-
+/** field → the option values its choices must cover exactly (schema lock). */
 export const QUIZ_FIELD_OPTIONS: Record<QuizQuestion["field"], readonly string[]> = {
   desiredContent: ORDINAL_RATING_OPTIONS.map(String),
   desiredScope: DESIRED_SCOPE_OPTIONS,

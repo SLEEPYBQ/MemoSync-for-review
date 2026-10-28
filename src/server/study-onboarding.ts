@@ -66,8 +66,9 @@ function informationFrom(value: unknown): StudyOnboardingInformation {
     throw new StudyOnboardingError("Select valid AI agent tools")
   }
   const selectedTools = new Set(record.agentTools as StudyAgentTool[])
-
-
+  // Checkbox ordering is a browser detail, not a different participant
+  // response. Persist the known-option order so post-consent exact retries
+  // remain idempotent across renders and browsers.
   const agentTools = STUDY_AGENT_TOOLS.filter((tool) => selectedTools.has(tool))
   if (agentTools.length === 0 || selectedTools.size !== (record.agentTools as unknown[]).length) {
     throw new StudyOnboardingError("Select each AI agent tool at most once")

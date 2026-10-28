@@ -1,5 +1,7 @@
-
-
+// Visual QA for the Memory Board: boot the real server on a temp data dir,
+// seed a few memories (+candidates), and screenshot /memory in light & dark via
+// Playwright. Usage: `bun run scripts/screenshot-memory.ts [outDir]`
+// Requires: `bun add -d playwright && bunx playwright install chromium`.
 import { mkdirSync, mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"

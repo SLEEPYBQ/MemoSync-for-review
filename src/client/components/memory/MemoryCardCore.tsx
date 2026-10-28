@@ -1,5 +1,9 @@
-
-
+// The canonical READ-ONLY face of a memory item (redesign 2026-08-07 §4:
+// shared operable representation). Body = short content + usage count + scope
+// + expandable Detail, identical everywhere. Hosts (candidate container,
+// checkup suggestions, injected-set card, audit rows, board, hover popovers)
+// embed this body and keep their action buttons OUTSIDE it — the
+// representation itself never carries actions.
 import { useState } from "react"
 import { ChevronRight } from "lucide-react"
 import type { MemoryItem } from "../../lib/memoriesApi"

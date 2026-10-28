@@ -1,61 +1,43 @@
-
-
+// planMemoryInjection is the source of truth for the selected MemoSync memory
+// context. Later changes ride user turns as deltas.
 import type { ConditionPolicy } from '../experiment/condition';
-import type { AgentProvider } from '../../shared/types';
 import type { MemoryService } from './index';
 import type { MemoryItem } from './types';
 import {
   buildMemoryBlock,
   buildMemoryDeltaBlock,
-  buildPlainMemoryBlock,
-  formatMemoryLine,
   type MemoryConflictPair,
   type MemoryDeltaEntry,
 } from './prompt';
-import {
-  buildStudyStaticFocusPayload,
-  buildStaticFocusPayload,
-  ensureStaticMemoryScaffold,
-  hashStaticMemoryFiles,
-  readStaticMemoryFiles,
-  readStudyStaticMemoryFiles,
-  type StaticFocusPayload,
-} from './static-files';
 
 export interface MemoryInjectionPlan {
-  mode: 'skills' | 'plain' | 'file';
-
+  mode: 'skills';
+  /** Exact text block baked once into the session context. */
   block: string;
-
+  /** Whether the load_memory_detail tool should be registered. */
   registerTools: boolean;
-
+  /** Items in play for the turn (per-turn restriction applied) — logging, preview, trace. */
   injectedMemories: MemoryItem[];
-
-
+  /** Items baked into `block`; seeds the next turn's delta baseline. */
   bakedMemories: MemoryItem[];
-
-  staticFiles: string[];
-
-  staticPayload: StaticFocusPayload | null;
-
-
+  /**
+   * Fingerprint of the injectable state. Content changes ride deltas;
+   * consumers use `sessionRebuildKey` to decide whether to rebuild.
+   */
   hash: string;
-
-
+  /** What requires a session rebuild under the delta model. */
   sessionRebuildKey: string;
 }
 
 export interface PlanMemoryInjectionOptions {
   policy: ConditionPolicy;
-
-  provider: AgentProvider;
   memory: MemoryService;
   projectId?: string;
   chatId?: string;
-
-  workspaceDir: string;
-
-
+  /**
+   * Only these confirmed ids inject this turn, including the skills boot
+   * block, subsequent deltas, Codex developer instructions and audit snapshot.
+   */
   restrictToIds?: string[];
 }
 
@@ -63,11 +45,16 @@ export interface NormalizeMemorySelectionOptions {
   memory: MemoryService;
   projectId?: string;
   chatId?: string;
-
+  /** Untrusted or stale ids supplied by a client-side selection surface. */
   selectedIds: readonly string[];
 }
 
-
+/**
+ * Resolve a client selection against the server-owned Visible Memory Pool for
+ * this project/chat. The pool supplies membership and canonical order, so the
+ * result also drops duplicates, unknown ids, stale status, wrong scope, and
+ * session exclusions without trusting a client snapshot.
+ */
 export function normalizeMemorySelection(opts: NormalizeMemorySelectionOptions): string[] {
   const selected = new Set(opts.selectedIds);
   return opts.memory
@@ -76,7 +63,7 @@ export function normalizeMemorySelection(opts: NormalizeMemorySelectionOptions):
     .map((item) => item.id);
 }
 
-
+/** Unresolved conflicts among `items` (active↔active), deduped as ordered pairs. */
 function conflictPairsAmong(memory: MemoryService, items: MemoryItem[]): MemoryConflictPair[] {
   const injected = new Set(items.map((m) => m.id));
   const seen = new Set<string>();
@@ -95,62 +82,7 @@ function conflictPairsAmong(memory: MemoryService, items: MemoryItem[]): MemoryC
 
 export function planMemoryInjection(opts: PlanMemoryInjectionOptions): MemoryInjectionPlan {
   const { policy, memory } = opts;
-
-  if (policy.injection === 'file') {
-
-
-    const studyStatic = policy.studyMode && policy.condition === 'static';
-    const scaffoldSeeds = studyStatic
-      ? []
-      : memory.injectedFor(opts.projectId);
-    ensureStaticMemoryScaffold(opts.workspaceDir, scaffoldSeeds);
-    const files = studyStatic
-      ? readStudyStaticMemoryFiles(opts.workspaceDir)
-      : readStaticMemoryFiles(opts.workspaceDir);
-    const staticPayload = studyStatic
-      ? buildStudyStaticFocusPayload(files)
-      : buildStaticFocusPayload(files);
-    const hash = `file:${hashStaticMemoryFiles(files)}`;
-    return {
-      mode: 'file',
-      block: staticPayload.text,
-      registerTools: false,
-      injectedMemories: [],
-      bakedMemories: [],
-      staticFiles: files.map((f) => f.relPath),
-      staticPayload,
-      hash,
-      sessionRebuildKey: hash,
-    };
-  }
-
-
-  const projectCopyAuto = policy.studyMode && policy.condition === 'auto' && opts.provider === 'claude';
-  let injected = projectCopyAuto
-    ? memory.autoProjectMemories(opts.projectId)
-    : memory.injectedFor(opts.projectId, opts.chatId);
-  if (opts.restrictToIds && policy.injection !== 'skills' && !projectCopyAuto) {
-    const allowed = new Set(opts.restrictToIds);
-    injected = injected.filter((m) => allowed.has(m.id));
-  }
-  const setHash = injected.map((m) => `${m.id}@v${m.version}`).join('|');
-
-  if (policy.injection === 'plain') {
-    const hash = `plain:${setHash}`;
-    return {
-      mode: 'plain',
-      block: buildPlainMemoryBlock(injected),
-      registerTools: false,
-      injectedMemories: injected,
-      bakedMemories: injected,
-      staticFiles: [],
-      staticPayload: null,
-      hash,
-      sessionRebuildKey: hash,
-    };
-  }
-
-
+  const injected = memory.injectedFor(opts.projectId, opts.chatId);
   const restricted = opts.restrictToIds
     ? injected.filter((m) => new Set(opts.restrictToIds).has(m.id))
     : injected;
@@ -164,10 +96,8 @@ export function planMemoryInjection(opts: PlanMemoryInjectionOptions): MemoryInj
     registerTools: policy.memoryTools,
     injectedMemories: restricted,
     bakedMemories: restricted,
-    staticFiles: [],
-    staticPayload: null,
-    hash: `skills:${restricted.map(m => `${m.id}@v${m.version}`).join('|')}`,
-
+    hash: `skills:${restricted.map((m) => `${m.id}@v${m.version}`).join('|')}`,
+    // Content changes ride deltas; only a tools/mode flip rebuilds the session.
     sessionRebuildKey: `skills-live:${policy.memoryTools}`,
   };
 }
@@ -176,26 +106,29 @@ export interface MemoryTurnDeltaOptions {
   memory: MemoryService;
   projectId?: string;
   chatId?: string;
-
+  /** id → version as of the last injection (boot snapshot or previous delta). */
   baseline: Map<string, number>;
-
+  /** Preview-gate per-turn allowlist (only these ids apply this turn). */
   restrictToIds?: string[];
 }
 
 export interface MemoryTurnDeltaResult {
-
+  /** Delta block text ('' = quiet turn, append nothing). No envelope. */
   block: string;
-
+  /** Baseline for the next turn (current active set). */
   nextBaseline: Map<string, number>;
-
+  /** Exact active pool snapshot used to compose this turn's delta. */
   visibleMemories: MemoryItem[];
-
+  /** Exact focused subset from that same snapshot. */
   effectiveMemories: MemoryItem[];
-
+  /** Items now in play (current actives minus per-turn ignores) — trace ground truth. */
   effectiveIds: string[];
 }
 
-
+/**
+ * Diff the current injectable set against the session's last-injected baseline
+ * and render the per-turn delta block. Pure read — callers own baseline state.
+ */
 export function computeMemoryTurnDelta(opts: MemoryTurnDeltaOptions): MemoryTurnDeltaResult {
   const visible = opts.memory.injectedFor(opts.projectId, opts.chatId);
   const selected = opts.restrictToIds ? new Set(opts.restrictToIds) : null;
@@ -249,5 +182,3 @@ export function computeMemoryTurnDelta(opts: MemoryTurnDeltaOptions): MemoryTurn
     effectiveIds: effective.map((m) => m.id),
   };
 }
-
-export { formatMemoryLine };

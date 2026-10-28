@@ -1,19 +1,42 @@
-
-
+// Per-turn relevance highlight (REDESIGN D6) — the restored "before" leg of
+// F3: before execution the developer could not predict which memories would
+// matter for THIS task. A sidecar LLM pass ranks the injected index against
+// the just-submitted user prompt and names up to MAX_RELEVANT likely-relevant
+// items, each with a one-line why.
+//
+// One-call fast path (user decision 2026-08-08): the same pass ALSO writes
+// each pick's expectedUse — the concrete instruction the Injected Memory Set
+// card shows and Claude receives. Selection and use planning stay separate
+// SERVICES for the assistant/manual-add paths; merging them here is an
+// implementation detail that halves the pre-turn wait (one round-trip instead
+// of relevance → use-plan in series). Ids the model omits are topped up by
+// the standalone Use Planner, so the contract never weakens.
+//
+// Epistemics (the fact/inference red line): this is a PREDICTION, not a
+// system fact. Every consumer must present it as such — the receipt card
+// styles it as a guess ("likely relevant"), and it is logged as
+// memory.relevance, never mixed into injection/citation facts. Failures
+// degrade to no highlight; nothing ever blocks the turn on this pass.
 import type { LlmJsonCaller } from './deepseek';
 import type { MemoryItem } from './types';
 
 export interface RelevantMemory {
   id: string;
-
+  /** One short clause: why this item likely matters for the task. */
   why: string;
-
+  /** One imperative sentence: how the agent should apply it this turn (may be absent when the model omitted it). */
   expectedUse?: string;
 }
 
 export interface RelevanceService {
-
-
+  /**
+   * Rank `injected` against the user's task; [] on failure or nothing
+   * relevant. `mustInclude` ids (attention carryovers, already selected) are
+   * always part of the output. `recentContext` is a truncated digest of the
+   * last turns — the cheap de-biasing context for this latency-critical pass
+   * (user decision 2026-08-08, option C): the pass can't wait for a fork,
+   * but it CAN know what the conversation has been doing.
+   */
   assess(
     userText: string,
     injected: MemoryItem[],
@@ -60,8 +83,9 @@ export function createRelevanceService(opts: { callJson: LlmJsonCaller }): Relev
               .map((m) => `[${m.id}] (${m.scope} · ${m.type}) ${m.content}${m.detail ? ' [+detail]' : ''}`)
               .join('\n') +
             (mustInclude.length ? `\n\nMUST-INCLUDE ids: ${mustInclude.join(', ')}` : ''),
-
-
+          // Latency-critical: the highlight must beat the user's gate decision.
+          // Reasoning OFF keeps this in the ~2-4s band; the budget covers
+          // MAX_RELEVANT whys + expectedUse sentences.
           disableThinking: true,
           maxTokens: 1400,
           timeoutMs: 15_000,
@@ -75,8 +99,8 @@ export function createRelevanceService(opts: { callJson: LlmJsonCaller }): Relev
           if (!entry || typeof entry !== 'object') continue;
           const rec = entry as Record<string, unknown>;
           const id = typeof rec.id === 'string' ? rec.id : '';
-
-
+          // Hallucinated ids must not surface — the highlight may only ever
+          // point at items that are really on the receipt.
           if (!id || !injectedIds.has(id) || seen.has(id)) continue;
           seen.add(id);
           const expectedUse = typeof rec.expectedUse === 'string' && rec.expectedUse.trim()
@@ -89,15 +113,15 @@ export function createRelevanceService(opts: { callJson: LlmJsonCaller }): Relev
           });
           if (out.length >= cap) break;
         }
-
-
+        // Carryovers the model dropped still ride the output — their
+        // expectedUse gets topped up by the standalone Use Planner.
         for (const id of mustInclude) {
           if (!seen.has(id)) out.push({ id, why: '' });
         }
         return out;
       } catch {
-
-
+        // Degrade to no highlight — never block or throw into the turn. The
+        // carryovers stay selected regardless.
         return mustInclude.map((id) => ({ id, why: '' }));
       }
     },

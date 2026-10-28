@@ -4,7 +4,8 @@ import os from "node:os"
 import path from "node:path"
 import { TerminalManager } from "./terminal-manager"
 
-
+// Upper bounds for waitFor() polling (25ms interval; returns as soon as the
+// condition holds, so raising them never slows a passing test).
 const SHELL_START_TIMEOUT_MS = 20_000
 const COMMAND_TIMEOUT_MS = 20_000
 const FOCUS_IN_SEQUENCE = "\x1b[I"
@@ -13,7 +14,17 @@ const RAW_READ_HEX_COMMAND = `python3 -c "exec('import os,sys,tty,termios,select
 const isSupportedPlatform = process.platform !== "win32" && typeof Bun.Terminal === "function"
 const describeIfSupported = isSupportedPlatform ? describe : describe.skip
 
-
+// Tests that spawn a REAL interactive login shell and assert live terminal
+// semantics (job control, ctrl+d EOF, focus reporting). These depend on the
+// host shell's interactive behavior, which headless CI runners do not provide
+// reliably — the ctrl+d-EOF case intermittently leaves the shell alive well
+// past any timeout (the shell simply never treats EOF as exit under CI's PTY).
+// They're valuable on a developer machine, so they run locally and skip on CI.
+// Pure-unit terminal tests (mocked sessions) still run everywhere.
+// Real-PTY tests share the machine with the whole parallel suite: spawning a
+// shell takes ~400ms solo but can exceed bun's 5s default per-test timeout
+// under load (the recurring flake). Give them their own generous ceiling —
+// the inner waitFor calls already bound the real waiting at 20s.
 const SHELL_TEST_TIMEOUT_MS = 30_000
 const shellTest: typeof test = process.env.CI
   ? (test.skip as typeof test)
@@ -342,6 +353,104 @@ describeIfSupported("TerminalManager", () => {
     } finally {
       manager.close(firstTerminalId)
       manager.close(secondTerminalId)
+    }
+  })
+})
+
+describe("TerminalManager callback lifecycle", () => {
+  test("uses the registered data callback for split UTF-8 output and headless state", async () => {
+    const originalTerminal = Bun.Terminal
+    const originalSpawn = Bun.spawn
+    const terminals: Array<{ data: (terminal: unknown, data: string | Uint8Array) => void }> = []
+    try {
+      class FakeTerminal {
+        readonly data: (terminal: unknown, data: string | Uint8Array) => void
+        constructor(options: { data: (terminal: unknown, data: string | Uint8Array) => void }) {
+          this.data = options.data
+          terminals.push(this)
+        }
+        resize() {}
+        write() {}
+        close() {}
+      }
+      Object.defineProperty(Bun, "Terminal", { value: FakeTerminal })
+      Object.defineProperty(Bun, "spawn", {
+        value: () => ({ pid: undefined, exited: Promise.resolve(0) }),
+      })
+      const manager = new TerminalManager()
+      const output: string[] = []
+      manager.onEvent((event) => {
+        if (event.type === "terminal.output") output.push(event.data)
+      })
+      manager.createTerminal({ projectPath: tempProjectPath, terminalId: "split", cols: 80, rows: 24, scrollback: 1_000 })
+      const terminal = terminals[0]!
+      terminal.data(terminal, Uint8Array.of(0xe4, 0xb8))
+      terminal.data(terminal, Uint8Array.of(0xad))
+      expect(output).toEqual(["中"])
+      terminal.data(terminal, Uint8Array.of(0xe4))
+      await waitFor(() => manager.getSnapshot("split")?.serializedState.includes("中�") ?? false, 1_000)
+      expect(output).toEqual(["中", "�"])
+      expect(manager.getSnapshot("split")?.status).toBe("exited")
+      terminal.data(terminal, Uint8Array.of(0xb8, 0xad))
+      expect(output).toEqual(["中", "�"])
+      manager.close("split")
+    } finally {
+      Object.defineProperty(Bun, "Terminal", { value: originalTerminal })
+      Object.defineProperty(Bun, "spawn", { value: originalSpawn })
+    }
+  })
+
+  test("ignores stale exit resolution and rejection after close and replacement", async () => {
+    const originalTerminal = Bun.Terminal
+    const originalSpawn = Bun.spawn
+    const terminals: Array<{ data: (terminal: unknown, data: string | Uint8Array) => void }> = []
+    const exits: Array<{ resolve: (code: number) => void; reject: (error: unknown) => void }> = []
+    try {
+      class FakeTerminal {
+        readonly data: (terminal: unknown, data: string | Uint8Array) => void
+        constructor(options: { data: (terminal: unknown, data: string | Uint8Array) => void }) {
+          this.data = options.data
+          terminals.push(this)
+        }
+        resize() {}
+        write() {}
+        close() {}
+      }
+      Object.defineProperty(Bun, "Terminal", { value: FakeTerminal })
+      Object.defineProperty(Bun, "spawn", {
+        value: () => {
+          let resolve!: (code: number) => void
+          let reject!: (error: unknown) => void
+          const exited = new Promise<number>((res, rej) => {
+            resolve = res
+            reject = rej
+          })
+          exits.push({ resolve, reject })
+          return { pid: undefined, exited }
+        },
+      })
+      const manager = new TerminalManager()
+      const events: string[] = []
+      manager.onEvent((event) => {
+        if (event.type === "terminal.exit") events.push(`exit:${event.terminalId}`)
+        if (event.type === "terminal.output") events.push(event.data)
+      })
+      manager.createTerminal({ projectPath: tempProjectPath, terminalId: "resolve", cols: 80, rows: 24, scrollback: 1_000 })
+      manager.close("resolve")
+      manager.createTerminal({ projectPath: tempProjectPath, terminalId: "resolve", cols: 80, rows: 24, scrollback: 1_000 })
+      exits[0]!.resolve(0)
+      terminals[0]!.data(terminals[0], "stale")
+      manager.createTerminal({ projectPath: tempProjectPath, terminalId: "reject", cols: 80, rows: 24, scrollback: 1_000 })
+      manager.close("reject")
+      manager.createTerminal({ projectPath: tempProjectPath, terminalId: "reject", cols: 80, rows: 24, scrollback: 1_000 })
+      exits[2]!.reject(new Error("stale failure"))
+      await Bun.sleep(0)
+      expect(events).toEqual([])
+      expect(manager.getSnapshot("resolve")?.status).toBe("running")
+      expect(manager.getSnapshot("reject")?.status).toBe("running")
+    } finally {
+      Object.defineProperty(Bun, "Terminal", { value: originalTerminal })
+      Object.defineProperty(Bun, "spawn", { value: originalSpawn })
     }
   })
 })

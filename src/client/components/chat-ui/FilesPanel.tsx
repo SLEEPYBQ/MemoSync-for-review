@@ -1,7 +1,11 @@
-
-
+// Files workbench panel: Codex-style code viewing and editing. Open-file tabs
+// on top, breadcrumb row beneath, CodeMirror editor with syntax highlighting
+// in the main area, and a filterable lazy-loaded file tree on the right.
+// Markdown keeps a rendered preview (toggle to source), images/PDF render
+// inline, and text files are editable with ⌘S / save-button persistence.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import Markdown from "react-markdown"
+import { copyTextToClipboard } from "../../lib/clipboard"
 import remarkGfm from "remark-gfm"
 import {
   DndContext, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent,
@@ -18,14 +22,12 @@ import {
 } from "../ui/context-menu"
 import { cn } from "../../lib/utils"
 import { classifyFilePreview, type FilePreviewKind } from "../../lib/filePreview"
-import { recordStaticMemoryEditEntered } from "../../lib/memoriesApi"
 import {
   ancestorDirs, baseName, dirName, filterIndexPaths, isSameOrUnder, nextActiveTab, remapPathAfterRename,
 } from "../../lib/filesWorkbench"
 import { markdownComponentsWithLinks } from "../messages/shared"
 import { CodeEditor } from "./CodeEditor"
 import { FileTypeIcon } from "./FileTypeIcon"
-import { isStaticMemoryMarkdownPath } from "../../../shared/staticMemoryPath"
 
 interface FilesPanelProps {
   projectId: string
@@ -48,17 +50,13 @@ interface FileBuffer {
   kind: FilePreviewKind
   status: "loading" | "ready" | "error"
   error?: string
-
+  /** Last saved content; `current !== original` marks the buffer dirty. */
   original: string
   current: string
   saving: boolean
   saveError: string | null
   justSaved: boolean
   mdMode: "preview" | "source"
-
-  editStartedAtMs: number | null
-
-  editEventId: string | null
 }
 
 interface FileIndex {
@@ -73,7 +71,8 @@ interface ContentMatch {
   col: number
 }
 
-
+/** One tab in the strip; drag to reorder (pointer must travel a few px so
+ * plain clicks still select the tab). */
 function SortableFileTab({
   path,
   isActive,
@@ -123,7 +122,7 @@ function SortableFileTab({
   )
 }
 
-
+/** Inline name input used for create-file / create-folder / rename rows. */
 type TreeEdit =
   | { mode: "create-file" | "create-dir"; dir: string }
   | { mode: "rename"; path: string }
@@ -137,8 +136,8 @@ function TreeEditInput({
 }: {
   initial: string
   indentPx: number
-
-
+  /** Rename: preselect only the stem so the extension survives typing.
+   * Create: select everything — the initial is a throwaway placeholder. */
   selectStem?: boolean
   onCommit: (name: string) => void
   onCancel: () => void
@@ -170,7 +169,7 @@ function TreeEditInput({
 }
 
 const MAX_INLINE_TEXT_BYTES = 2 * 1024 * 1024
-
+/** Below this panel width the tree and the editor swap instead of sharing. */
 const NARROW_PANEL_PX = 560
 
 function contentUrl(projectId: string, relPath: string): string {
@@ -185,7 +184,7 @@ function fetchFailMessage(err: unknown, fallback: string): string {
       : fallback
 }
 
-export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
+export function FilesPanel({ projectId, onClose }: FilesPanelProps) {
   const [dirs, setDirs] = useState<Record<string, DirState>>({})
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [tabs, setTabs] = useState<string[]>([])
@@ -204,7 +203,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
   const [reveal, setReveal] = useState<{ path: string; line: number; nonce: number } | null>(null)
   const [projectTitle, setProjectTitle] = useState<string | null>(null)
   const [isNarrow, setIsNarrow] = useState(false)
-
+  // Narrow mode swaps between tree and editor; wide mode can hide the tree.
   const [narrowShowTree, setNarrowShowTree] = useState(true)
   const [wideShowTree, setWideShowTree] = useState(true)
   const [copied, setCopied] = useState(false)
@@ -224,25 +223,14 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     setBuffers((prev) => {
       const existing = prev.get(path)
       if (!existing) return prev
-      const tracksStaticMemoryEdit = isStaticMemoryMarkdownPath(path)
-      const nextEditEventId = !tracksStaticMemoryEdit || current === existing.original
-        ? null
-        : (existing.editEventId ?? `control:static-edit:${crypto.randomUUID()}`)
-      if (nextEditEventId && existing.editEventId === null) {
-        recordStaticMemoryEditEntered(nextEditEventId, chatId, path)
-      }
       const next = new Map(prev)
       next.set(path, {
         ...existing,
         current,
-        editStartedAtMs: !tracksStaticMemoryEdit || current === existing.original
-          ? null
-          : (existing.editStartedAtMs ?? Date.now()),
-        editEventId: nextEditEventId,
       })
       return next
     })
-  }, [chatId])
+  }, [])
 
   const loadDir = useCallback(
     async (rel: string) => {
@@ -278,7 +266,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     void loadDir("")
   }, [loadDir])
 
-
+  // Project title for the breadcrumb root; non-fatal if it fails.
   useEffect(() => {
     let cancelled = false
     fetch("/api/projects")
@@ -293,7 +281,8 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     }
   }, [projectId])
 
-
+  // Track the panel's own width — it lives in a resizable pane, so viewport
+  // breakpoints don't describe it.
   useEffect(() => {
     const el = rootRef.current
     if (!el) return
@@ -305,7 +294,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     return () => observer.disconnect()
   }, [])
 
-
+  // Lazily build the quick-open index the first time the filter is used.
   useEffect(() => {
     if (filter && index === null && indexError === null) void loadIndex()
   }, [filter, index, indexError, loadIndex])
@@ -316,7 +305,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     [buffers],
   )
 
-
+  // Fall back to the tree when the last tab closes in narrow mode.
   useEffect(() => {
     if (!active) setNarrowShowTree(true)
   }, [active])
@@ -335,7 +324,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
       setTabs((prev) => (prev.includes(path) ? prev : [...prev, path]))
       setActive(path)
       setNarrowShowTree(false)
-
+      // Reveal in tree: expand ancestors and make sure their listings load.
       setExpanded((prev) => {
         const next = new Set(prev)
         for (const dir of ancestorDirs(path)) next.add(dir)
@@ -355,8 +344,6 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
           saveError: null,
           justSaved: false,
           mdMode: "preview",
-          editStartedAtMs: null,
-          editEventId: null,
         })
         return next
       })
@@ -364,7 +351,8 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     [],
   )
 
-
+  // Ensure ancestor dir listings exist for the active file (reveal-in-tree
+  // after quick-open) — separate effect so openFile stays synchronous.
   useEffect(() => {
     if (!active) return
     for (const dir of ancestorDirs(active)) {
@@ -372,7 +360,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     }
   }, [active, dirs, loadDir])
 
-
+  // Fetch text/markdown content for buffers that are still loading.
   useEffect(() => {
     const pending = [...buffers.entries()].filter(([, b]) => b.status === "loading")
     if (pending.length === 0) return
@@ -427,11 +415,6 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
       updateBuffer(path, { saving: true, saveError: null })
       try {
         const headers: Record<string, string> = { "Content-Type": "text/plain;charset=utf-8" }
-        if (chatId) headers["X-MemoSync-Session-Id"] = chatId
-        if (buffer.editStartedAtMs !== null) {
-          headers["X-MemoSync-Edit-Duration-Ms"] = String(Math.max(0, Date.now() - buffer.editStartedAtMs))
-        }
-        if (buffer.editEventId) headers["X-MemoSync-Event-Id"] = buffer.editEventId
         const res = await fetch(contentUrl(projectId, path), {
           method: "PUT",
           headers,
@@ -445,15 +428,13 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
           saving: false,
           original: content,
           justSaved: true,
-          editStartedAtMs: null,
-          editEventId: null,
         })
         window.setTimeout(() => updateBuffer(path, { justSaved: false }), 1500)
       } catch (err) {
         updateBuffer(path, { saving: false, saveError: fetchFailMessage(err, "failed to save file") })
       }
     },
-    [buffers, chatId, projectId, updateBuffer],
+    [buffers, projectId, updateBuffer],
   )
 
   const refresh = useCallback(() => {
@@ -464,7 +445,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     setContentResults(null)
   }, [expanded, loadDir])
 
-
+  // Debounced project-wide content search (search-in-files mode).
   useEffect(() => {
     if (searchMode !== "content") return
     const q = filter.trim()
@@ -502,7 +483,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
   const openFileAt = useCallback(
     (path: string, line: number) => {
       openFile(path)
-
+      // Line jumps need the source editor — markdown otherwise opens in preview.
       updateBuffer(path, { mdMode: "source" })
       setReveal((prev) => ({ path, line, nonce: (prev?.nonce ?? 0) + 1 }))
     },
@@ -549,7 +530,10 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     [dirs, loadDir],
   )
 
-
+  // Radix restores focus to the trigger row when a context menu closes, which
+  // would immediately blur (and cancel) the inline edit input. Suppress that
+  // restore (see onCloseAutoFocus below) and defer entering edit mode until
+  // the menu has finished closing.
   const pendingMenuEditRef = useRef(false)
   const startTreeEditAfterMenu = useCallback(
     (edit: TreeEdit) => {
@@ -601,7 +585,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
       const rel = treeEdit.dir ? `${treeEdit.dir}/${clean}` : clean
       const done = await runFileOp({ op: treeEdit.mode === "create-file" ? "create" : "mkdir", path: rel })
       if (!done) return
-
+      // Reload every level the new path touches (subpaths auto-create dirs).
       void loadDir(treeEdit.dir)
       for (const anc of ancestorDirs(rel)) {
         setExpanded((prev) => new Set(prev).add(anc))
@@ -647,7 +631,8 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     [dirs, loadDir],
   )
 
-
+  // A small travel distance keeps plain clicks selecting tabs; only an actual
+  // drag starts reordering.
   const tabDndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }))
   const handleTabDragEnd = useCallback((event: DragEndEvent) => {
     const { active: dragged, over } = event
@@ -660,12 +645,11 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     })
   }, [])
 
-  const copyActivePath = useCallback(() => {
+  const copyActivePath = useCallback(async () => {
     if (!active) return
-    void navigator.clipboard?.writeText(active).then(() => {
-      setCopied(true)
-      window.setTimeout(() => setCopied(false), 1200)
-    })
+    if (!await copyTextToClipboard(active)) return
+    setCopied(true)
+    window.setTimeout(() => setCopied(false), 1200)
   }, [active])
 
   const filterResults = useMemo(
@@ -678,6 +662,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
   const activeIsDirty =
     activeBuffer?.status === "ready" && activeBuffer.current !== activeBuffer.original
 
+  // --- tree rendering -------------------------------------------------------
 
   const renderDirEntries = (rel: string, depth: number): ReactNode => {
     const state = dirs[rel]
@@ -999,6 +984,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     </div>
   )
 
+  // --- main pane ------------------------------------------------------------
 
   const mainPane = (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
@@ -1077,10 +1063,11 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
     </div>
   )
 
+  // --- chrome ---------------------------------------------------------------
 
   return (
     <div ref={rootRef} className="flex h-full flex-col overflow-hidden">
-
+      {/* Tab strip */}
       {tabs.length > 0 ? (
         <div className="flex items-center gap-1 overflow-x-auto border-b border-border px-1.5 pt-1.5 pb-1 [scrollbar-width:thin]">
           <DndContext sensors={tabDndSensors} collisionDetection={closestCenter} onDragEnd={handleTabDragEnd}>
@@ -1106,7 +1093,7 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
         </div>
       ) : null}
 
-
+      {/* Breadcrumb + actions */}
       <div className="flex h-9 items-center justify-between gap-2 border-b border-border px-2">
         <div className="flex min-w-0 items-center gap-1 font-mono text-xs text-muted-foreground">
           <span className="shrink-0 truncate">{projectTitle ?? "Project"}</span>
@@ -1159,8 +1146,8 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
                 size="icon"
                 className="h-7 w-7"
                 title="Open in new tab"
-
-
+                // Absolute URL via window.open — a relative target=_blank anchor
+                // opens a blank popup in PWA standalone (QA_TEST_CHAIN_2 E16).
                 onClick={() =>
                   window.open(
                     new URL(contentUrl(projectId, active), window.location.origin).toString(),
@@ -1190,18 +1177,18 @@ export function FilesPanel({ projectId, chatId, onClose }: FilesPanelProps) {
         </div>
       </div>
 
-
+      {/* Body */}
       <div className="flex min-h-0 flex-1">
         {showMain ? mainPane : null}
         {isNarrow ? (
           showTree ? treePane : null
         ) : (
-
-
+          /* Wide mode keeps the tree mounted and animates its width so the
+             toggle slides instead of snapping (the editor reflows with it). */
           <div
             className={cn(
-
-
+              // min-w-0 matters: a flex item's min-width:auto would floor the
+              // width at the tree's content size and defeat the w-0 collapse.
               "min-h-0 min-w-0 shrink-0 overflow-hidden transition-[width] duration-200 ease-out",
               wideShowTree ? "w-56" : "w-0",
             )}

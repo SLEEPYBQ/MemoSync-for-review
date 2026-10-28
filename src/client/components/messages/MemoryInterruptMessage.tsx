@@ -1,5 +1,7 @@
-
-
+// Recovery card: parked inline at the interruption point after a per-memory
+// interrupt. The participant writes one turn-local correction; sending it is
+// Resume. Working Memory remains visible as lightweight context and can still
+// be adjusted before the continuation starts.
 import { useMemo, useState } from "react"
 import { CircleSlash, CornerDownRight, Loader2, Send, X } from "lucide-react"
 import type { HydratedTranscriptMessage } from "../../../shared/types"
@@ -56,7 +58,7 @@ export function MemoryInterruptMessage({ message }: Props) {
     }
   }
 
-
+  // Settled: one quiet receipt line, same idiom as the settled gates.
   if (message.resolution) {
     return (
       <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">

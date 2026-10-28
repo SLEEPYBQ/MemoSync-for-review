@@ -26,7 +26,7 @@ function clearSelection(): void {
   try {
     window.getSelection()?.removeAllRanges()
   } catch {
-
+    // Selection APIs can be blocked by embedded browsers; prevention remains.
   }
 }
 

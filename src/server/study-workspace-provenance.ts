@@ -48,7 +48,7 @@ export function assertValidStudyWorkspaceProvenance(provenancePath: string, proj
   }
 }
 
-
+/** Fail-closed readiness probe shared by server boot and provisioning tests. */
 export function studyWorkspaceStarterReady(localPath: string, projectId: string): boolean {
   try {
     if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(projectId) || projectId.includes("..")) return false

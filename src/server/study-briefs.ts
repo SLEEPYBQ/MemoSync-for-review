@@ -1,5 +1,7 @@
-
-
+// Participant-facing task briefs, verbatim from the study design. Kept
+// server-side ON PURPOSE: the serial gate must be able to withhold a locked
+// task's instructions, so this text can never ship in the client bundle.
+// Served by /api/study/task/:id for unlocked tasks only.
 export const STUDY_BRIEFS: Record<string, string[]> = {
   "038-S1": [
     "Please implement the browsing and discovery features of a short-term apartment rental website.",

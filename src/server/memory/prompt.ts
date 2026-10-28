@@ -1,44 +1,54 @@
-
-
+// The memory system-prompt fragments. ADDITIVE: Kanna already supplies the
+// agent persona + native tools, so this only layers on the memory context, the
+// [M-NN] citation rule, and the tool-usage guidance.
+//
+// Injection model (REDESIGN 2026-08-04, D1/D2): the boot block (rules +
+// snapshot) is appended ONCE to Claude's preset system prompt and the session
+// is never rebuilt for memory changes — instead every later change rides the
+// next user turn as a delta block (`buildMemoryDeltaBlock`) inside a
+// <system-reminder>. Items carry versions ("[M-07 v3]"); the stated resolution
+// rule is "same id → highest version wins", which is what lets stale snapshot
+// lines coexist with fresh delta lines in one context window. Codex still
+// receives the full block per turn via developer_instructions.
 import type { MemoryItem } from './types';
 
-
+/** One index line: `[M-07 v3] (scope · type) content [+detail]`. */
 export function formatMemoryLine(m: MemoryItem): string {
   return `[${m.id} v${m.version}] (${m.scope} · ${m.type}) ${m.content}${m.detail ? ' [+detail]' : ''}`;
 }
 
-
+/**
+ * Format the injected memory list — SHORT forms only ("memory as skills"):
+ * one cheap line per item; `[+detail]` marks items whose detailed form can be
+ * pulled with load_memory_detail.
+ */
 export function formatMemoryList(memories: MemoryItem[]): string {
   if (memories.length === 0) return '(none)';
   return memories.map(formatMemoryLine).join('\n');
 }
 
-
-export function buildPlainMemoryBlock(memories: MemoryItem[]): string {
-  if (memories.length === 0) return '';
-  return [
-    '# Notes from previous sessions',
-    '',
-    ...memories.map((m) => `- ${m.content}`),
-  ].join('\n');
-}
-
-
+/** An unresolved conflicts_with pair among injected actives (both sides shown). */
 export interface MemoryConflictPair {
   id: string;
   otherId: string;
 }
 
 export interface MemoryBlockOptions {
-
+  /** Active memories for the session (the boot snapshot). */
   memories: MemoryItem[];
-
+  /** Whether the load_memory_detail tool is registered (default true). */
   tools?: boolean;
-
+  /** Unresolved conflicts among the snapshot items (deduped pairs). */
   conflicts?: MemoryConflictPair[];
 }
 
-
+/**
+ * Build the appendable BOOT block: stable rules + the session-start snapshot.
+ * The injected index is the COMPLETE memory surface for the session — there is
+ * deliberately no search tool reaching past it, so what the user sees in the
+ * injection receipt is exactly what the model can use. Returns '' only in the
+ * degenerate case of no memories AND no tools.
+ */
 export function buildMemoryBlock(opts: MemoryBlockOptions): string {
   const tools = opts.tools ?? true;
   const memories = opts.memories ?? [];
@@ -84,27 +94,31 @@ export function buildMemoryBlock(opts: MemoryBlockOptions): string {
   return parts.join('\n');
 }
 
-
+/** One line of a per-turn memory delta. */
 export interface MemoryDeltaEntry {
   kind: 'added' | 'edited' | 'removed';
   id: string;
-
+  /** Current version (added/edited). */
   version?: number;
-
+  /** Previous version (edited). */
   fromVersion?: number;
-
+  /** Formatted content line (added/edited): `(scope · type) content [+detail]`. */
   line?: string;
-
+  /** Ids this item now conflicts with (unresolved). */
   conflictsWith?: string[];
 }
 
 export interface MemoryDeltaBlockOptions {
   entries: MemoryDeltaEntry[];
-
+  /** Ids injected but excluded for THIS turn only (preview-gate edit). */
   ignoreForTurn?: string[];
 }
 
-
+/**
+ * Render the per-turn delta block (WITHOUT the <system-reminder> wrapper —
+ * the caller owns the envelope). Returns '' when there is nothing to say, so
+ * quiet turns add zero tokens and leave the prompt cache untouched.
+ */
 export function buildMemoryDeltaBlock(opts: MemoryDeltaBlockOptions): string {
   const { entries, ignoreForTurn } = opts;
   const hasIgnores = Boolean(ignoreForTurn?.length);
@@ -120,7 +134,7 @@ export function buildMemoryDeltaBlock(opts: MemoryDeltaBlockOptions): string {
         ? ` — ⚠ conflicts with ${e.conflictsWith.map((id) => `[${id}]`).join(', ')} (unresolved; if both apply, ask the user)`
         : '';
       if (e.kind === 'removed') {
-
+        // Covers archive AND session exclusion — either way it left the set.
         parts.push(`- [${e.id}] (no longer in the active set)`);
       } else if (e.kind === 'added') {
         parts.push(`- [${e.id} v${e.version ?? 1}] (added) ${e.line ?? ''}${conflictSuffix}`);

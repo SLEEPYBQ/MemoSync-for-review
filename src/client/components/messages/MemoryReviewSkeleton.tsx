@@ -5,7 +5,7 @@ interface Props {
   status: string
 }
 
-
+/** One loading language for every pre-turn memory review. */
 export function MemoryReviewSkeleton({ label, status }: Props) {
   return (
     <div className="flex flex-col gap-1.5" aria-live="polite" aria-label={label}>

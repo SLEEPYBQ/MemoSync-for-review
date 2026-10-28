@@ -1,45 +1,65 @@
-
-
+// Cross-context transfer (Transfer design 2026-08-08, docs/TRANSFER_DESIGN_
+// 2026-08-08.md). TWO EXPLICIT STAGES around a middle representation:
+//
+//   ENCODE  source item + source context profile
+//           → abstract rule + applicability (the portable middle form)
+//   DECODE  rule + target name + target's existing memories
+//           [+ task text + recent-conversation digest, flow-initiated only]
+//           → localized text + suggested landing scope + landing judgment
+//
+// Input discipline (audited against over-engineering, doc §输入的理由审查):
+// the encoder sees the SOURCE profile because stripping source-local nouns
+// requires knowing what the source looks like — it deliberately does NOT see
+// the conversation digest (what the source chatted about recently is not
+// evidence of what is source-local). The decoder sees task text + digest so
+// the localized form fits the work at hand; Board-initiated transfers have
+// neither and degrade naturally. The middle representation is NOT persisted
+// as a standalone memory item — it rides the proposal (and the transferred
+// item's provenance) as metadata.
+//
 import type { LlmJsonCaller } from './deepseek';
 import type { AbstractionLevel, MemoryItem, MemoryScope } from './types';
 
 export interface TransferTarget {
   scope: MemoryScope;
   projectId?: string;
-
+  /** Human title for the target project — the LLM localizes better with it. */
   projectTitle?: string;
-
-
+  /** The target context's existing ACTIVE memories — version is included by
+   * automatic Transfer so the landing can carry a write-time CAS snapshot. */
   existing?: Array<Pick<MemoryItem, 'id' | 'content'> & Partial<Pick<MemoryItem, 'version'>>>;
 }
 
 export interface TransferSourceContext {
-
+  /** Human title of the source project (undefined for session/personal sources). */
   projectTitle?: string;
-
-
+  /**
+   * A few representative memories from the source context. They show the
+   * encoder which nouns, paths, and stack choices are source-local — you
+   * cannot know what to strip without knowing what the source looks like.
+   */
   representative?: Array<Pick<MemoryItem, 'id' | 'content'>>;
 }
 
-
+/** The middle representation — shown on the card, stored as metadata, never a standalone item. */
 export interface TransferEncoding {
-
+  /** The portable, context-free rule (one line). */
   rule: string;
-
+  /** When the rule applies; undefined = unconditional. */
   applicability?: string;
-
+  /** False = context-bound: the memory only makes sense at its source. */
   portable: boolean;
-
-
+  /** Exact source-memory substrings removed as source-local — the card
+   * strikes them through to make the encoding VISIBLE in the text. */
   stripped?: string[];
   note: string;
 }
 
 export interface TransferDecodeContext {
   target: TransferTarget;
-
+  /** The current task text — conversation-flow initiations only. */
   taskText?: string;
-
+  /** Recent-conversation digest (the same non-fork mechanism relevance uses). */
   recentContext?: string;
 }
 
@@ -47,22 +67,22 @@ export type TransferLandingRoute = 'new' | 'reinforces' | 'conflicts';
 
 export interface TransferLanding {
   route: TransferLandingRoute;
-
+  /** The target-context memory the landing relates to (reinforces/conflicts). */
   targetId?: string;
   targetContent?: string;
-
+  /** Version of the target snapshot used for this landing judgment. */
   targetVersion?: number;
 }
 
 export interface TransferDecoding {
-
+  /** The localized memory text as it should read in the target (editable by the user). */
   content: string;
-
-
+  /** Exact content substrings newly bound from the target/task — the card
+   * tints them in the landing scope's color. */
   bound?: string[];
   detail?: string;
   abstractionLevel: AbstractionLevel;
-
+  /** Where the decoded form should land — preselects the card's ScopeControl. */
   suggestedScope: MemoryScope;
   landing: TransferLanding;
   note: string;
@@ -70,14 +90,14 @@ export interface TransferDecoding {
 
 export type TransferVerdict = 'as_is' | 'rewrite' | 'context_bound';
 
-
+/** Board-compat proposal shape (transfer-preview route + dialog). */
 export interface TransferProposal {
   verdict: TransferVerdict;
-
+  /** The abstract rule the source was lifted to (the middle representation). */
   portable: string;
-
+  /** When the rule applies; undefined = unconditional. */
   applicability?: string;
-
+  /** The form localized for the target context (editable by the user). */
   content: string;
   detail?: string;
   abstractionLevel: AbstractionLevel;
@@ -96,7 +116,7 @@ export interface TransferService {
     ctx: TransferDecodeContext,
     opts?: { signal?: AbortSignal },
   ): Promise<TransferDecoding>;
-
+  /** encode → decode chained into the Board dialog's proposal shape. */
   propose(
     memory: MemoryItem,
     target: TransferTarget,
@@ -181,14 +201,15 @@ Respond with strict JSON only: {"content": "...", "detail": "... or null", "abst
 "suggestedScope": "project", "landingRoute": "new", "landingTargetId": "<id or null>", "bound": ["..."], \
 "note": "..."}`;
 
-
+/** Keep only real, verbatim substrings of `host` — a hallucinated fragment
+ * must never earn a highlight. */
 function cleanFragments(raw: unknown, host: string): string[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const items = raw
     .filter((x): x is string => typeof x === 'string')
     .map((x) => x.trim())
-
-
+    // Values, not prose: short, verbatim, and free of clause punctuation — a
+    // model that returns the whole sentence must not strike the whole card.
     .filter((x) => x.length > 0 && x.length <= 24 && host.includes(x) && !/[,;。;,]/.test(x))
     .slice(0, 5);
   return items.length ? items : undefined;
@@ -205,8 +226,9 @@ export function createTransferService(opts: { callJson: LlmJsonCaller }): Transf
     const representative = (source.representative ?? []).filter((m) => m.id !== memory.id);
     const raw = await opts.callJson({
       system: ENCODE_SYSTEM,
-
-
+      // Low-effort thinking (user decision 2026-08-09, official mapping is a
+      // true "low" on v4-flash): the few-shot examples carry the abstraction
+      // quality; a roomy budget so the reply can never truncate silently.
       reasoningEffort: 'low',
       maxTokens: 12000,
       user: [
@@ -236,8 +258,9 @@ export function createTransferService(opts: { callJson: LlmJsonCaller }): Transf
     const existing = target.existing ?? [];
     const raw = await opts.callJson({
       system: DECODE_SYSTEM,
-
-
+      // The heaviest call in the pipeline: the landing judgment reasons over
+      // the whole target pool. Low-effort thinking + a roomy budget — the
+      // default 4000 truncated the JSON and silently dropped rows.
       reasoningEffort: 'low',
       maxTokens: 12000,
       user: [
@@ -257,7 +280,8 @@ export function createTransferService(opts: { callJson: LlmJsonCaller }): Transf
       signal: decodeOpts?.signal,
     });
 
-
+    // Landing CAS: only bind to a target memory that really exists in the
+    // provided short-list — a hallucinated id degrades to "new".
     const existingIds = new Map(existing.map((m) => [m.id, m]));
     let landing: TransferLanding = { route: 'new' };
     const landingRoute = LANDING_ROUTES.has(raw.landingRoute as TransferLandingRoute)
@@ -296,8 +320,8 @@ export function createTransferService(opts: { callJson: LlmJsonCaller }): Transf
     async propose(memory, target, source, proposeOpts) {
       const encoding = await encode(memory, source ?? {}, proposeOpts);
       const decoding = await decode(encoding, { target }, proposeOpts);
-
-
+      // Verdict is DERIVED, not asked for: context-bound comes from the
+      // encoder; as_is means the round trip landed back on the source text.
       const verdict: TransferVerdict = !encoding.portable
         ? 'context_bound'
         : decoding.content === memory.content

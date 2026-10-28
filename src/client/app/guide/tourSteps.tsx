@@ -1,5 +1,5 @@
 import type { TourStep } from "./GuideTour"
-import { buildAutoScenes, buildMemoSyncScenes, buildStaticScenes, TOUR_ANCHORS } from "./guideScenes"
+import { buildMemoSyncScenes, TOUR_ANCHORS } from "./guideScenes"
 import { GUIDE_BOARD_PENDING_DEMO } from "./guideBoardDemo"
 
 type UnclassifiedTourStep = Omit<TourStep, "chapter" | "sharedAcrossConditions">
@@ -16,6 +16,19 @@ function classifySteps(
   }))
 }
 
+/**
+ * Step content per study arm. Chapter 1 teaches system use through one shared
+ * chat/Browser/Files subset plus the arm's real memory surface. Chapter 2 is
+ * assembled by one shared experiment-workflow builder, so task/submission
+ * instructions cannot drift between conditions. The demo advances WITH the
+ * participant's clicks; the baselines call the app "Agent".
+ *
+ * The MemoSync steps walk the paper's 2x4 matrix in timeline order
+ * (INTERACTION_REDESIGN_2026-08-07 §2): Reviewing / Accepting proposed
+ * changes, Inspecting / Adjusting the injected set, Tracing / Interrupting
+ * memory use, Auditing / Following Up on outcomes. Every surface is the real
+ * production component; steps marked interactive can actually be tried.
+ */
 
 const DEMO_REVISE_REPLY =
   "Kept [M-02] (cart state) and [M-03] (confirmation dialog); they are the memories that touch this cart task. Say the word if you want [M-01] back in."
@@ -225,16 +238,6 @@ function filesPanelStep(scene: TourStep["scene"]): UnclassifiedTourStep {
     target: { panel: true },
     interactive: true,
   }
-}
-
-function baselineProjectCopyExplanation() {
-  return (
-    <p>
-      Your first project starts with empty memory, shared by every chat and session in that
-      project. Its final memory is copied once into the second project. After that, each project
-      has a separate copy, so changing one does not change the other.
-    </p>
-  )
 }
 
 function studyContractSteps(scene: TourStep["scene"]): UnclassifiedTourStep[] {
@@ -561,39 +564,6 @@ function sharedSystemOpeningSteps(scenes: SharedSystemScenes): TourStep[] {
   ])
 }
 
-function sharedSystemResultSteps(scenes: SharedSystemScenes): TourStep[] {
-  return classifySteps("system_use", true, [
-    {
-      id: "shared.work-log",
-      title: "Grey rows = the assistant working",
-      body: (
-        <>
-          <p>
-            Each grey row is a real action such as running a command or editing a file. Click a row
-            in the study to inspect exactly what happened.
-          </p>
-          <p>You do not need to approve each row; use them to monitor the work and diagnose mistakes.</p>
-        </>
-      ),
-      scene: scenes.tools,
-      target: { rowKind: "tool-group", nth: 0 },
-    },
-    {
-      id: "shared.finished-reply",
-      title: "The finished reply",
-      body: (
-        <p>
-          The final reply summarizes the change. Treat it as a report, then test the application
-          yourself. If anything is off, describe the observed problem in your next message and ask
-          the assistant to fix it.
-        </p>
-      ),
-      scene: scenes.final,
-      target: { rowId: TOUR_ANCHORS.finalReply },
-    },
-  ])
-}
-
 function sharedSystemWorkspaceSteps(scenes: SharedSystemScenes): TourStep[] {
   return classifySteps("system_use", true, [
     ...browserPanelSteps(scenes.final),
@@ -865,8 +835,8 @@ export function buildMemoSyncSteps(): TourStep[] {
       scene: scenes.previewOpen,
       target: { rowId: TOUR_ANCHORS.preview },
       interactive: true,
-
-
+      // Demo mode from the first preview step: the production buttons and
+      // Enter/Esc path settle only this local scene.
       previewDemo: {
         poolExpanded: true,
         reviseReply: DEMO_REVISE_REPLY,
@@ -1105,168 +1075,6 @@ export function buildMemoSyncSteps(): TourStep[] {
       ),
       scene: scenes.resumedAudit,
     },
-    ]),
-    ...experimentWorkflowSteps(scenes.ask),
-  ]
-}
-
-export function buildAutoSteps(): TourStep[] {
-  const scenes = buildAutoScenes()
-  const sharedScenes: SharedSystemScenes = {
-    empty: scenes.empty,
-    ask: scenes.ask,
-    active: scenes.replying,
-    tools: scenes.tools,
-    final: scenes.final,
-  }
-  return [
-    ...sharedSystemOpeningSteps(sharedScenes),
-    ...classifySteps("system_use", false, [
-      {
-        id: "auto.memory",
-        title: "Automatic project memory",
-        body: (
-          <>
-            <p>
-              After each completed turn, Agent <strong>automatically captures</strong> broadly useful
-              preferences, decisions, and codebase facts. They join one project-local memory copy
-              shared by every chat and session in the current project.
-            </p>
-            <p>
-              Before every next turn, the system focuses the current project's{" "}
-              <strong>complete plain Markdown block</strong>. It sends the whole block as text, with no
-              relevance filter, participant selection, or per-item review step.
-            </p>
-          </>
-        ),
-        scene: scenes.replying,
-      },
-      {
-        id: "auto.inspect",
-        title: "Inspect and update Auto memory",
-        body: (
-          <>
-            <p>
-              This real sidebar shows a readable <strong>derived summary</strong> of the current
-              project's memory copy. The summary is a monitoring view, not a second canonical store
-              and not a substitute for the complete block focused on each turn.
-            </p>
-            <p>
-              Use the input labelled <strong>Ask or update your memory</strong> to inspect the copy or
-              tell Agent to remember, change, or forget something. Optional practice: try a request
-              here, or select Next. The interaction stays isolated from participant memory.
-            </p>
-            {baselineProjectCopyExplanation()}
-          </>
-        ),
-        scene: scenes.final,
-        panel: "autoMemory",
-        target: { panel: true },
-        interactive: true,
-      },
-    ]),
-    ...sharedSystemResultSteps(sharedScenes),
-    ...sharedSystemWorkspaceSteps(sharedScenes),
-    ...classifySteps("system_use", false, [
-      {
-        id: "auto.recap",
-        title: "Automatic-memory recap",
-        body: (
-          <p>
-            Agent captures memory after completed turns, focuses the full current-project block on
-            the next turn, and lets you inspect or change the copy through the memory sidebar.
-          </p>
-        ),
-        scene: scenes.final,
-      },
-    ]),
-    ...experimentWorkflowSteps(scenes.ask),
-  ]
-}
-
-export function buildStaticSteps(): TourStep[] {
-  const scenes = buildStaticScenes()
-  const sharedScenes: SharedSystemScenes = {
-    empty: scenes.empty,
-    ask: scenes.ask,
-    active: scenes.tools,
-    tools: scenes.tools,
-    final: scenes.final,
-  }
-  return [
-    ...sharedSystemOpeningSteps(sharedScenes),
-    ...classifySteps("system_use", false, [
-      {
-        id: "static.notebook",
-        title: "The shared Markdown notebook",
-        body: (
-          <>
-            <p>
-              Static memory is the workspace's <strong>exact Markdown text block</strong>: the root{" "}
-              <strong>MEMORY.md</strong> plus every eligible file under <strong>memory/*.md</strong>.
-              At the start of every turn, the system reads all current memory files and sends their
-              contents to Claude as text as one complete block. It never sends file attachments or
-              applies relevance, selection, or per-item review.
-            </p>
-            <p>
-              This real sidebar shows the root file. Optional practice: use <strong>Edit</strong> and
-              <strong> Save</strong> here, or select Next. In a real session, extra files can be
-              inspected or edited through the Files panel.
-            </p>
-            {baselineProjectCopyExplanation()}
-          </>
-        ),
-        scene: scenes.ask,
-        panel: "staticMemory",
-        target: { panel: true },
-        interactive: true,
-      },
-      {
-        id: "static.apply",
-        title: "Agent applies the exact notebook",
-        body: (
-          <p>
-            The reply follows the Markdown text sent with this turn. There is no fabricated read-file
-            action in the transcript because the study system delivers the block before the run.
-          </p>
-        ),
-        scene: scenes.tools,
-        target: { rowId: TOUR_ANCHORS.firstReply },
-      },
-      {
-        id: "static.update",
-        title: "It updates the notebook too",
-        body: (
-          <>
-            <p>
-              When something is worth keeping, Agent edits MEMORY.md. Here it noted the new button.
-              The file is yours as well: ask in chat to change or remove notes, and its edits show up
-              in the Git panel like any other file change.
-            </p>
-            <p>
-              To read the notes any time, open the <strong>memory panel</strong> (brain icon on the
-              right side of a chat).
-            </p>
-          </>
-        ),
-        scene: scenes.tools,
-        target: { rowKind: "tool-group", nth: 1 },
-      },
-    ]),
-    ...sharedSystemResultSteps(sharedScenes),
-    ...sharedSystemWorkspaceSteps(sharedScenes),
-    ...classifySteps("system_use", false, [
-      {
-        id: "static.recap",
-        title: "Static-memory recap",
-        body: (
-          <p>
-            You and Agent share the project Markdown files directly. Every turn receives the complete
-            current block, and edits remain visible in the workspace and Git history.
-          </p>
-        ),
-        scene: scenes.final,
-      },
     ]),
     ...experimentWorkflowSteps(scenes.ask),
   ]

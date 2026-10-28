@@ -1,5 +1,8 @@
-
-
+// Client data layer for the memory HTTP API. Same-origin relative fetch (Vite
+// proxies /api to the Bun backend in dev; one origin in prod). Envelope:
+// success = { data }, error = { error: { code, message } } — matches
+// src/server/memory/routes.ts. Types are imported type-only from the server
+// module (erased at build; no server code enters the client bundle).
 import type {
   AbstractionLevel,
   MemoryEvent,
@@ -13,9 +16,9 @@ import type {
   MemoryBoardBacklogSnapshot,
   MemoryBoardOpeningPromptState,
 } from "../../server/memory/board-backlog"
-import { isStaticMemoryMarkdownPath } from "../../shared/staticMemoryPath"
 import { enqueueStudyTelemetry } from "../app/study/studyTelemetry"
 import { notifyIfUnauthorized } from "./authGuard"
+import { generateUUID } from "./utils"
 
 export type { AbstractionLevel, MemoryEvent, MemoryItem, MemoryScope, MemoryStatus, MemoryType }
 
@@ -34,7 +37,7 @@ export interface CreateMemoryBody {
   detail?: string
   abstractionLevel?: AbstractionLevel
   scope: MemoryScope
-
+  /** Optional — the server defaults manual creations to 'fact'. */
   type?: MemoryType
   status?: MemoryStatus
   projectId?: string
@@ -56,7 +59,7 @@ export interface MemoryBoardCheckupActionContext extends MemoryBoardActionContex
   otherMemoryId?: string
 }
 
-
+/** GET /api/memories/:id/history response — the per-item version/usage log (option 乙). */
 export interface MemoryHistory {
   memory: MemoryItem
   events: MemoryEvent[]
@@ -104,7 +107,7 @@ function qs(params: Record<string, string | undefined>): string {
 }
 
 function controlOperationId(label: string): string {
-  return `control:${label}:${crypto.randomUUID()}`
+  return `control:${label}:${generateUUID()}`
 }
 
 export const memoriesApi = {
@@ -146,7 +149,7 @@ export const memoriesApi = {
       body: JSON.stringify({ toSeq, surface, operationId: controlOperationId(`crud-revert:${id}:${toSeq}`) }),
     }).then((r) => unwrap<MemoryItem>(r)),
 
-
+  /** GET /api/memories/needs-attention — conflicted memories for the Board (A1). */
   needsAttention: (projectId?: string) =>
     fetch(`/api/memories/needs-attention${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`).then((r) =>
       unwrap<{ items: Array<{ memory: MemoryItem; supersededBy: MemoryItem[] }> }>(r),
@@ -185,7 +188,7 @@ export const memoriesApi = {
       body: JSON.stringify({ taskId, chatId, reviewId }),
     }).then((r) => unwrap<MemoryBoardReviewStatus>(r)),
 
-
+  /** Renew/Archive on a gate attention row — validated + logged as an attention act. */
   resolveAttention: (
     kind: "conflict" | "redundant" | "stale",
     id: string,
@@ -210,7 +213,9 @@ export const memoriesApi = {
       }),
     }).then((r) => unwrap<MemoryItem>(r)),
 
-
+  /** Audit follow-up ①: queue this memory for next turn's injected list + reminder. */
+  /** Enforce this next run (renamed from pay-attention, 2026-08-19 D1): locks
+   * the memory into the next run with a hard order citing the evidence. */
   enforce: (id: string, sessionId: string, quote?: string) =>
     fetch("/api/memories/pay-attention", {
       method: "POST",
@@ -224,7 +229,7 @@ export const memoriesApi = {
       body: JSON.stringify({ id, sessionId }),
     }).then((r) => unwrap<{ queued: string }>(r)),
 
-
+  /** Audit follow-up ②: draft a fix for a memory the audit blamed; parks for the next gate. */
   draftRevision: (id: string, sessionId?: string) =>
     fetch(`/api/memories/${encodeURIComponent(id)}/draft-revision`, {
       method: "POST",
@@ -232,7 +237,7 @@ export const memoriesApi = {
       body: JSON.stringify({ sessionId, operationId: controlOperationId(`audit-draft-fix:${id}`) }),
     }).then((r) => unwrap<MemoryItem>(r)),
 
-
+  /** "Ask agent to revise" on the Step 2 gate: NL adjustment of the injected set. */
   reviseInjection: (
     instruction: string,
     selectedIds: string[],
@@ -253,7 +258,7 @@ export const memoriesApi = {
       }),
     }).then((r) => unwrap<{ selectedIds: string[]; reply: string }>(r)),
 
-
+  /** Explain how each newly selected memory should guide this turn. */
   planInjectionUses: (
     task: string,
     selectedIds: string[],
@@ -265,7 +270,7 @@ export const memoriesApi = {
       body: JSON.stringify({ task, selectedIds, ...context }),
     }).then((r) => unwrap<ExpectedMemoryUse[]>(r)),
 
-
+  /** Memory files: every projection file (personal + each project) — a generated, read-only export. */
   mdStatus: () =>
     fetch("/api/memories/md-status").then((r) =>
       unwrap<{
@@ -273,13 +278,13 @@ export const memoriesApi = {
       }>(r),
     ),
 
-
+  /** Raw text of one projection file — the in-app viewer reads this. */
   mdFile: (target: { scope: "personal" } | { scope: "project"; projectId: string }) =>
     fetch(
       `/api/memories/md-file${target.scope === "project" ? `?project=${encodeURIComponent(target.projectId)}` : ""}`,
     ).then((r) => unwrap<{ path: string; content: string }>(r)),
 
-
+  /** Import an external CLAUDE.md/.cursorrules: every bullet line becomes a candidate. */
   mdImport: (text: string, scope: "personal" | "project", projectId?: string) =>
     fetch("/api/memories/md-import", {
       method: "POST",
@@ -287,7 +292,7 @@ export const memoriesApi = {
       body: JSON.stringify({ text, scope, projectId }),
     }).then((r) => unwrap<{ created: string[]; skipped: number }>(r)),
 
-
+  /** Delegating mode (F4): Ask parks proposals for review; Auto applies them with revert. */
   getEvolutionPolicy: () =>
     fetch("/api/memories/evolution-policy").then((r) => unwrap<{ mode: "ask" | "auto" }>(r)),
 
@@ -298,7 +303,7 @@ export const memoriesApi = {
       body: JSON.stringify({ mode }),
     }).then((r) => unwrap<{ mode: "ask" | "auto" }>(r)),
 
-
+  /** One-click inverse of an auto-applied proposal: back to the review lane. */
   revertAutoAccept: (
     id: string,
     options: { sessionId?: string; surface?: MemoryControlSurface } = {},
@@ -309,7 +314,7 @@ export const memoriesApi = {
       body: JSON.stringify({ ...options, operationId: controlOperationId(`crud-revert-auto:${id}`) }),
     }).then((r) => unwrap<{ reverted: MemoryItem; restored: MemoryItem | null }>(r)),
 
-
+  /** Restore one non-sensitive soft-dismissed Candidate inside a reopened review. */
   restoreCandidate: (id: string, options: { surface?: MemoryControlSurface } = {}) =>
     fetch(`/api/memories/${encodeURIComponent(id)}/restore-candidate`, {
       method: "POST",
@@ -317,7 +322,7 @@ export const memoriesApi = {
       body: JSON.stringify({ ...options, operationId: controlOperationId(`crud-restore:${id}`) }),
     }).then((r) => unwrap<MemoryItem>(r)),
 
-
+  /** Muted proposals; canUnmute is server-authoritative per dismissal. */
   listMuted: () =>
     fetch("/api/memories/muted").then((r) =>
       unwrap<{ items: MutedProposal[] }>(r),
@@ -327,51 +332,7 @@ export const memoriesApi = {
       unwrap<{ ok: boolean }>(r),
     ),
 
-
-  getSummary: (projectId?: string) =>
-    fetch(`/api/memories/summary${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`).then((r) =>
-      unwrap<{ text: string; updatedAt: string; stale: boolean }>(r),
-    ),
-
-  refreshSummary: (projectId?: string) =>
-    fetch(`/api/memories/summary/refresh`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId }),
-    }).then((r) => unwrap<{ text: string; updatedAt: string; stale: boolean }>(r)),
-
-  summaryChat: (message: string, projectId?: string, sessionId?: string) =>
-    fetch(`/api/memories/summary/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        eventId: `prompt:auto-summary:${crypto.randomUUID()}`,
-        message,
-        projectId,
-        sessionId,
-      }),
-    }).then((r) =>
-      unwrap<{ reply: string; applied: number; summary: { text: string; updatedAt: string; stale: boolean } }>(r),
-    ),
-
-
-  getMemoryFile: (projectId: string) =>
-    fetch(`/api/projects/${encodeURIComponent(projectId)}/memory-file`).then((r) =>
-      unwrap<{ path: string; content: string; mtimeMs: number; exists: boolean }>(r),
-    ),
-
-  saveMemoryFile: (
-    projectId: string,
-    content: string,
-    options: { baseMtimeMs?: number; sessionId?: string; editDurationMs?: number; eventId?: string } = {},
-  ) =>
-    fetch(`/api/projects/${encodeURIComponent(projectId)}/memory-file`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content, ...options }),
-    }).then((r) => unwrap<{ path: string; mtimeMs: number }>(r)),
-
-
+  /** The session's muted ids (REDESIGN D7) — [] means everything active injects. */
   getSessionExclusions: (sessionId: string) =>
     fetch(`/api/memories/session-exclusions/${encodeURIComponent(sessionId)}`).then((r) =>
       unwrap<{ sessionId: string; ids: string[] }>(r),
@@ -384,7 +345,11 @@ export const memoriesApi = {
       body: JSON.stringify({ ids }),
     }).then((r) => unwrap<{ sessionId: string; ids: string[] }>(r)),
 
-
+  /**
+   * Redaction proposal for a sensitive candidate (DG1 "confirm" branch).
+   * Fails loudly when the LLM is unavailable — the caller's fallback is
+   * manual editing, never a fake "clean" proposal.
+   */
   sanitizePreview: (id: string) =>
     fetch(`/api/memories/${encodeURIComponent(id)}/sanitize-preview`, {
       method: "POST",
@@ -394,7 +359,7 @@ export const memoriesApi = {
       unwrap<{ content: string; detail?: string; redactions: Array<{ placeholder: string; kind: string }> }>(r),
     ),
 
-
+  /** Cross-context transfer judgment (DG3): as_is / rewrite / context_bound + adapted form. */
   transferPreview: (id: string, body: TransferTargetBody) =>
     fetch(`/api/memories/${encodeURIComponent(id)}/transfer-preview`, {
       method: "POST",
@@ -402,24 +367,24 @@ export const memoriesApi = {
       body: JSON.stringify(body),
     }).then((r) => unwrap<TransferProposal>(r)),
 
-
+  /** Commit a transfer: creates a derived memory in the target context, linked derived_from. */
   transfer: (
     id: string,
     body: TransferTargetBody & {
-
-      sourceVersion?: number
+      /** Transcript-card CAS; required for chat-gate and Board suggestions. */
+      sourceVersion: number
       content: string
       detail?: string
       abstractionLevel?: AbstractionLevel
       verdict?: TransferProposal["verdict"]
       edited?: boolean
       archiveOriginal?: boolean
-
+      /** Landing decision against the target context (REDESIGN §4.5). */
       landingRoute?: TransferLandingRoute
       landingTargetId?: string
-
+      /** Transcript landing CAS; required when the suggestion names a target. */
       landingTargetVersion?: number
-
+      /** The chat whose turn accepted this — badges the preview receipt. */
       chatId?: string
       surface?: MemoryControlSurface
       boardResolution?: MemoryBoardActionContext
@@ -431,7 +396,7 @@ export const memoriesApi = {
       body: JSON.stringify({ ...body, operationId: controlOperationId(`transfer:${id}`) }),
     }).then((r) => unwrap<MemoryItem>(r)),
 
-
+  /** "Not this one" on the Transfer card — the (source, destination) pair is never suggested again. */
   transferDecline: (
     id: string,
     contextKey: string,
@@ -453,11 +418,11 @@ export const memoriesApi = {
 export interface TransferTargetBody {
   targetScope: "personal" | "project" | "session"
   targetProjectId?: string
-
+  /** Required for a session landing (the in-flow Transfer card only). */
   targetSessionId?: string
   targetProjectTitle?: string
   sourceProjectTitle?: string
-
+  /** The middle representation — stored as metadata on the transferred item. */
   rule?: string
   applicability?: string
 }
@@ -466,27 +431,34 @@ export type TransferLandingRoute = "new" | "reinforces" | "conflicts"
 
 export interface TransferLanding {
   route: TransferLandingRoute
-
+  /** The target-context memory this landing relates to (reinforces/conflicts). */
   targetId?: string
   targetContent?: string
+  /** Version of the target snapshot used for this landing judgment. */
+  targetVersion?: number
 }
 
 export interface TransferProposal {
   verdict: "as_is" | "rewrite" | "context_bound"
-
+  /** Version of the source snapshot used for this proposal. */
+  sourceVersion: number
+  /** The abstract rule — the context-free middle representation. */
   portable: string
-
+  /** When the rule applies; absent = unconditional. */
   applicability?: string
-
+  /** The form localized for the target context (editable). */
   content: string
   detail?: string
   abstractionLevel: AbstractionLevel
   note: string
-
+  /** How the instantiated form meets the target's existing memories. */
   landing: TransferLanding
 }
 
-
+// Monitoring-act telemetry (metamemory mediator data): fire-and-forget, never
+// blocks or surfaces errors — losing a beacon is better than jank.
+// The guide tour renders the same components against fake data; it mutes the
+// beacons wholesale so the study's monitoring metrics never count tour clicks.
 let uiMonitorSuppressed = false
 export function setUiMonitorSuppressed(suppressed: boolean): void {
   uiMonitorSuppressed = suppressed
@@ -494,20 +466,6 @@ export function setUiMonitorSuppressed(suppressed: boolean): void {
 
 export function isUiMonitorSuppressed(): boolean {
   return uiMonitorSuppressed
-}
-
-export function recordStaticMemoryEditEntered(operationId: string, sessionId: string | undefined, path: string): void {
-  if (uiMonitorSuppressed || !isStaticMemoryMarkdownPath(path)) return
-  enqueueStudyTelemetry({
-    eventId: `${operationId}:entered`,
-    endpoint: "/api/study/static-edit-entered",
-    body: {
-      operationId,
-      clientTimestamp: new Date().toISOString(),
-      ...(sessionId ? { chatId: sessionId } : {}),
-      path,
-    },
-  })
 }
 
 export function recordWorkingMemorySelection(input: {
@@ -530,7 +488,7 @@ export function recordUiMonitor(
   extra: { ids?: string[]; sessionId?: string; interaction?: "open" | "click" | "scroll" | "hover" } = {},
 ): void {
   if (uiMonitorSuppressed) return
-  const eventId = `monitor:${crypto.randomUUID()}`
+  const eventId = `monitor:${generateUUID()}`
   enqueueStudyTelemetry({
     eventId,
     endpoint: "/api/memories/ui-monitor",

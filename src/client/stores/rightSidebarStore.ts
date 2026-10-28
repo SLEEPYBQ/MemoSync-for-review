@@ -3,8 +3,8 @@ import { persist } from "zustand/middleware"
 
 export interface ProjectRightSidebarVisibilityState {
   rightPanel: "hidden" | "git" | "browser" | "memory" | "files"
-
-
+  /** How the currently visible panel was opened; persisted layout restoration
+   * is system-owned, while togglePanel is an explicit participant action. */
   openInitiator: "system" | "participant"
 }
 
@@ -52,8 +52,9 @@ function clampSize(size: number) {
 
 function createDefaultProjectVisibilityState(): ProjectRightSidebarVisibilityState {
   return {
-
-
+    // Default OPEN on the memory panel (redesign 2026-08-07, supervisor
+    // requirement): the memory timeline is a standing monitoring surface,
+    // especially during the study — it starts visible instead of hidden.
     rightPanel: "memory",
     openInitiator: "system",
   }
@@ -144,7 +145,8 @@ export function migrateRightSidebarStore(persistedState: unknown) {
   return { size: DEFAULT_RIGHT_SIDEBAR_SIZE, projects, projectUi: state.projectUi ?? {}, projectBrowser }
 }
 
-
+/** Restored visibility is system-owned. In particular, a participant-opened
+ * panel must not retain participant provenance across a page reload. */
 export function mergeRightSidebarStore(
   persistedState: unknown,
   currentState: RightSidebarState,

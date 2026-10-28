@@ -1,5 +1,8 @@
-
-
+// Experiment shell · participant-facing task briefs behind the serial gate.
+// `/study` lists the sessions with their gate status (only the active one is
+// clickable); `/study/:taskId` fetches the brief from the server, which
+// withholds it while the task is locked — brief text never ships in the
+// client bundle, so there is no peeking ahead.
 import { useEffect, useState } from "react"
 import { useNavigate, useOutletContext, useParams } from "react-router-dom"
 import { ArrowLeft, ArrowRight, Check, ClipboardList, FolderOpen, Loader2, Lock } from "lucide-react"
@@ -203,8 +206,8 @@ export function StudyTaskPage() {
     setStarting(true)
     setStartError(null)
     try {
-
-
+      // Every session receives a fresh chat, while S2 deliberately keeps the
+      // same project directory and therefore all code produced in S1.
       const result = await app.handleCreateChat(assignedProject.groupKey)
       const chatStartError = getAssignedChatStartError(result)
       if (chatStartError) {

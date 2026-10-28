@@ -49,7 +49,11 @@ function focusedReviewKey(chatId: string, reviewId: string) {
   return `${chatId}\u0000${reviewId}`
 }
 
-
+/**
+ * Shared live controller index. The transcript owns the controller because it
+ * already owns the canonical gate callbacks; the opening Board only borrows
+ * the exact chat/review pair, so no second review implementation can drift.
+ */
 export function createFocusedMemoryReviewRegistry(): FocusedMemoryReviewRegistry {
   const controllers = new Map<string, FocusedMemoryReviewController>()
   const listeners = new Set<() => void>()
@@ -62,8 +66,8 @@ export function createFocusedMemoryReviewRegistry(): FocusedMemoryReviewRegistry
         publish()
       }
       return () => {
-
-
+        // A stale React cleanup must not remove a replacement controller that
+        // already registered for the same durable review after remount.
         if (controllers.get(key) !== controller) return
         controllers.delete(key)
         publish()

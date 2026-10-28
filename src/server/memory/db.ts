@@ -1,10 +1,13 @@
-
-
+// SQLite handle for the memory layer, on Bun's built-in `bun:sqlite`
+// (no native dependency, unlike MemoSync's better-sqlite3). Only the two
+// memory tables live here — conversation/session persistence is Kanna's domain
+// (its JSONL event store), so we deliberately do NOT port MemoSync's
+// sessions/messages/repositories tables.
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-
+/** The full memory schema (idempotent — every statement uses IF NOT EXISTS). */
 export const MEMORY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
@@ -122,7 +125,11 @@ CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_memory_events_memory ON memory_events(memory_id, seq);
 `;
 
-
+/**
+ * Apply the schema to an open database (idempotent), migrating pre-upgrade
+ * databases forward: CREATE IF NOT EXISTS covers new tables, and missing
+ * columns on `memories` are added with their defaults.
+ */
 export function applySchema(db: Database): void {
   db.exec(MEMORY_SCHEMA);
   const columns = new Set(
@@ -151,8 +158,11 @@ export function applySchema(db: Database): void {
   if (!dismissalColumns.has('sensitive')) {
     db.exec(`ALTER TABLE dismissed_candidate_fingerprints ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0`);
   }
-
-
+  // Before this column existed, sensitive dismissals were identifiable by a
+  // retained sensitive row, a fingerprint attached to an impossible
+  // non-discarded state, or a hard-erased row that left only its fingerprint.
+  // Preserve that evidence so mutable item/history fields cannot downgrade the
+  // original privacy decision.
   db.exec(`UPDATE dismissed_candidate_fingerprints
               SET sensitive = 1
             WHERE sensitive = 0
@@ -169,7 +179,12 @@ export function applySchema(db: Database): void {
               )`);
 }
 
-
+/**
+ * Open (creating if needed) a memory database at `dbPath`, enable foreign
+ * keys, and apply the schema. DELETE journaling is deliberate: rejected
+ * candidate text must not remain in a WAL when an external reader holds a
+ * snapshot. Pass ':memory:' for an ephemeral DB.
+ */
 export function openMemoryDb(dbPath: string): Database {
   if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
   const db = new Database(dbPath, { create: true });

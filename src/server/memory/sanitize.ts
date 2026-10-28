@@ -1,5 +1,10 @@
-
-
+// Sensitive-candidate anonymization (SPEC §4.2, DG1 "exclude or confirm" —
+// the confirm branch): before accepting a capture candidate flagged
+// sensitive, the user can ask for a redacted version. One DeepSeek pass
+// proposes the same durable knowledge with secrets/credentials/personal data
+// replaced by typed placeholders; the user reviews and edits before it is
+// stored. Failures PROPAGATE — a failed redaction must never be mistaken for
+// a clean one (the caller falls back to manual editing, not to raw text).
 import type { LlmJsonCaller } from './deepseek';
 
 export interface SanitizeInput {
@@ -38,8 +43,11 @@ export function createSanitizeService(opts: { callJson: LlmJsonCaller }): Saniti
 
       const content = typeof raw.content === 'string' ? raw.content.trim() : '';
       if (!content) throw new Error('sanitize: proposal missing content');
-
-
+      // If a detail was submitted for redaction but the model returned none, the
+      // ORIGINAL (still-sensitive) detail would otherwise silently stay in the
+      // stored memory. Fail loudly instead — a missing redaction must never be
+      // mistaken for a clean one (BUG MEMSRV-4; the caller falls back to manual
+      // editing, not to raw text).
       let detail: string | undefined;
       if (input.detail) {
         if (typeof raw.detail !== 'string' || !raw.detail.trim()) {

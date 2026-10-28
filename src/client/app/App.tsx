@@ -52,8 +52,9 @@ function TelemetryBootstrap() {
       stopStudyTelemetryOutbox()
       return
     }
-
-
+    // The monitoring record stays on in normal deployments: start the durable
+    // outbox directly — no onboarding, no participant scoping reset. Events
+    // flow to the never-condition-locked logging routes.
     void initializeStudyTelemetryOutbox({
       condition: policy.condition,
       resetForNewParticipant: false,
@@ -192,7 +193,9 @@ function useAppAuthState() {
     }
   }, [refresh])
 
-
+  // The socket's reconnect probe found the session locked out (rotated
+  // password, evicted cookie): return to the password gate instead of
+  // letting the app cycle "connecting" forever.
   useEffect(() => {
     const handleUnauthorized = () => setState({ status: "locked", error: null })
     window.addEventListener(WS_UNAUTHORIZED_EVENT, handleUnauthorized)
@@ -240,12 +243,12 @@ function AppLayout() {
   const navigate = useNavigate()
   const params = useParams()
   const state = useAppState(params.chatId ?? null)
-
-
+  // "" until the condition policy resolves — the title effects below wait for
+  // it rather than stamping the MemoSync name onto a baseline arm's tab.
   const brandName = useBrandName()
   useBrandFavicon()
-
-
+  // Study completion is stored in this participant instance's study.sqlite,
+  // not browser-local state that a later participant could accidentally reuse.
   const conditionPolicyForGuide = useConditionPolicyResolved()
   const conditionPolicyLoadFailed = useConditionPolicyLoadFailed()
   const [memoryBoardRequest, setMemoryBoardRequest] = useState<ResolvedMemoryBoardLaunchRequest | null>(null)
@@ -418,7 +421,7 @@ function AppLayout() {
     void playChatNotificationSound(chatSoundId, burstCount).catch(() => undefined)
   }, [chatSoundId, chatSoundPreference, state.appSettings, state.sidebarData])
 
-
+  // Memory surfaces fail closed until the server's feature policy resolves.
   if (conditionPolicyForGuide === null) {
     return (
       <div className="flex h-[100dvh] min-h-[100dvh] items-center justify-center bg-background px-6 text-sm text-muted-foreground">

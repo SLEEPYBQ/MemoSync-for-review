@@ -1,5 +1,7 @@
-
-
+// Client mirror of the study-condition policy (GET /api/condition) — gates
+// which memory surfaces the UI shows (Board nav, bring-in panel). Fetched
+// once per page load; defaults to the full memosync policy until the fetch
+// resolves (the policy is static for an instance's lifetime).
 import { useEffect, useState } from "react"
 import type { ConditionPolicy } from "../../server/experiment/condition"
 import { PROVIDERS, type ProviderCatalogEntry } from "../../shared/types"
@@ -23,11 +25,13 @@ let cached: ConditionPolicy | null = null
 let inflight: Promise<ConditionPolicy> | null = null
 let resolvedFromServer = false
 let conditionLoadFailed = false
-
-
+// A study shell can arrive just before its same-origin API is ready (for
+// example during a reverse-proxy/container handoff). Retry that narrow window
+// with a bounded backoff; after 1s the shell still fails closed.
 const CONDITION_LOAD_RETRY_DELAYS_MS = [0, 250, 750] as const
-
-
+// The server's provider catalog rides the same response — in study mode it is
+// pinned to one engine/model/effort, and the launcher (no chat snapshot yet)
+// must honor that pin instead of the static client-side catalog.
 let cachedProviders: ProviderCatalogEntry[] | null = null
 
 function wait(ms: number) {
@@ -75,8 +79,9 @@ export function fetchConditionPolicy(): Promise<ConditionPolicy> {
         return cached
       })
       .catch(() => {
-
-
+        // Legacy hooks retain their previous fallback value, but AppLayout
+        // remains hidden because `resolvedFromServer` is false. This preserves
+        // the fail-closed treatment boundary after the bounded retries end.
         cached = DEFAULT_POLICY
         resolvedFromServer = false
         conditionLoadFailed = true
@@ -86,10 +91,12 @@ export function fetchConditionPolicy(): Promise<ConditionPolicy> {
   return inflight
 }
 
-
+// Claude-only deployment: until the server catalog arrives, fall back to the
+// shared catalog minus Codex so the picker never flashes an engine this build
+// does not ship.
 const FALLBACK_PROVIDERS = PROVIDERS.filter((provider) => provider.id === "claude")
 
-
+/** The server's provider catalog (study pin included); static fallback until it arrives. */
 export function useServerProviders(): ProviderCatalogEntry[] {
   const [providers, setProviders] = useState<ProviderCatalogEntry[]>(cachedProviders ?? FALLBACK_PROVIDERS)
   useEffect(() => {
@@ -118,7 +125,11 @@ export function useConditionPolicy(): ConditionPolicy {
   return policy
 }
 
-
+/**
+ * Like useConditionPolicy, but null until the real policy arrives — for
+ * surfaces that must not fall back to the memosync default while waiting
+ * (the brand mark: a baseline arm must never flash the MemoSync identity).
+ */
 export function useConditionPolicyResolved(): ConditionPolicy | null {
   const [policy, setPolicy] = useState<ConditionPolicy | null>(resolvedFromServer ? cached : null)
   useEffect(() => {
@@ -133,7 +144,8 @@ export function useConditionPolicyResolved(): ConditionPolicy | null {
   return policy
 }
 
-
+/** A failed condition request is an experiment-integrity error, not a signal
+ * to guess a treatment. AppLayout shows a neutral retry screen. */
 export function useConditionPolicyLoadFailed(): boolean {
   const [failed, setFailed] = useState(conditionLoadFailed)
   useEffect(() => {

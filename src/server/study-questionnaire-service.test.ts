@@ -324,7 +324,7 @@ describe('StudyQuestionnaireService', () => {
     expect(registry.freezeState('038-S1')).toBe('frozen');
     expect(events[0]).toMatchObject({ type: 'study.freeze', taskId: '038-S1', snapshotId: 'freeze-1' });
 
-
+    // Loading never re-reads the live object.
     expect(service.get('038-S1')).toEqual(questionnaire);
     store.close();
   });
@@ -463,7 +463,7 @@ describe('StudyQuestionnaireService', () => {
       .toThrow(/exactly once/);
     expect(service.submit({ taskId: '038-S1', snapshotId: 'freeze-exact', answers: [answer], attentionCheck: ATTENTION_RESPONSE }))
       .toMatchObject({ recorded: 1 });
-
+    // Lost HTTP response: the exact retry is idempotent while workload remains pending.
     expect(service.submit({ taskId: '038-S1', snapshotId: 'freeze-exact', answers: [answer], attentionCheck: ATTENTION_RESPONSE }))
       .toMatchObject({ recorded: 1, created: false });
     store.close();

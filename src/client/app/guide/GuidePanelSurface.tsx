@@ -18,7 +18,13 @@ function stopKeyboardActivation(event: KeyboardEvent<HTMLDivElement>) {
   event.stopPropagation()
 }
 
-
+/**
+ * A Guide panel must remain a real scroll surface even when its actions are
+ * only being demonstrated. CSS `pointer-events-none` cannot express that: it
+ * removes the scrollbar's wheel/trackpad hit target together with the
+ * controls. Keep pointer input enabled here and suppress only activation
+ * events in read-only lessons.
+ */
 export function GuidePanelSurface({
   readOnly = false,
   className,

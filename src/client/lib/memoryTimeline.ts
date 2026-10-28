@@ -1,5 +1,11 @@
-
-
+// buildMemoryRecord — fold the chat transcript into the sidebar Memory Record:
+// per turn, the monitoring column of the paper's 2×N table re-presented along
+// time. Six stages mirror the transcript stations one-to-one (Memory
+// Candidates / Suggested Transfers / Saved Memory Changes / Injected Memory
+// Set / Reported Memory Use / Memory Use Audit); a stage row exists exactly
+// when its transcript entry exists, so the record can never claim more than
+// the conversation shows. Pure derivation over already-streamed hydrated
+// messages — no extra fetching, no model calls of its own.
 import type { HydratedTranscriptMessage, MemoryCheckupKind } from "../../shared/types"
 
 export type AuditVerdict = "operational" | "injected_without_effect" | "violated" | "not_applicable"
@@ -8,8 +14,8 @@ export interface RecordCandidatesStage {
   entryId: string
   pending?: boolean
   decision?: "reviewed" | "skipped" | "cancelled" | "expired" | "empty"
-
-
+  /** Content resolves from the memory store at render time (the transcript
+   *  persists candidate ids alone — snapshot content only on old rows). */
   items: Array<{ id: string; content?: string; scope?: string }>
 }
 
@@ -30,12 +36,12 @@ export interface RecordCheckupStage {
 
 export interface RecordInjectedStage {
   entryId: string
-
+  /** Only the ids that actually injected (an EDITED gate narrows the set). */
   items: Array<{ id: string; content: string; scope: string }>
 }
 
 export interface RecordReportedStage {
-
+  /** memoryId → citation count, insertion-ordered by first mention. */
   counts: Map<string, number>
 }
 
@@ -47,9 +53,9 @@ export interface RecordAuditStage {
 
 export interface MemoryRecordTurn {
   turn: number
-
+  /** The audit pass's one-sentence recap — lands only after the turn settles. */
   summary?: string
-
+  /** The injection gate's outcome, when one was recorded. */
   decision?: "go_on" | "dismiss" | "without_memory" | "expired"
   candidates?: RecordCandidatesStage
   transfers?: RecordTransfersStage
@@ -57,19 +63,19 @@ export interface MemoryRecordTurn {
   injected?: RecordInjectedStage
   reported?: RecordReportedStage
   audit?: RecordAuditStage
-
+  /** Per-memory interrupt (2026-08-19 C3): the participant stopped this turn over one memory. */
   interrupted?: { memoryId: string }
 }
 
 export interface MemoryRecord {
-
+  /** Ascending by turn; only turns with memory activity appear. */
   turns: MemoryRecordTurn[]
 }
 
 const CITATION_RE = /\[(M-\d+)\]/g
 
 export function turnPulse(turn: MemoryRecordTurn): "violated" | "shaped" | "quiet" {
-
+  // A participant interrupt IS a human violated verdict (2026-08-19 C3).
   if (turn.interrupted) return "violated"
   let shaped = false
   for (const label of turn.audit?.labels ?? []) {
@@ -79,7 +85,7 @@ export function turnPulse(turn: MemoryRecordTurn): "violated" | "shaped" | "quie
   return shaped ? "shaped" : "quiet"
 }
 
-
+/** Distinct memory ids represented by the injected/audit monitoring rows. */
 export function memoryRecordMonitorIds(record: MemoryRecord): string[] {
   const ids = new Set<string>()
   for (const turn of record.turns) {
@@ -94,8 +100,8 @@ export function buildMemoryRecord(
   liveStreamingText: string | null = null,
 ): MemoryRecord {
   const turnsByNumber = new Map<number, MemoryRecordTurn>()
-
-
+  // Assistant text carries no turn number; attribute citations to the latest
+  // turn any memory entry has named so far (the entries bracket the reply).
   let currentTurn: number | null = null
 
   const turnOf = (turn: number): MemoryRecordTurn => {
@@ -167,8 +173,8 @@ export function buildMemoryRecord(
         if (message.turn === undefined) break
         const t = turnOf(message.turn)
         t.decision = message.decision
-
-
+        // Dismissed / without-memory / expired gates injected nothing; an
+        // EDITED go_on narrows to the selected subset.
         const selected = message.decisionSelectedIds ? new Set(message.decisionSelectedIds) : null
         const injected = message.decision === "go_on"
           ? message.memories.filter((m) => (selected ? selected.has(m.id) : true))

@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useState } from "react"
 import { isUiMonitorSuppressed } from "../../lib/memoriesApi"
+import { generateUUID } from "../../lib/utils"
 import { enqueueStudyTelemetry, type StudyTelemetryOutboxRequest } from "./studyTelemetry"
 
 export type StudySurfaceExposure =
-  | "auto_summary_sidebar"
-  | "static_memory_sidebar"
   | "memory_board"
   | "memory_record"
   | "audit_card"
@@ -70,7 +69,8 @@ export function observeSurfaceIntersection({
   return () => observer.disconnect()
 }
 
-
+/** Viewport seam for virtualized audit rows. Without IntersectionObserver the
+ * hook fails closed, so a buffered/offscreen mount never becomes exposure. */
 export function useSurfaceViewportVisibility<T extends Element>(): {
   ref: (element: T | null) => void
   visible: boolean
@@ -103,13 +103,18 @@ export function useSurfaceViewportVisibility<T extends Element>(): {
   return { ref, ...visibility }
 }
 
-
+/**
+ * One client-observed visibility interval. Callers name only the mounted
+ * surface and its authoritative chat. This module owns stable identity,
+ * ordered transitions, visibility pauses, page teardown and durable outbox
+ * delivery. Polling, scrolling and render updates never cross this seam.
+ */
 export function createSurfaceExposure({
   surface,
   chatId,
   initiator,
   memoryIds = [],
-  randomId = () => crypto.randomUUID(),
+  randomId = generateUUID,
   now = Date.now,
   visibilityTarget = typeof document === "undefined" ? null : document,
   pageTarget = typeof window === "undefined" ? null : window,
@@ -182,13 +187,13 @@ export function createSurfaceExposure({
     open() {
       if (state !== "idle" || suppressed() || !chatId.trim()) return
       state = "visible"
-
-
+      // enqueueStudyTelemetry persists into localStorage synchronously before
+      // its first network await, so opened survives an immediate reload.
       const openedAt = emit("opened")
       if (visibilityTarget && visibilityTarget.visibilityState !== "visible") {
         state = "hidden"
-
-
+        // The surface mounted while the document was already hidden. Preserve
+        // the same clock sample so export observes exactly 0 ms of visibility.
         emit("hidden", undefined, openedAt)
       }
       visibilityTarget?.addEventListener("visibilitychange", onVisibilityChange)

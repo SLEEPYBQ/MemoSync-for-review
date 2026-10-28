@@ -26,7 +26,11 @@ function parseProgress(value: unknown): StudyRouteProgress | null {
   return progress as StudyRouteProgress
 }
 
-
+/**
+ * Fail-closed route owner for the study's irreversible post-session phase.
+ * It sits above AppLayout so neither chat nor memory UI mounts while a Back
+ * or SPA navigation is being checked against durable study progress.
+ */
 export function StudyRouteBoundary({
   enabled,
   children,
@@ -45,8 +49,9 @@ export function StudyRouteBoundary({
   useEffect(() => {
     if (!enabled) return
     const pathname = location.pathname
-
-
+    // The Guide is a pre-session prerequisite. The server intentionally keeps
+    // /api/study/progress closed until its receipt has been recorded, so this
+    // boundary must not request progress while the Guide is the active route.
     if (isStudyPreSessionPath(pathname)) return
     const controller = new AbortController()
 

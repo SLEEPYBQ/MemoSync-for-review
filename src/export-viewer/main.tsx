@@ -12,7 +12,9 @@ import { APP_NAME } from "../shared/branding"
 import type { AskUserQuestionAnswerMap, StandaloneTranscriptBundle } from "../shared/types"
 import "../index.css"
 
-
+// The viewer renders whatever theme the bundle RECORDED at export time (an
+// exported page is a frozen artifact; the app itself is light-locked, so new
+// bundles always record light — this branch keeps old dark exports readable).
 function syncThemeMetadata(theme: "light" | "dark") {
   const backgroundColor =
     getComputedStyle(document.body).backgroundColor || getComputedStyle(document.documentElement).backgroundColor
@@ -41,18 +43,18 @@ function StandaloneTranscriptApp() {
   useEffect(() => {
     let cancelled = false
 
-    void fetch(new URL("./transcript.json", document.baseURI).toString(), {
-      headers: {
-        Accept: "application/json",
-      },
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          throw new Error(`Transcript request failed with status ${response.status}`)
-        }
+    async function loadBundle(): Promise<StandaloneTranscriptBundle> {
+      const embedded = document.getElementById("memosync-transcript-data")
+      if (embedded) return JSON.parse(embedded.textContent ?? "") as StandaloneTranscriptBundle
 
-        return await response.json() as StandaloneTranscriptBundle
+      const response = await fetch(new URL("./transcript.json", document.baseURI).toString(), {
+        headers: { Accept: "application/json" },
       })
+      if (!response.ok) throw new Error(`Transcript request failed with status ${response.status}`)
+      return await response.json() as StandaloneTranscriptBundle
+    }
+
+    void loadBundle()
       .then((bundle) => {
         if (cancelled) return
         setState({ status: "ready", bundle })
@@ -136,6 +138,7 @@ function StandaloneTranscriptApp() {
         readonly: true,
         localLinkMode: "text",
         attachmentMode: state.bundle.attachmentMode,
+        textAttachmentPreviews: state.bundle.textAttachmentPreviews,
       }}
     >
       <div className="h-full bg-background">

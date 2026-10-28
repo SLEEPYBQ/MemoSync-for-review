@@ -41,7 +41,7 @@ describe('createSanitizeService', () => {
   });
 
   it('rejects a malformed proposal instead of passing raw text through', async () => {
-    const { call } = stubCaller({ redactions: [] });
+    const { call } = stubCaller({ redactions: [] }); // no content — invalid
     const sanitize = createSanitizeService({ callJson: call });
     await expect(sanitize.propose(SENSITIVE)).rejects.toThrow(/sanitize/i);
   });

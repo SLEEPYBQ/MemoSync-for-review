@@ -262,8 +262,11 @@ function buildCustomEditorCommand(args: {
 
   const line = String(args.line ?? 1)
   const column = String(args.column ?? 1)
-
-
+  // Tokenize the TEMPLATE first, then substitute into each token. Substituting
+  // before tokenizing split a path containing spaces (e.g. "~/My Project/f.ts")
+  // across multiple argv entries, so the editor opened the wrong file or
+  // nothing at all — with no error surfaced (BUG HTTP-3). Now {path} is always
+  // exactly one argument, whether or not the user quoted it in the template.
   const tokens = tokenizeCommandTemplate(template).map((token) =>
     token
       .replaceAll("{path}", args.localPath)

@@ -6,7 +6,7 @@ import { MemoryFile } from './MemoryFile';
 import { MemoryStore } from './MemoryStore';
 import type { MemoryItem } from './types';
 
-
+/** Build a full MemoryItem from a partial (test convenience). */
 function mem(p: Partial<MemoryItem> & Pick<MemoryItem, 'id' | 'content'>): MemoryItem {
   return {
     scope: 'personal',

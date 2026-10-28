@@ -1,5 +1,8 @@
-
-
+// Memory files (DG5): the Markdown projections are the developer-native view
+// of the memory store — one file per scope (personal + each project), shared
+// by every session of that project. The files are a generated EXPORT of the
+// store, read-only: memories are edited in the app, never through the files.
+// Import feeds an external CLAUDE.md / .cursorrules through the candidate lane.
 import { useCallback, useEffect, useMemo, useState } from "react"
 import Markdown from "react-markdown"
 import { FileText, FolderInput, Loader2 } from "lucide-react"
@@ -23,7 +26,8 @@ function targetKey(t: FileTarget | FileEntry): string {
   return t.scope === "project" ? `project:${t.projectId}` : "personal"
 }
 
-
+/** The projection's bookkeeping comments (hash/updated/pending marker) are
+ * internal — the rendered view hides them. */
 function stripProjectionComments(text: string): string {
   return text
     .split("\n")
@@ -113,7 +117,8 @@ export function MarkdownSyncCard({ onSynced }: { onSynced?: (newCandidateIds?: s
         <span className="text-[11px] text-muted-foreground">generated export — edit memories in the app</span>
       </div>
 
-
+      {/* One file per scope: Personal plus every project — all sessions of a
+          project share that project's file. */}
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
         {files.map((f) => {
           const key = targetKey(f)

@@ -1,4 +1,4 @@
-
+/** Live transport check. Supply GLM_API_KEY in the environment; never pass a key on argv. */
 import { query } from "@anthropic-ai/claude-agent-sdk"
 import { randomUUID } from "node:crypto"
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"

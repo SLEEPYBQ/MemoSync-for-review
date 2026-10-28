@@ -28,7 +28,7 @@ async function removeTempRoot(root: string): Promise<void> {
   try {
     await makeWritable(root)
   } catch {
-
+    // A failed snapshot can remove its temporary tree before cleanup runs.
   }
   await rm(root, { recursive: true, force: true })
 }

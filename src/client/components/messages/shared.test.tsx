@@ -53,11 +53,11 @@ describe("markdownComponents", () => {
         remarkPlugins={[remarkGfm]}
         components={createMarkdownComponents({ onOpenLocalLink: () => {} })}
       >
-        {"[app.ts](/Users/reviewer/Projects/example/src/client/app/App.tsx#L1)"}
+        {"[app.ts](/Users/user/Projects/sample-app/src/client/app/App.tsx#L1)"}
       </Markdown>
     )
 
-    expect(html).toContain("/Users/reviewer/Projects/example/src/client/app/App.tsx#L1")
+    expect(html).toContain("/Users/user/Projects/sample-app/src/client/app/App.tsx#L1")
     expect(html).not.toContain('target="_blank"')
   })
 
@@ -68,12 +68,12 @@ describe("markdownComponents", () => {
           remarkPlugins={[remarkGfm]}
           components={createMarkdownComponents()}
         >
-          {"[app.ts](/Users/reviewer/Projects/example/src/client/app/App.tsx#L1)"}
+          {"[app.ts](/Users/user/Projects/sample-app/src/client/app/App.tsx#L1)"}
         </Markdown>
       </OpenLocalLinkProvider>
     )
 
-    expect(html).toContain("/Users/reviewer/Projects/example/src/client/app/App.tsx#L1")
+    expect(html).toContain("/Users/user/Projects/sample-app/src/client/app/App.tsx#L1")
     expect(html).not.toContain('target="_blank"')
   })
 

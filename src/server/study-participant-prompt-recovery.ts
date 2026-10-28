@@ -24,7 +24,11 @@ export interface StudyParticipantPromptReconciliation {
   skipped: number
 }
 
-
+/**
+ * Rebuild durable prompt evidence from the transcript write that precedes it.
+ * The reconciler never guesses a task from receive time: the original entry
+ * timestamp, serial task window, chat lineage and assigned project must agree.
+ */
 export function createStudyParticipantPromptReconciler(input: {
   transcript: ParticipantPromptTranscript
   registry: StudyRegistry

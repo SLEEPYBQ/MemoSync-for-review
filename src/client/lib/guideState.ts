@@ -1,5 +1,9 @@
-
-
+/**
+ * First-visit guide state. The guide auto-opens once per browser in study
+ * deployments (participants read it before their first task) and is always
+ * reachable again from the sidebar. Dismissal is local to the browser —
+ * a participant on a fresh machine sees it again, which is what we want.
+ */
 const GUIDE_SEEN_STORAGE_KEY = "memosync:guide-seen"
 
 export interface StudyGuideStatus {
@@ -42,17 +46,20 @@ export function markGuideSeen(storage: Pick<Storage, "setItem"> = window.localSt
   try {
     storage.setItem(GUIDE_SEEN_STORAGE_KEY, "1")
   } catch {
-
+    // Private-mode storage failures just mean the guide may show again.
   }
 }
 
-
+/**
+ * Auto-open only in study deployments: developers running the full UI should
+ * not be yanked to the guide on every fresh profile.
+ */
 export function shouldAutoShowGuide(policy: { studyMode: boolean } | null, seen: boolean): boolean {
   if (!policy) return false
   return policy.studyMode && !seen
 }
 
-
+/** Study rules are part of informed task training and cannot be skipped. */
 export function canSkipGuide(policy: { studyMode: boolean }): boolean {
   return !policy.studyMode
 }

@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises"
+import { appendFile, mkdir, readFile, readdir, rename, rm, truncate, writeFile } from "node:fs/promises"
 import { existsSync, readFileSync as readFileSyncImmediate } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
@@ -38,6 +38,40 @@ function normalizeSidebarProjectOrder(value: unknown) {
   }
 
   return projectIds
+}
+
+function parseTranscriptText(text: string, chatId: string): ParsedTranscript {
+  const entries: TranscriptEntry[] = []
+  let lineStart = 0
+  let recoverableTailOffset: number | null = null
+
+  while (lineStart < text.length) {
+    const newlineAt = text.indexOf("\n", lineStart)
+    const lineIsTerminated = newlineAt !== -1
+    const lineEnd = lineIsTerminated ? newlineAt : text.length
+    const line = text.slice(lineStart, lineEnd).trim()
+    if (line) {
+      try {
+        entries.push(JSON.parse(line) as TranscriptEntry)
+      } catch (error) {
+        if (!lineIsTerminated && lineEnd === text.length) {
+          recoverableTailOffset = Buffer.byteLength(text.slice(0, lineStart), "utf8")
+          console.warn(`${LOG_PREFIX} dropped corrupt trailing line in transcript ${chatId}.jsonl`)
+          break
+        }
+        throw error
+      }
+    }
+    if (!lineIsTerminated) break
+    lineStart = newlineAt + 1
+  }
+
+  return { entries, recoverableTailOffset }
+}
+
+interface ParsedTranscript {
+  entries: TranscriptEntry[]
+  recoverableTailOffset: number | null
 }
 
 function isSendToStartingProfilingEnabled() {
@@ -170,7 +204,7 @@ function isValidQueuedChatMessage(value: unknown): value is QueuedChatMessage {
     && isString(value.content)
     && Array.isArray(value.attachments)
     && isFiniteNumber(value.createdAt)
-    && (value.provider === undefined || value.provider === "claude" || value.provider === "codex")
+    && (value.provider === undefined || value.provider === "claude" || value.provider === "codex" || value.provider === "pi")
     && (value.model === undefined || isString(value.model))
     && (value.planMode === undefined || typeof value.planMode === "boolean")
 }
@@ -203,7 +237,7 @@ function isValidStoreEvent(event: unknown): event is StoreEvent {
     case "turn_cancelled":
       return hasChatId()
     case "chat_provider_set":
-      return hasChatId() && (event.provider === "claude" || event.provider === "codex")
+      return hasChatId() && (event.provider === "claude" || event.provider === "codex" || event.provider === "pi")
     case "chat_plan_mode_set":
       return hasChatId() && typeof event.planMode === "boolean"
     case "chat_read_state_set":
@@ -297,6 +331,7 @@ export class EventStore {
   private readonly turnsLogPath: string
   private readonly transcriptsDir: string
   private readonly sidebarProjectOrderPath: string
+  private readonly transcriptPreparedForAppend = new Set<string>()
   private legacyMessagesByChatId = new Map<string, TranscriptEntry[]>()
   private legacySidebarProjectOrder: string[] = []
   private sidebarProjectOrder: string[] = []
@@ -711,8 +746,9 @@ export class EventStore {
       }
       case "queued_message_enqueued": {
         const existing = this.state.queuedMessagesByChatId.get(event.chatId) ?? []
-
-
+        // Idempotent by id: compact() writes the snapshot before it truncates
+        // the logs, so a crash in that window replays an already-snapshotted
+        // enqueue and would otherwise push a duplicate queued message (BUG WS-4).
         if (!existing.some((entry) => entry.id === event.message.id)) {
           existing.push({
             ...event.message,
@@ -796,7 +832,17 @@ export class EventStore {
     chat.updatedAt = Math.max(chat.updatedAt, entry.createdAt)
   }
 
-
+  /**
+   * Serialize a write task on the single write chain. The chain itself NEVER
+   * stays rejected: each task runs after the previous one SETTLES (success or
+   * failure), and a task's own error propagates only to that task's caller.
+   *
+   * Previously every write did `writeChain = writeChain.then(task)` with no
+   * rejection handler — so one failed appendFile (disk full, permissions, a
+   * flaky storage volume) permanently poisoned the chain: every later write's
+   * `.then` callback silently never ran, neither writing to disk nor updating
+   * the in-memory state, until the process restarted (BUG WS-1).
+   */
   private enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
     const result = this.writeChain.then(task, task)
     this.writeChain = result.then(() => {}, () => {})
@@ -823,25 +869,30 @@ export class EventStore {
 
     const text = readFileSyncImmediate(transcriptPath, "utf8")
     if (!text.trim()) return []
+    return parseTranscriptText(text, chatId).entries
+  }
 
-
-    const entries: TranscriptEntry[] = []
-    const lines = text.split("\n")
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]!.trim()
-      if (!line) continue
-      try {
-        entries.push(JSON.parse(line) as TranscriptEntry)
-      } catch (error) {
-        const isLastContentfulLine = lines.slice(i + 1).every((rest) => rest.trim() === "")
-        if (isLastContentfulLine) {
-          console.warn(`${LOG_PREFIX} dropped corrupt trailing line in transcript ${chatId}.jsonl`)
-          break
-        }
-        throw error
+  private async prepareTranscriptForAppend(chatId: string, transcriptPath: string) {
+    if (this.transcriptPreparedForAppend.has(transcriptPath)) return
+    let bytes: Buffer
+    try {
+      bytes = await readFile(transcriptPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.transcriptPreparedForAppend.add(transcriptPath)
+        return
       }
+      throw error
     }
-    return entries
+
+    const text = bytes.toString("utf8")
+    const parsed = parseTranscriptText(text, chatId)
+    if (parsed.recoverableTailOffset !== null) {
+      await truncate(transcriptPath, parsed.recoverableTailOffset)
+    } else if (text.length > 0 && !text.endsWith("\n")) {
+      await appendFile(transcriptPath, "\n", "utf8")
+    }
+    this.transcriptPreparedForAppend.add(transcriptPath)
   }
 
   async openProject(localPath: string, title?: string) {
@@ -970,8 +1021,8 @@ export class EventStore {
       const payload = sourceEntries.map((entry) => JSON.stringify(entry)).join("\n")
       await this.enqueueWrite(async () => {
         await mkdir(this.transcriptsDir, { recursive: true })
-
-
+        // Atomic write (tmp + rename) so a fork interrupted mid-write can never
+        // leave a half-written transcript that later fails to load (BUG WS-2).
         const tmpPath = `${transcriptPath}.tmp`
         await writeFile(tmpPath, `${payload}\n`, "utf8")
         await rename(tmpPath, transcriptPath)
@@ -1129,14 +1180,21 @@ export class EventStore {
     const transcriptPath = this.transcriptPath(chatId)
     const queuedAt = performance.now()
     return this.enqueueWrite(async () => {
-
-
+      // Some memory-review entries are snapshots of mutable Memory state. Let
+      // their caller revalidate at the actual serialized write boundary, after
+      // all older transcript work has drained but before anything is durable.
       if (options?.shouldAppend && !options.shouldAppend()) return false
       const startedAt = performance.now()
       const queueDelayMs = Number((startedAt - queuedAt).toFixed(1))
       await mkdir(this.transcriptsDir, { recursive: true })
+      await this.prepareTranscriptForAppend(chatId, transcriptPath)
       const beforeAppendAt = performance.now()
-      await appendFile(transcriptPath, payload, "utf8")
+      try {
+        await appendFile(transcriptPath, payload, "utf8")
+      } catch (error) {
+        this.transcriptPreparedForAppend.delete(transcriptPath)
+        throw error
+      }
       const afterAppendAt = performance.now()
       this.applyMessageMetadata(chatId, entry)
       if (this.cachedTranscript?.chatId === chatId) {
@@ -1331,7 +1389,7 @@ export class EventStore {
     return this.getQueuedMessages(chatId).find((entry) => entry.id === queuedMessageId) ?? null
   }
 
-
+  /** Chat ids that have at least one persisted queued message (order not significant). */
   getChatIdsWithQueuedMessages(): string[] {
     const ids: string[] = []
     for (const [chatId, entries] of this.state.queuedMessagesByChatId) {
@@ -1387,12 +1445,15 @@ export class EventStore {
     return [...this.state.projectsById.values()].filter((project) => !project.deletedAt)
   }
 
-
+  /** Every non-deleted chat (archived included — their titles still label things). */
   listChats() {
     return [...this.state.chatsById.values()].filter((chat) => !chat.deletedAt)
   }
 
-
+  /**
+   * Durable study evidence authority. Deleted chats stay hidden from every UI
+   * query, but their transcript lineage remains available for crash recovery.
+   */
   listStudyTranscriptChats() {
     return [...this.state.chatsById.values()]
   }
@@ -1439,8 +1500,9 @@ export class EventStore {
       v: STORE_VERSION,
       generatedAt: Date.now(),
       projects: this.listProjects().map((project) => ({ ...project })),
-
-
+      // A deleted chat can still contain a participant prompt whose transcript
+      // append committed immediately before telemetry failed. Preserve the
+      // tombstoned lineage across compaction for deterministic study repair.
       chats: [...this.state.chatsById.values()].map((chat) => ({ ...chat })),
       queuedMessages: [...this.state.queuedMessagesByChatId.entries()]
         .map(([chatId, entries]) => ({
@@ -1455,8 +1517,9 @@ export class EventStore {
 
   async compact() {
     return this.enqueueWrite(async () => {
-
-
+      // Snapshot creation and log truncation must observe the same point in
+      // the serialized write stream. Otherwise a concurrent append can land
+      // after createSnapshot() but before truncation and disappear on restart.
       const snapshot = this.createSnapshot()
       const payload = `${JSON.stringify(snapshot, null, 2)}\n`
       await this.writeSnapshotAtomically(this.snapshotPath, payload)

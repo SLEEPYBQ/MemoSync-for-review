@@ -1,5 +1,7 @@
-
-
+// Session-start Memory Board gate (2026-08-19 E1) + the reusable in-chat
+// overlay. The study gate is deliberately fail-closed: a MemoSync chat stays
+// covered while lifecycle/Board state is checked, and request failures expose
+// only a retry surface, never the underlying live memory or chat controls.
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useLocation, useNavigate } from "react-router-dom"
 import { Loader2 } from "lucide-react"
@@ -24,6 +26,7 @@ import {
   type FocusedMemoryReviewController,
 } from "./MemoryBoardLauncher"
 import { useSurfaceExposure } from "./surfaceExposure"
+import { generateUUID } from "../../lib/utils"
 
 export interface StudyBoardProgress {
   activeTaskId: string | null
@@ -69,7 +72,7 @@ export interface StudyBoardRequestSequence {
   isCurrent(request: number): boolean
 }
 
-
+/** Latest-request-wins guard for route/focus checks that can resolve out of order. */
 export function createStudyBoardRequestSequence(): StudyBoardRequestSequence {
   let latest = 0
   return {
@@ -113,7 +116,10 @@ export interface OpeningPreparationClaims {
   retry(identity: object): void
 }
 
-
+/**
+ * One held object owns one stable review id and one prepare attempt. React
+ * renders cannot retry it; only an explicit participant retry re-arms it.
+ */
 export function createOpeningPreparationClaims(): OpeningPreparationClaims {
   const claims = new WeakMap<object, { reviewId: string; attempted: boolean }>()
   return {
@@ -126,7 +132,7 @@ export function createOpeningPreparationClaims(): OpeningPreparationClaims {
         }
         claims.set(identity, claim)
       } else if (preferredReviewId && claim.reviewId !== preferredReviewId) {
-
+        // A durable server receipt is authoritative after reconciliation.
         claim.reviewId = preferredReviewId
       }
       if (claim.attempted) return { claimed: false, reviewId: claim.reviewId }
@@ -148,7 +154,10 @@ export type OpeningBoardCompletionResolution =
   | { admitted: true; status: MemoryBoardReviewStatus; error: null }
   | { admitted: false; status: MemoryBoardReviewStatus; error: unknown }
 
-
+/**
+ * A completed POST can lose its response. Read the durable receipt before
+ * surfacing failure so the participant never gets a dead Continue button.
+ */
 export async function completeOpeningBoardReviewWithReconciliation(input: {
   complete: () => Promise<MemoryBoardReviewStatus>
   read: () => Promise<MemoryBoardReviewStatus>
@@ -166,7 +175,11 @@ export async function completeOpeningBoardReviewWithReconciliation(input: {
     : { admitted: false, status, error: completionError }
 }
 
-
+/**
+ * Transfer a durable opening receipt into exactly one client owner. A local
+ * hold resolves without dispatch; after reload the composer consumes the
+ * server-owned receipt by hash.
+ */
 export function consumeOpeningPromptOwnership(
   status: MemoryBoardReviewStatus,
   held: HeldStudyPrompt | null,
@@ -182,7 +195,11 @@ export function consumeOpeningPromptOwnership(
   markStudyPromptServerOwned(ownership.chatId, ownership.reviewId, ownership.promptHash)
 }
 
-
+/**
+ * One admission seam shared by the mounted gate and its tests. It deliberately
+ * short-circuits before even reading study progress on non-chat surfaces, and
+ * short-circuits before Board state once freezing/post-session has started.
+ */
 export async function loadStudyBoardGate(
   route: { pathname: string; condition: string | null; studyMode: boolean },
   dependencies: {
@@ -287,7 +304,7 @@ export function MemoryBoardOverlay({
   onEnterSession,
   onBacklogChanged,
 }: {
-
+  /** Guide-only containment: fill the mounted demo pane instead of the viewport. */
   embedded?: boolean
   blocking: boolean
   taskId?: string
@@ -295,9 +312,9 @@ export function MemoryBoardOverlay({
   status?: MemoryBoardReviewStatus
   actionError?: string | null
   submitting?: boolean
-
+  /** Opening flow only: the participant's message waiting behind this review. */
   pendingPrompt?: string
-
+  /** Manual flow only: the active in-chat Long-term review to expand. */
   focusedReview?: FocusedMemoryReviewController
   onClose?: () => void
   onEnterSession?: () => void
@@ -332,8 +349,8 @@ export function MemoryBoardOverlay({
       />
     </div>
   )
-
-
+  // Guide containment stays inside its demo pane. Production uses Radix so
+  // focus is trapped and the blurred chat/composer is actually inert.
   if (embedded) return (
     <div
       className="absolute inset-0 z-50 flex items-center justify-center bg-background/60 p-4 backdrop-blur-md md:p-8"
@@ -382,7 +399,10 @@ type ManualBoardState =
   | { kind: "error"; message: string }
   | { kind: "ready"; taskId: string; chatId: string; status: MemoryBoardReviewStatus }
 
-
+/**
+ * The approved E3 mid-session view: same data/status as the opening Board,
+ * but always closable. Non-study MemoSync keeps the ordinary Board behavior.
+ */
 export function ManualMemoryBoardOverlay({
   chatId,
   focusedReview,
@@ -470,7 +490,18 @@ export function ManualMemoryBoardOverlay({
   )
 }
 
-
+/**
+ * Mounted inside StudyRouteBoundary. Only an exact /chat/:id route can ask
+ * for Board data; guide, study brief, questionnaire, freezing, frozen, and
+ * post-session routes never issue a Board request or mount live memory.
+ *
+ * 2026-08-19 evening revision (E1): the gate no longer takes over the route.
+ * The chat renders immediately; the Board state loads in the background. Only
+ * when the participant SENDS the first prompt of an unreviewed task does the
+ * gate capture that prompt and open the Board modal over a blurred backdrop —
+ * completing the review dispatches the held prompt automatically. The
+ * server-side studyPromptGate remains the admission authority.
+ */
 export function StudyBoardGate() {
   const policy = useConditionPolicy()
   const location = useLocation()
@@ -553,7 +584,9 @@ export function StudyBoardGate() {
     }
   }, [check, eligibleRoute])
 
-
+  // The composer asks this seam before dispatching. Fail-closed: while the
+  // background check is unsettled (or errored), the prompt is captured and the
+  // modal shows progress/retry instead of racing the review receipt.
   useEffect(() => {
     if (!eligibleRoute) return
     setStudyPromptInterceptor((submission) => {
@@ -580,14 +613,15 @@ export function StudyBoardGate() {
     }
   }, [check, eligibleRoute, routeKey])
 
-
+  // A route change abandons the captured prompt — it belonged to the chat the
+  // participant left, and replaying it elsewhere would misattribute the send.
   useEffect(() => {
     heldRef.current?.abandon()
     heldRef.current = null
     setHeld(null)
   }, [routeKey])
 
-
+  // Review was explicitly admitted while a prompt is held: let it go once.
   useEffect(() => {
     if (!held) return
     if (state.routeKey === routeKey && state.kind === "admitted") {
@@ -598,7 +632,10 @@ export function StudyBoardGate() {
     }
   }, [held, routeKey, state])
 
-
+  // Once every pre-existing durable row is settled, bind and dispatch the
+  // exact held prompt behind the same Board. The composer promise deliberately
+  // remains pending: Candidate → Transfer → Checkup and final Continue still
+  // own the participant-visible boundary.
   useEffect(() => {
     if (!held || state.kind !== "review_required") return
     if (state.status.pending.total > 0 && !state.status.openingPrompt) return
@@ -608,7 +645,7 @@ export function StudyBoardGate() {
     const preparationClaim = preparationClaims.claim(
       held,
       existing?.reviewId,
-      () => crypto.randomUUID(),
+      generateUUID,
     )
     if (!preparationClaim.claimed) return
     const reviewId = preparationClaim.reviewId
@@ -636,8 +673,9 @@ export function StudyBoardGate() {
         if (status.openingPrompt?.phase === "dispatch_pending") {
           await held.prepare(reviewId)
         } else if (status.openingPrompt) {
-
-
+          // `/prepare` eagerly starts the server-owned exact dispatch. If its
+          // response has already advanced, ChatInput must not send the same
+          // prompt again without the opening review id on final Continue.
           held.markExternallyPrepared(reviewId)
         }
         if (cancelled || heldRef.current !== held) return
@@ -665,8 +703,8 @@ export function StudyBoardGate() {
             return
           }
         } catch {
-
-
+          // The original prepare error is the actionable participant-facing
+          // failure; a failed reconciliation must not start another attempt.
         }
         if (cancelled || heldRef.current !== held) return
         setState({ routeKey, kind: "error", message })
@@ -676,7 +714,9 @@ export function StudyBoardGate() {
     return () => { cancelled = true }
   }, [held, state])
 
-
+  // Long-term preparation finishes asynchronously in AgentCoordinator. Poll
+  // only while this exact blocking Board owns the route; manual Boards keep
+  // their existing event-driven refresh behavior.
   useEffect(() => {
     if (state.kind !== "review_required" || !state.status.openingPrompt) return
     if (state.status.openingPrompt.phase === "completed") return
@@ -706,7 +746,10 @@ export function StudyBoardGate() {
     state.kind === "review_required" ? state.status.openingPrompt?.promptHash : null,
   ])
 
-
+  // Browser reload loses the local HeldStudyPrompt but not the server-owned
+  // exact payload. Ask the server to re-prime that same review id; this never
+  // reconstructs participant text in the client and is idempotent with the
+  // prepare route's eager dispatch.
   useEffect(() => {
     if (held || state.kind !== "review_required") return
     const openingPrompt = state.status.openingPrompt
@@ -787,7 +830,9 @@ export function StudyBoardGate() {
     }
   }, [state])
 
-
+  // Nothing renders until a prompt is actually captured: entering the chat,
+  // reading, and typing are all free. The modal exists only between "send"
+  // and "review complete".
   const durableOpeningReview = state.kind === "review_required"
     && state.status.openingPrompt !== undefined
     && state.status.openingPrompt.phase !== "completed"

@@ -40,14 +40,16 @@ describe("matchSlashCommands", () => {
   })
 })
 
-
+// The popup opens UPWARD (bottom-anchored above the composer). When the
+// composer sits high in the viewport — the centered landing page — a fixed
+// max height overflows the viewport top and gets clipped.
 describe("slashPopupMaxHeightPx", () => {
   test("keeps the full height when the composer is low in the viewport (chat dock)", () => {
     expect(slashPopupMaxHeightPx(800)).toBe(288)
   })
 
   test("shrinks to the space above the composer when it would clip", () => {
-
+    // anchor top 200 − 8px gap − 12px viewport margin = 180
     expect(slashPopupMaxHeightPx(200)).toBe(180)
   })
 

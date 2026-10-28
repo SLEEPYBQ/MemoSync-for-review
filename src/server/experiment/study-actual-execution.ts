@@ -21,7 +21,7 @@ export interface ActualExecutionTaskCheck {
 
 export interface ActualExecutionTaskContext {
   brief: string[]
-
+  /** Official task checks are context, never a per-memory verdict shortcut. */
   officialChecks: ActualExecutionTaskCheck[]
 }
 
@@ -85,7 +85,7 @@ export interface ActualExecutionJudgeInput {
   }
   task: ActualExecutionTaskContext
   workspace: StudyWorkspaceSnapshotMetadata
-
+  /** Verified frozen tree. The judge must never inspect the participant's live workspace. */
   workspaceRoot: string
 }
 
@@ -339,7 +339,11 @@ async function readExistingArtifact(input: {
   return { artifact, body }
 }
 
-
+/**
+ * Evaluate each canonical Desired Memory against its verified frozen workspace.
+ * The returned document is the only evaluator output consumed by study:export;
+ * detailed reasoning remains in immutable per-probe artifacts referenced by it.
+ */
 export async function evaluateStudyActualExecution(
   input: EvaluateStudyActualExecutionInput,
 ): Promise<JsonActualExecutionEvidenceDocument> {

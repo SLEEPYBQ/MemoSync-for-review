@@ -1,13 +1,20 @@
-
-
+// MemoSync brand icon (user's Figma: "Layered Transfer Icon Recreation").
+// Three full layered cards in the three memory-scope colors — green session,
+// blue project, orange personal — each with an inset white keyline, and a
+// white cross-context transfer glyph on the top card.
+// Motion mirrors the Figma prototype's Folded ↔ Expanded card spread:
+// `spread` (or hover with animated="hover") fans the cards out.
+// Geometry is lifted verbatim from the Figma vector master (node 22:2).
 import { cn } from "../lib/utils"
 
 interface MemoSyncIconProps {
   className?: string
-
-
+  /**
+   * "hover" = fan out on hover; "loop" = slow ambient breathe (empty states);
+   * "none" = static (still spreads when `spread` is set).
+   */
   animated?: "hover" | "loop" | "none"
-
+  /** Controlled expanded state (e.g. cycle it, or bind to an open/close toggle). */
   spread?: boolean
 }
 

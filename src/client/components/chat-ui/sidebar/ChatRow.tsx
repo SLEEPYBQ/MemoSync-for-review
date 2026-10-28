@@ -13,7 +13,7 @@ const loadingStatuses = new Set(["starting", "previewing_memory", "running"])
 
 interface Props {
   chat: SidebarChatRow
-
+  /** Study sessions hide forking because it inherits transcript/session state. */
   showFork?: boolean
   activeChatId: string | null
   nowMs: number

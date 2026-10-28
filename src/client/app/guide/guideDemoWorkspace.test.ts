@@ -9,7 +9,7 @@ afterEach(() => {
   uninstall?.()
   uninstall = null
   if (ORIGINAL_WINDOW === undefined) {
-
+    // Bun has no browser global unless a test installs one.
     delete (globalThis as { window?: Window }).window
   } else {
     globalThis.window = ORIGINAL_WINDOW

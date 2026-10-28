@@ -88,8 +88,12 @@ function getMeasuredTerminalSize(terminal: Terminal, container: HTMLElement) {
 
   const fitCols = Math.floor(availableWidth / cellWidth)
   const fitRows = Math.floor(availableHeight / cellHeight)
-
-
+  // A collapsing panel (the open/close toggle animation) shrinks the container
+  // toward 0. Don't report a degenerate size it can't actually hold — the old
+  // Math.max(2,…)/Math.max(1,…) forced a 2x1 PTY mid-animation, which is a REAL
+  // resize sent to the shell and scrambles full-screen programs like vim/htop
+  // (BUG PANEL-2). Returning null keeps the last real size until the panel can
+  // fit a usable terminal again.
   if (fitCols < 1 || fitRows < 1) {
     return null
   }
@@ -348,8 +352,11 @@ export function TerminalPane({
       terminal.dispose()
       terminalRef.current = null
     }
-
-
+    // terminalTheme is intentionally NOT a dependency: the effect below applies
+    // theme changes in place. Including it here tore the whole xterm instance
+    // down and rebuilt it on every light/dark toggle — visible flicker + lost
+    // scroll position (BUG PANEL-3). Only structural inputs recreate the term.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scrollback, socket, terminalId])
 
   useEffect(() => {

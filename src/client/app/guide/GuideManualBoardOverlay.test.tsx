@@ -33,7 +33,8 @@ describe("Guide focused Memory Board close", () => {
     const close = boardClose(overlay)
     expect(typeof close).toBe("function")
 
-
+    // MemoryBoardOverlay owns its visible Close; the Guide dismisses only the
+    // optional overlay and leaves the Candidate lesson in place.
     close?.()
 
     expect(events).toEqual(["closed"])

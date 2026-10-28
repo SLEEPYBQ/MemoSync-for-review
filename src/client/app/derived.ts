@@ -46,7 +46,13 @@ export function isProcessingStatus(status?: string) {
   return status === "starting" || status === "previewing_memory" || status === "running" || status === "waiting_for_user"
 }
 
-
+/**
+ * An undecided per-turn memory preview parks the turn SERVER-side, but no
+ * ActiveTurn exists yet so runtime.status stays "idle" — sends during this
+ * window must take the enqueue path (queued-message UI) instead of looking
+ * delivered. Scanning from the end: a user_prompt/result after the preview
+ * means the turn moved past it (stale), not pending.
+ */
 export function hasPendingMemoryPreview(messages: Array<{ kind: string; decision?: unknown }>): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]

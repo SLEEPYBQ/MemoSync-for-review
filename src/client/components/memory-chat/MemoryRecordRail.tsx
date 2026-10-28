@@ -1,5 +1,12 @@
-
-
+// Memory Record — the sidebar re-presentation of the monitoring column over
+// time (redesign discussion 2026-08-10). Each turn mirrors the transcript
+// stations one-to-one as two-line stage rows: a Title-Case stage name (the
+// system's own vocabulary, same icon as the in-flow card) above a lowercase
+// one-line statement. Verdicts live ONLY in the audit stage; the summary
+// sentence stays a neutral narrative. Hovering a stage row pops the same
+// items the big card holds; clicking jumps back to that card in the
+// transcript. Monitoring only — the record holds no buttons that change
+// state; control stays at the gates.
 import { Fragment, useMemo } from "react"
 import {
   ArrowRightLeft,
@@ -32,9 +39,9 @@ import { cn } from "../../lib/utils"
 interface Props {
   chatId: string
   messages: HydratedTranscriptMessage[]
-
+  /** Current Claude text before it becomes a hydrated transcript row. */
   streamingText?: string | null
-
+  /** Server-authoritative active-turn state; remains true between text chunks. */
   isTurnActive?: boolean
 }
 
@@ -56,20 +63,21 @@ function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s
 }
 
-
+/** The audit recap with its [M-NN] citations as live chips. */
 function SummaryLine({ text }: { text: string }) {
   const parts = text.split(CITATION_RE)
   return (
     <p className="text-xs leading-relaxed text-foreground">
       {parts.map((part, i) =>
-
+        // Odd indexes are the captured M-NN groups from the split regex.
         i % 2 === 0 ? <Fragment key={i}>{part}</Fragment> : <MemoryCitationChip key={i} id={part} />,
       )}
     </p>
   )
 }
 
-
+/** Scroll the transcript to a station's card and flash it (virtualized rows
+ *  that are not mounted simply no-op — same limit as quote jumps). */
 function jumpToEntry(chatId: string, entryId: string) {
   const el = document.querySelector<HTMLElement>(`[data-transcript-row-id="${entryId}"]`)
     ?? document.querySelector<HTMLElement>(`[data-entry-id="${entryId}"]`)
@@ -79,7 +87,11 @@ function jumpToEntry(chatId: string, entryId: string) {
   recordUiMonitor("timeline_slot_jump", { sessionId: chatId, interaction: "click" })
 }
 
-
+/**
+ * One stage as two lines: icon + Title-Case stage name, then the statement.
+ * `detail` (when given) renders in a hover card — the same read-only popover
+ * language as hovering a memory chip.
+ */
 function StageRow({
   icon: Icon,
   label,
@@ -124,7 +136,8 @@ function StageRow({
   )
 }
 
-
+/** A proposed candidate: content lives in the memory store, not the
+ *  transcript (ids alone persist) — resolve live, fall back to the snapshot. */
 function CandidateLine({ id, fallback }: { id: string; fallback?: string }) {
   const memory = useMemoryStore((s) => s.items.find((m) => m.id === id))
   const content = memory?.content ?? fallback
@@ -191,8 +204,8 @@ function AuditDetail({ chatId, audit }: { chatId: string; audit: RecordAuditStag
             ) : label.label === "operational" ? (
               <span className="text-foreground/80">shaped this turn</span>
             ) : label.label === "not_applicable" ? (
-
-
+              // Slate + the named missing object: "never entered play" must not
+              // blur into "played, changed nothing" (mentor 2026-08-15).
               <span className="text-slate-600 dark:text-slate-400">
                 not applicable
                 {label.missing ? <span className="text-muted-foreground"> — {label.missing}</span> : null}
@@ -225,7 +238,7 @@ function TurnBlock({ chatId, turn, isLast, isLive }: { chatId: string; turn: Mem
 
   return (
     <div className="flex gap-2.5">
-
+      {/* Spine: pulse node + connector. */}
       <div className="flex w-6 shrink-0 flex-col items-center">
         <span
           className={cn(
@@ -239,7 +252,7 @@ function TurnBlock({ chatId, turn, isLast, isLive }: { chatId: string; turn: Mem
       </div>
 
       <div className={cn("min-w-0 flex-1", !isLast && "pb-5")}>
-
+        {/* Head: turn number + the settled recap (or the turn's fate). */}
         <div className="flex items-baseline gap-2">
           <span className="font-mono text-[10px] font-semibold leading-relaxed text-muted-icon">t{turn.turn}</span>
           <div className="min-w-0 flex-1">
@@ -252,8 +265,8 @@ function TurnBlock({ chatId, turn, isLast, isLive }: { chatId: string; turn: Mem
             ) : turn.summary ? (
               <SummaryLine text={turn.summary} />
             ) : turn.audit && turn.audit.status !== "pending" ? (
-
-
+              // A settled audit without a recap sentence still settles the row
+              // (2026-08-19 evening revision: no eternal "running…").
               <p className="text-[11px] italic text-muted-foreground">
                 {turn.audit.status === "empty"
                   ? "no memory was in play this turn"
@@ -450,7 +463,9 @@ function TurnBlock({ chatId, turn, isLast, isLive }: { chatId: string; turn: Mem
   )
 }
 
-
+// Figure-only demo record (opt-in via ?demo in the URL). Hand-crafted so a
+// screenshot shows a full pre-turn review + an interrupt on t1 and all four
+// audit verdicts on t2. Never used in normal operation.
 const DEMO_RECORD: MemoryRecord = {
   turns: [
     {

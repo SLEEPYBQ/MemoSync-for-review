@@ -35,10 +35,12 @@ export interface LocalHttpServerInfo {
   ownerPath?: string
   processName?: string
   sameProject?: boolean
-
+  /** Server authority for process termination; false for managed study previews. */
   canKill?: boolean
-
-
+  /** True when the app runs in a container (PREVIEW_VIA_PROXY): the browser
+   * iframe lives on the HOST, so `address` (in-container localhost) is
+   * unreachable — open the app's localhost-subdomain proxy when local, or
+   * its same-origin path proxy when MemoSync is reached remotely. */
   preferProxy?: boolean
 }
 
@@ -141,7 +143,7 @@ export type ClientCommand =
       modelOptions?: ModelOptions
       effort?: string
       planMode?: boolean
-
+      /** Server-issued id for the one first prompt staged behind the opening Memory Board. */
       openingReviewId?: string
     }
   | { type: "chat.refreshDiffs"; chatId: string }

@@ -49,7 +49,7 @@ function getToolGroupLabel(messages: HydratedTranscriptMessage[]): string {
     }
   }
 
-
+  // Format as "N reads, M writes" in order of first appearance
   return order.map(key => {
     const { category, count } = counts.get(key)!
     return `${count} ${count === 1 ? category.singular : category.plural}`
@@ -67,7 +67,7 @@ interface Props {
 export function CollapsedToolGroup({ messages, isLoading, localPath, expanded, onExpandedChange }: Props) {
   const label = useMemo(() => getToolGroupLabel(messages), [messages])
 
-
+  // Check if any tool in the group is still in progress
   const anyInProgress = messages.some(msg => {
     const processed = msg as ProcessedToolCall
     return processed.result === undefined

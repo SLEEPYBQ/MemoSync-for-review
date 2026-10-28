@@ -1,5 +1,13 @@
-
-
+// The experiment's serial gate. Canonical freeze/post-session state comes from
+// study.sqlite when a lifecycle reader is available; events.jsonl remains the
+// compatibility fallback for older runs. Sessions are TIME WINDOWS, not
+// hand-picked chats: a
+// task's window runs from the previous task's Session Completion to its own
+// freeze, and everything that happened in the instance during that window
+// (any chat in the task's assigned project) belongs to that task. The
+// instance is per-participant and strictly serial; project admission makes
+// "which project / which chat did task X" an enforced fact instead of a
+// participant choice.
 import { existsSync, readFileSync } from "node:fs"
 import { basename } from "node:path"
 import { getStudyTask, STUDY_TASKS, type StudyTaskStatus } from "../shared/studyTasks"
@@ -12,7 +20,7 @@ export interface StudyProgressEntry {
 
 export type StudyFreezeState = "open" | "freezing" | "frozen"
 
-
+/** Minimal canonical lifecycle reader implemented by StudyMemoryStore. */
 export interface StudyLifecycleReader {
   getTaskFreezeSnapshot(taskId: string): { snapshotId: string; frozenAt: string } | null
   getQuestionnaireSubmission(snapshotId: string): { submittedAt: string } | null
@@ -20,7 +28,8 @@ export interface StudyLifecycleReader {
   getSusSubmission(): { submittedAt: string } | null
 }
 
-
+/** Optional counterbalancing: STUDY_TASK_ORDER="098-S1,098-S2,038-S1,038-S2".
+ *  Unknown ids are dropped, missing ids append in catalog order. */
 export function resolveStudyOrder(env: string | undefined = process.env.STUDY_TASK_ORDER): string[] {
   const known = STUDY_TASKS.map((task) => task.id)
   const requested = (env ?? "")
@@ -32,14 +41,14 @@ export function resolveStudyOrder(env: string | undefined = process.env.STUDY_TA
 
 export class StudyRegistry {
   private readonly order: string[]
-
+  /** taskId → ISO ts of its study.freeze (the window's end). */
   private readonly frozenAtByTask = new Map<string, string>()
-
+  /** taskId → ISO ts when D/A/E and both Raw TLX blocks were submitted. */
   private readonly completedAtByTask = new Map<string, string>()
   private susSubmittedAt: string | null = null
-
+  /** In-process reservation held while the freeze barrier and snapshot run. */
   private readonly freezingTasks = new Set<string>()
-
+  /** taskId -> treatment-memory HTTP mutations admitted before freeze. */
   private readonly memoryMutationsByTask = new Map<string, number>()
 
   constructor(
@@ -58,12 +67,12 @@ export class StudyRegistry {
           if (event.type === "study.freeze") this.noteFreeze(event.taskId, ts)
           else if (event.type === "study.unfreeze") this.noteUnfreeze(event.taskId)
           else if (event.type === "study.session.complete") this.noteSessionComplete(event.taskId, ts)
-
-
+          // Compatibility for pre-workload runs. Canonical SQLite recovery
+          // below clears this legacy completion when a freeze snapshot exists.
           else if (event.type === "quiz.submit") this.noteSessionComplete(event.taskId, ts)
           else if (event.type === "study.sus.submit") this.noteSusSubmit(ts)
         } catch {
-
+          // Torn tail line — never let it break the gate.
         }
       }
     }
@@ -76,8 +85,8 @@ export class StudyRegistry {
       if (!snapshot) continue
       this.freezingTasks.delete(taskId)
       this.frozenAtByTask.set(taskId, snapshot.frozenAt)
-
-
+      // A canonical snapshot makes SQLite authoritative for this task. Remove a
+      // legacy JSONL completion unless the canonical completion also exists.
       this.completedAtByTask.delete(taskId)
       const completion = lifecycle.getSessionCompletion(taskId)
       if (completion) this.completedAtByTask.set(taskId, completion.completedAt)
@@ -96,7 +105,7 @@ export class StudyRegistry {
     return this.freezingTasks.has(taskId) ? "freezing" : "open"
   }
 
-
+  /** Atomically reserve the current task before any asynchronous freeze work. */
   beginFreeze(taskId: string): boolean {
     if (this.taskStatus(taskId) !== "active" || this.freezeState(taskId) !== "open") return false
     if ((this.memoryMutationsByTask.get(taskId) ?? 0) > 0) return false
@@ -104,7 +113,11 @@ export class StudyRegistry {
     return true
   }
 
-
+  /**
+   * Reserve one participant-facing treatment-memory mutation. The synchronous
+   * admission point and beginFreeze() form a small read/write gate: whichever
+   * starts first wins, so a request cannot cross the immutable session edge.
+   */
   beginTreatmentMemoryMutation(): (() => void) | null {
     const taskId = this.activeTaskId()
     if (!taskId || this.freezeState(taskId) !== "open") return null
@@ -123,12 +136,12 @@ export class StudyRegistry {
     return (this.memoryMutationsByTask.get(taskId) ?? 0) > 0
   }
 
-
+  /** Release a failed in-process freeze reservation so work can resume/retry. */
   cancelFreeze(taskId: string): boolean {
     return this.freezingTasks.delete(taskId)
   }
 
-
+  /** Experimenter escape hatch: reopen an accidentally ended session. */
   noteUnfreeze(taskId: string): void {
     this.freezingTasks.delete(taskId)
     this.frozenAtByTask.delete(taskId)
@@ -143,12 +156,12 @@ export class StudyRegistry {
     this.susSubmittedAt = ts
   }
 
-
+  /** The one task currently open for work/quiz, or null when all are done. */
   activeTaskId(): string | null {
     return this.order.find((id) => !this.completedAtByTask.has(id)) ?? null
   }
 
-
+  /** The next serial task after `taskId`, independent of its current lock state. */
   nextTaskIdAfter(taskId: string): string | null {
     const index = this.order.indexOf(taskId)
     return index >= 0 ? this.order[index + 1] ?? null : null
@@ -160,7 +173,7 @@ export class StudyRegistry {
     return this.activeTaskId() === taskId ? "active" : "locked"
   }
 
-
+  /** The active window's start: the latest completion ts, or null at study start. */
   windowStart(): string | null {
     let latest: string | null = null
     for (const ts of this.completedAtByTask.values()) {
@@ -169,7 +182,11 @@ export class StudyRegistry {
     return latest
   }
 
-
+  /**
+   * Resolve one durable event timestamp to its serial task window. The task
+   * ends at freeze; questionnaire time between freeze and Session Completion
+   * belongs to no task. An open active task has no end yet.
+   */
   taskWindowAt(timestampMs: number): { taskId: string; startAt: number; endAt: number | null } | null {
     if (!Number.isFinite(timestampMs)) return null
     let startAt = Number.NEGATIVE_INFINITY
@@ -195,7 +212,7 @@ export class StudyRegistry {
     return this.frozenAtByTask.get(taskId)
   }
 
-
+  /** The active task has frozen and still has required post-session measures. */
   questionnairePending(): boolean {
     const active = this.activeTaskId()
     return active !== null && this.frozenAtByTask.has(active)
@@ -222,7 +239,13 @@ export class StudyRegistry {
     }))
   }
 
-
+  /**
+   * The study-arm prompt gate: a participant-readable refusal, or null when
+   * the prompt may proceed. `chatCreatedAtMs` is the target chat's creation
+   * time — chats born before the current window belong to a completed
+   * session and stay read-only forever. `projectLocalPath`, when supplied by
+   * the server admission layer, must match the active task's assigned project.
+   */
   promptRefusal(chatCreatedAtMs?: number, projectLocalPath?: string): string | null {
     const active = this.activeTaskId()
     if (active === null) {

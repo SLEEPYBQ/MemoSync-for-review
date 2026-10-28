@@ -1,5 +1,5 @@
 import path from "node:path"
-import { cp as copyPath, copyFile, mkdir, stat, writeFile } from "node:fs/promises"
+import { cp as copyPath, copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises"
 import type {
   StandaloneTranscriptAttachmentMode,
   StandaloneTranscriptBundle,
@@ -8,11 +8,12 @@ import type {
   TranscriptEntry,
 } from "../shared/types"
 import { APP_VERSION } from "../shared/branding"
+import { classifyAttachmentPreview, TEXT_PREVIEW_LIMIT_BYTES, type TextPreviewResult } from "../shared/attachment-preview"
 import { getProjectExportDir } from "./paths"
 
 const STANDALONE_TRANSCRIPT_BUNDLE_VERSION = 1 as const
-
-
+// Absolute local paths are scrubbed from the bundle before it is written: an
+// export is a self-contained folder the user may hand to anyone.
 const STANDALONE_EXPORT_WORKSPACE_PATH = "/workspace"
 
 export interface WriteStandaloneTranscriptExportArgs {
@@ -36,6 +37,7 @@ export interface StandaloneExportDeps {
 
 interface PreparedMessagesResult {
   messages: TranscriptEntry[]
+  textAttachmentPreviews: Record<string, TextPreviewResult>
   totalAttachmentCount: number
   bundledAttachmentCount: number
 }
@@ -44,7 +46,10 @@ export function getStandaloneViewerDistDir() {
   return path.join(import.meta.dir, "..", "..", "dist", "export-viewer")
 }
 
-
+/**
+ * Export a chat transcript as a standalone local web page under the project's
+ * exports directory. Local-only: nothing is uploaded anywhere.
+ */
 export async function writeStandaloneTranscriptExport(
   args: WriteStandaloneTranscriptExportArgs,
   deps: StandaloneExportDeps = {},
@@ -89,16 +94,29 @@ export async function writeStandaloneTranscriptExport(
     theme: args.theme,
     attachmentMode: args.attachmentMode,
     messages: prepared.messages,
+    textAttachmentPreviews: Object.keys(prepared.textAttachmentPreviews).length
+      ? prepared.textAttachmentPreviews
+      : undefined,
   }
 
   const transcriptJson = `${JSON.stringify(bundle, null, 2)}\n`
   const transcriptJsonPath = path.join(outputDir, "transcript.json")
   await writeFileImpl(transcriptJsonPath, transcriptJson, "utf8")
 
+  const indexHtmlPath = path.join(outputDir, "index.html")
+  const viewerHtml = await readFile(indexHtmlPath, "utf8")
+  const bodyEnd = viewerHtml.toLowerCase().lastIndexOf("</body>")
+  if (bodyEnd < 0) {
+    throw new Error("Standalone viewer HTML is missing its closing body tag.")
+  }
+  // Escape HTML delimiters even in inert JSON: a literal </script> ends the element.
+  const embeddedData = `<script id="memosync-transcript-data" type="application/json">${transcriptJson.replace(/</g, "\\u003c")}</script>`
+  await writeFileImpl(indexHtmlPath, `${viewerHtml.slice(0, bodyEnd)}${embeddedData}${viewerHtml.slice(bodyEnd)}`, "utf8")
+
   return {
     ok: true,
     outputDir,
-    indexHtmlPath: path.join(outputDir, "index.html"),
+    indexHtmlPath,
     transcriptJsonPath,
     attachmentMode: args.attachmentMode,
     totalAttachmentCount: prepared.totalAttachmentCount,
@@ -118,14 +136,16 @@ async function prepareStandaloneMessages(
   },
 ): Promise<PreparedMessagesResult> {
   const preparedMessages = structuredClone(messages)
+  const textAttachmentPreviews: Record<string, TextPreviewResult> = {}
   let totalAttachmentCount = 0
   let bundledAttachmentCount = 0
   let attachmentsDirCreated = false
 
   for (const message of preparedMessages) {
     if (message.kind === "memory_candidates") {
-
-
+      // Older transcript rows duplicated candidate content and details. A
+      // hidden UI placeholder is not enough: scrub those fields from the JSON
+      // bundle itself before it is written.
       message.candidates = message.candidates.map(({ id }) => ({ id }))
       continue
     }
@@ -160,13 +180,23 @@ async function prepareStandaloneMessages(
       attachment.absolutePath = relativeDestinationPath
       attachment.relativePath = relativeDestinationPath
       attachment.contentUrl = relativeDestinationPath
+      const previewKind = classifyAttachmentPreview(attachment).kind
+      if (["markdown", "text", "json", "table"].includes(previewKind)) {
+        const bytes = new Uint8Array(await Bun.file(destinationPath).slice(0, TEXT_PREVIEW_LIMIT_BYTES + 1).arrayBuffer())
+        textAttachmentPreviews[relativeDestinationPath] = {
+          content: new TextDecoder().decode(bytes.subarray(0, TEXT_PREVIEW_LIMIT_BYTES)),
+          truncated: bytes.byteLength > TEXT_PREVIEW_LIMIT_BYTES,
+        }
+      }
     }
   }
 
   rewriteLocalPathsForExport(preparedMessages, args.localPath)
+  rewriteLocalPathsForExport(textAttachmentPreviews, args.localPath)
 
   return {
     messages: preparedMessages,
+    textAttachmentPreviews,
     totalAttachmentCount,
     bundledAttachmentCount,
   }

@@ -1,5 +1,11 @@
-
-
+// MemoryStore — CRUD + relations over the SQLite `memories` table, plus the
+// append-only per-item version/usage log (`memory_events`, SPEC §3 option 乙).
+// Ported from MemoSync (apps/backend/src/services/memory/MemoryStore.ts),
+// adapted from better-sqlite3 to Bun's `bun:sqlite` (named params use the `$`
+// sigil; positional `?` for single-value reads).
+//
+// Every mutation requires an ActorMeta — actor provenance (user vs agent) is a
+// core study measurement, so it is never inferred or defaulted.
 import type { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import type {
@@ -19,7 +25,7 @@ import type {
 } from './types';
 import { computeMemoryHash } from './hash';
 
-
+/** Values SQLite can bind (subset of bun:sqlite's SQLQueryBindings). */
 type Bind = string | number | bigint | boolean | null | Uint8Array;
 
 export interface CreateMemoryInput {
@@ -36,7 +42,7 @@ export interface CreateMemoryInput {
   provenanceSessionId?: string;
   provenanceTurn?: number;
   evidenceClass?: EvidenceClass;
-
+  /** Optional explicit id (e.g. seeding). Otherwise auto-generated. */
   id?: string;
 }
 
@@ -47,11 +53,11 @@ export interface MemoryFilter {
   status?: MemoryStatus;
 }
 
-
+/** Extra context recorded on a 'use' event. */
 export interface UseMeta extends ActorMeta {
-
+  /** How the memory was used, e.g. 'citation'. */
   via?: string;
-
+  /** Whether the agent loaded the detailed form (vs short form only). */
   detailLoaded?: boolean;
 }
 
@@ -90,7 +96,7 @@ interface MemoryEventRow {
   meta: string | null;
 }
 
-
+/** Maps MemoryItem patch keys to their DB column names. */
 const UPDATABLE_COLUMNS: Record<string, string> = {
   content: 'content',
   detail: 'detail',
@@ -107,7 +113,7 @@ const UPDATABLE_COLUMNS: Record<string, string> = {
   evidenceClass: 'evidence_class',
 };
 
-
+/** The fields a version snapshot captures — what rollback restores. */
 const VERSIONED_FIELDS = [
   'content',
   'detail',
@@ -120,15 +126,18 @@ const VERSIONED_FIELDS = [
   'sessionId',
 ] as const;
 
-
+/** Reach order for promote-vs-rescope classification. */
 const SCOPE_REACH: Record<MemoryScope, number> = { session: 0, project: 1, personal: 2 };
 
-
-const CONTENT_VERSION_FIELDS = ['content', 'detail', 'scope', 'type', 'topic', 'abstractionLevel'] as const;
+/** Patch keys whose change means "the text/meaning the model acts on moved" — these bump `version`. */
+const CONTENT_VERSION_FIELDS = ['content', 'detail', 'scope', 'projectId', 'sessionId', 'type', 'topic', 'abstractionLevel'] as const;
 
 type CandidateDecisionTransition = 'ordinary' | 'dismiss' | 'restore';
 
-
+/**
+ * A Candidate dismissal is a domain decision, not another editable status.
+ * Routes map this store-owned error to the stable CANDIDATE_DISCARDED response.
+ */
 export class CandidateDismissalTransitionError extends Error {
   readonly code = 'CANDIDATE_DISCARDED';
 
@@ -138,10 +147,19 @@ export class CandidateDismissalTransitionError extends Error {
   }
 }
 
+export class RevisionConflictError extends Error {
+  readonly code = 'CONFLICT';
+
+  constructor() {
+    super('Revision targets changed or their reviewed snapshot is unavailable; review the revision again');
+    this.name = 'RevisionConflictError';
+  }
+}
+
 export class MemoryStore {
   constructor(private db: Database) {}
 
-
+  /** sha1-based memory-set hash. */
   static computeHash(items: Array<Pick<MemoryItem, 'id' | 'content'>>): string {
     return computeMemoryHash(items);
   }
@@ -190,7 +208,12 @@ export class MemoryStore {
     })();
   }
 
-
+  /**
+   * Create one transferred memory together with the provenance relation that
+   * makes it a valid landing. An optional semantic-conflict relation belongs
+   * to the same commit. If any relation write fails, SQLite rolls back the
+   * item and its create event instead of leaving an orphan in the pool.
+   */
   createDerivedMemory(
     input: CreateMemoryInput,
     sourceId: string,
@@ -230,7 +253,7 @@ export class MemoryStore {
       params.push(filter.status);
     }
     const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
-
+    // Order numerically by the id's numeric suffix so M-99 precedes M-100.
     const rows = this.db
       .query(
         `SELECT * FROM memories${where}
@@ -240,7 +263,12 @@ export class MemoryStore {
     return rows.map((r) => this.rowToItem(r));
   }
 
-
+  /**
+   * A scope move clears the binding columns the new scope has no use for —
+   * a personal memory carries no projectId/sessionId, a project one no
+   * sessionId, a session one no projectId. Stale bindings otherwise leak
+   * back through provenance displays, later moves, and transfer targeting.
+   */
   private normalizeScopePatch(existing: MemoryItem, patch: Partial<MemoryItem>): Partial<MemoryItem> {
     if (!patch.scope || patch.scope === existing.scope) return patch;
     const normalized = { ...patch } as Record<string, unknown>;
@@ -288,7 +316,15 @@ export class MemoryStore {
     ).get(id));
   }
 
-
+  /**
+   * The single status-transition seam for Candidate decisions.
+   *
+   * - Ordinary mutations may neither enter nor leave a dismissed decision.
+   * - Only dismissCandidate may enter discarded.
+   * - Only restoreDismissedCandidate may leave it, and never for sensitive data.
+   * - A retained sensitive legacy row stays inert even if an older build moved
+   *   it through archived: its persisted dismissal record/history still wins.
+   */
   private assertCandidateDecisionTransition(
     existing: MemoryItem,
     patch: Partial<MemoryItem>,
@@ -342,7 +378,9 @@ export class MemoryStore {
       this.assertCandidateDecisionTransition(existing, patch, transition);
       patch = this.normalizeScopePatch(existing, patch);
 
-
+    // Only fields that actually differ count as a change; `undefined` means
+    // "leave unchanged". A patch that changes nothing is a full no-op (no
+    // updated_at bump, no event).
     const sets: string[] = [];
     const params: Record<string, Bind> = { $id: id };
     const changes: Record<string, { before: unknown; after: unknown }> = {};
@@ -361,8 +399,10 @@ export class MemoryStore {
 
     sets.push('updated_at = $updated_at');
     params.$updated_at = new Date().toISOString();
-
-
+    // Content-bearing changes bump the injection version (delta anchor).
+    // Status-only transitions (accept/archive) deliberately do not: the text
+    // the model would act on is unchanged, and the delta reports lifecycle
+    // moves (added/archived) separately from edits (v2→v3).
     if (CONTENT_VERSION_FIELDS.some((f) => f in changes)) {
       sets.push('version = version + 1');
     }
@@ -381,37 +421,62 @@ export class MemoryStore {
     return this.updateWithCandidateDecision(id, patch, meta, 'ordinary');
   }
 
-
+  /** Soft delete: set status to 'archived'. The id is never reused. */
   archive(id: string, meta: ActorMeta): MemoryItem {
     return this.update(id, { status: 'archived' }, meta);
   }
 
-
+  /**
+   * HARD-remove a pending candidate and every draft artifact. Used for
+   * SENSITIVE candidates, where dismissal must erase the text (only the
+   * normalized fingerprint survives, for exact-repeat suppression).
+   *
+   * Accepted trade-off: erasing the events means a sensitive dismissal never
+   * counts toward candidateResolutionsSince (the policy-memo trigger runs a
+   * touch slow) and never joins the few-shot negative examples — sensitive
+   * text must not reach LLM prompts, and that boundary outranks counting
+   * accuracy. The experiment log is unaffected: routes emits its
+   * memory.decision event regardless.
+   */
   discardCandidate(id: string): void {
     this.db.transaction(() => {
       const existing = this.getById(id);
       if (!existing) throw new Error(`Memory not found: ${id}`);
       if (existing.status !== 'candidate') throw new Error(`Memory is not a candidate: ${id}`);
       this.recordCandidateDismissal(existing);
+      this.db.query('DELETE FROM memory_kv WHERE key = ?').run(`revision_targets:${id}`);
       this.db.query('DELETE FROM memory_relations WHERE source_id = ? OR target_id = ?').run(id, id);
       this.db.query('DELETE FROM memory_events WHERE memory_id = ?').run(id);
       this.db.query('DELETE FROM memories WHERE id = ?').run(id);
     })();
   }
 
-
+  /**
+   * Erase a candidate that was never shown to anyone — the rollback half of a
+   * two-phase commit (e.g. Localized drafts whose gate card failed to append).
+   * Unlike discardCandidate this leaves NO dismissal fingerprint: nobody
+   * rejected it, so nothing may teach the gate that they did.
+   */
   eraseCandidate(id: string): void {
     this.db.transaction(() => {
       const existing = this.getById(id);
       if (!existing) return;
       if (existing.status !== 'candidate') throw new Error(`Memory is not a candidate: ${id}`);
+      this.db.query('DELETE FROM memory_kv WHERE key = ?').run(`revision_targets:${id}`);
       this.db.query('DELETE FROM memory_relations WHERE source_id = ? OR target_id = ?').run(id, id);
       this.db.query('DELETE FROM memory_events WHERE memory_id = ?').run(id);
       this.db.query('DELETE FROM memories WHERE id = ?').run(id);
     })();
   }
 
-
+  /**
+   * SOFT-dismiss a pending non-sensitive candidate: status → 'discarded' with a
+   * recorded event. The text is deliberately retained so the necessity gate can
+   * cite it back to the LLM as a negative example ("the user said no to this")
+   * and the study keeps its extracted-but-not-stored material. The fingerprint
+   * is still written — exact repeats are dropped before the gate ever runs.
+   * Discarded items never inject, never rank, and never list by default.
+   */
   dismissCandidate(id: string, meta: ActorMeta): MemoryItem {
     return this.db.transaction(() => {
       const existing = this.getById(id);
@@ -422,7 +487,12 @@ export class MemoryStore {
     })();
   }
 
-
+  /**
+   * Apply the participant's Dismiss decision using store-owned privacy
+   * authority. Mutable Candidate fields are not sufficient for this choice:
+   * a legacy row may have been relabelled after an earlier sensitive
+   * dismissal, while its durable tombstone still requires secure erasure.
+   */
   dismissCandidateByPolicy(id: string, meta: ActorMeta): 'hard_erased' | 'soft_dismissed' {
     return this.db.transaction(() => {
       const existing = this.getById(id);
@@ -438,7 +508,12 @@ export class MemoryStore {
     })();
   }
 
-
+  /**
+   * Inverse of a non-sensitive soft dismissal. The Candidate row and its exact
+   * repeat-suppression fingerprint move back to the review lane atomically.
+   * Sensitive dismissals are hard deletes, so they deliberately fail the
+   * not-found guard and no secret is reconstructed here.
+   */
   restoreDismissedCandidate(id: string, meta: ActorMeta): MemoryItem {
     return this.db.transaction(() => {
       const existing = this.getById(id);
@@ -452,7 +527,7 @@ export class MemoryStore {
     })() as MemoryItem;
   }
 
-
+  /** Replace a pending draft while erasing its previous content from version history. */
   replaceCandidateDraft(id: string, patch: Partial<MemoryItem>, meta: ActorMeta): MemoryItem {
     const replaced = this.db.transaction(() => {
       const existing = this.getById(id);
@@ -487,7 +562,17 @@ export class MemoryStore {
     return replaced;
   }
 
-
+  /**
+   * Commit the only allowed acceptance transition for a sensitive Candidate
+   * shown by the blocking study Board. The reviewed Content/Detail snapshot,
+   * activation, and any revision-target archives share one transaction, so a
+   * caller cannot stage one draft and activate a different draft later.
+   *
+   * Content must actually replace the captured sensitive text. Detail is
+   * required even when the participant deliberately reviews it as empty.
+   * replaceCandidateDraft erases the predecessor from item history before the
+   * accepted status event is appended.
+   */
   acceptReviewedSensitiveCandidate(
     id: string,
     patch: Partial<MemoryItem> & { content: string; detail: string },
@@ -521,14 +606,18 @@ export class MemoryStore {
     })() as { updated: MemoryItem; replaced: MemoryItem[] };
   }
 
-
+  /** Exact, whitespace/case-normalized rejection check without retaining text. */
   wasCandidateDismissed(content: string): boolean {
     return Boolean(this.db.query(
       'SELECT 1 FROM dismissed_candidate_fingerprints WHERE fingerprint = ?',
     ).get(this.candidateFingerprint(content)));
   }
 
-
+  /**
+   * The muted-proposals shelf: every dismissal fingerprint, joined back to the
+   * discarded row for a human-readable label. Non-sensitive suppression can
+   * be lifted; sensitive content stays masked behind an immutable tombstone.
+   */
   listMutedProposals(): Array<{
     memoryId: string;
     content: string | null;
@@ -561,7 +650,7 @@ export class MemoryStore {
     }));
   }
 
-
+  /** Lift recoverable non-sensitive suppression so the knowledge may be proposed again. */
   unmuteProposal(memoryId: string): boolean {
     const evidence = this.candidateDismissalEvidence(memoryId);
     const existing = this.getById(memoryId);
@@ -579,7 +668,13 @@ export class MemoryStore {
     return res.changes > 0;
   }
 
-
+  /**
+   * Record one USE of a memory as a 'use' event. The counter means "shaped
+   * N turns": citations and trace-operational labels bump usage_count (hover
+   * card, retrieval boost); detail loads live in the event log only.
+   * Deliberately not a version — updated_at is untouched and no snapshot is
+   * taken.
+   */
   recordUse(id: string, meta: UseMeta): void {
     this.db.transaction(() => {
       const isCitation = meta.via !== 'detail_load';
@@ -594,14 +689,17 @@ export class MemoryStore {
     })();
   }
 
-
+  /**
+   * Record the post-turn trace verdict for one memory as a 'trace' event
+   * (meta.label). Missing ids are a no-op — the async pass can race a delete.
+   */
   recordTraceLabel(id: string, label: MemoryTraceLabel, meta: ActorMeta & { turn?: number }): void {
     const row = this.db.query(`SELECT id FROM memories WHERE id = ?`).get(id);
     if (!row) return;
     this.appendEvent(id, 'trace', meta, { meta: { label } });
   }
 
-
+  /** Latest trace verdict per memory (last event wins). */
   latestTraceLabels(): Map<string, MemoryTraceLabel> {
     const rows = this.db
       .query(`SELECT memory_id, meta FROM memory_events WHERE kind = 'trace' ORDER BY seq`)
@@ -614,7 +712,14 @@ export class MemoryStore {
     return labels;
   }
 
-
+  /**
+   * Capture candidates the user rejected (status candidate → discarded),
+   * newest dismissal first. Feeds the necessity gate as negative examples —
+   * "the user already said no to this kind of item". Sensitive candidates are
+   * hard-deleted on dismissal, so they can never appear here. An
+   * accepted-then-archived memory is a lifecycle end, not a rejection, and is
+   * excluded by the before-status check.
+   */
   recentlyDismissedCandidates(limit = 8): MemoryItem[] {
     const rows = this.db
       .query(
@@ -633,7 +738,11 @@ export class MemoryStore {
     return rows.map((r) => this.rowToItem(r));
   }
 
-
+  /**
+   * Capture candidates the user accepted (status candidate → active), newest
+   * first. Feeds the capture/necessity passes as positive few-shot examples —
+   * "this is the kind of item the user keeps" (self-evolution M1).
+   */
   recentlyAcceptedCandidates(limit = 8): MemoryItem[] {
     const rows = this.db
       .query(
@@ -651,7 +760,12 @@ export class MemoryStore {
     return rows.map((r) => this.rowToItem(r));
   }
 
-
+  /**
+   * Record one RE-OBSERVATION of an existing memory (necessity gate verdict
+   * 'reinforce'): the conversation restated a fact already stored. Bumps
+   * reinforced_count (Fig 6 "reinforced N×") and appends a
+   * 'reinforce' event. Not a version — no snapshot, updated_at untouched.
+   */
   recordReinforce(id: string, meta: ActorMeta): void {
     this.db.transaction(() => {
       const res = this.db
@@ -662,7 +776,11 @@ export class MemoryStore {
     })();
   }
 
-
+  /**
+   * Record a Transfer reinforcement together with its source provenance. A
+   * reinforcement without derived_from evidence is not a valid Transfer
+   * landing, so both writes commit or roll back as one store operation.
+   */
   recordDerivedReinforce(id: string, sourceId: string, meta: ActorMeta): void {
     this.db.transaction(() => {
       this.recordReinforce(id, meta);
@@ -670,7 +788,12 @@ export class MemoryStore {
     })();
   }
 
-
+  /**
+   * The memory's most recent trace verdicts, newest first, capped at `limit`.
+   * Backs the self-evolution M4 trigger: K consecutive 'violated' or
+   * 'injected_without_effect' verdicts mean the stored text and observed
+   * behavior have drifted apart.
+   */
   recentTraceLabels(id: string, limit = 3): MemoryTraceLabel[] {
     const rows = this.db
       .query(
@@ -687,7 +810,7 @@ export class MemoryStore {
     return labels;
   }
 
-
+  /** True when a PENDING revision candidate already targets `id` (don't re-propose). */
   hasOpenRevision(id: string): boolean {
     return Boolean(
       this.db
@@ -701,51 +824,119 @@ export class MemoryStore {
     );
   }
 
-
+  /**
+   * Atomically create a REVISION candidate for `targetId`: the open-revision
+   * check, the insert, and the 'revises' relation run in ONE transaction, so
+   * two concurrent turns can never both draft a replacement for the same
+   * memory (the pre-LLM check alone races across the drafting await).
+   * Returns null when the target is gone/inactive or already has an open
+   * revision — the caller simply drops its draft.
+   */
   createRevisionProposal(
     input: CreateMemoryInput,
     targetId: string,
     meta: ActorMeta,
     opts?: {
-
-
+      /**
+       * CAS guard for drafts written across an await: the target's content
+       * when the draft was conceived. If the target moved meanwhile (e.g. the
+       * user already fixed it by hand), the stale draft is dropped rather
+       * than proposed against text it never saw.
+       */
       expectedTargetContent?: string;
     },
   ): MemoryItem | null {
+    return this.createRevisionCandidate(input, targetId, meta, false, opts)?.item ?? null;
+  }
+
+  /** Preserve competing capture updates as target-bound alternatives, not independent facts. */
+  createCaptureUpdateProposal(
+    input: CreateMemoryInput,
+    targetId: string,
+    meta: ActorMeta,
+    opts?: { expectedTargetContent?: string },
+  ): { item: MemoryItem; isRevision: boolean } | null {
+    return this.createRevisionCandidate(input, targetId, meta, true, opts);
+  }
+
+  private createRevisionCandidate(
+    input: CreateMemoryInput,
+    targetId: string,
+    meta: ActorMeta,
+    allowCompeting: boolean,
+    opts?: { expectedTargetContent?: string },
+  ): { item: MemoryItem; isRevision: boolean } | null {
     return this.db.transaction(() => {
       const target = this.getById(targetId);
       if (!target || target.status !== 'active') return null;
       if (opts?.expectedTargetContent !== undefined && target.content !== opts.expectedTargetContent) return null;
-      if (this.hasOpenRevision(targetId)) return null;
+      if (!allowCompeting && this.hasOpenRevision(targetId)) return null;
       const proposal = this.create({ ...input, status: 'candidate' }, meta);
       this.addRelation(proposal.id, targetId, 'revises');
-      return proposal;
-    })() as MemoryItem | null;
+      this.setKv(`revision_targets:${proposal.id}`, [this.revisionSnapshot(target)]);
+      return { item: proposal, isRevision: true };
+    })();
   }
 
-
-  acceptRevision(candidateId: string, meta: ActorMeta): { updated: MemoryItem; replaced: MemoryItem[] } {
+  /**
+   * Atomically accept a REVISION candidate: activate it and archive EVERY
+   * memory it revises in ONE transaction (a single-target revision archives
+   * one; a MERGE proposal archives both originals). Two separate mutations
+   * here left a half-applied state on mid-way failure (both memories active,
+   * candidate spent). Returns the activated item plus the archived targets
+   * ([] when the candidate is not a revision). Legacy proposals without a
+   * reviewed snapshot require re-review rather than guessing what was seen.
+   */
+  acceptRevision(candidateId: string, meta: ActorMeta, draftPatch?: Partial<MemoryItem>): { updated: MemoryItem; replaced: MemoryItem[] } {
     return this.db.transaction(() => {
+      const targets = this.revisionTargetsOf(candidateId);
+      const reviewed = this.getKv<ReturnType<MemoryStore['revisionSnapshot']>[]>(`revision_targets:${candidateId}`);
+      if (targets.length > 0 || reviewed !== null) {
+        if (!Array.isArray(reviewed) || reviewed.length !== targets.length || targets.some((target, index) => {
+          const snapshot = this.revisionSnapshot(target);
+          return target.status !== 'active'
+            || reviewed[index]?.id !== snapshot.id
+            || reviewed[index]?.version !== snapshot.version
+            || reviewed[index]?.digest !== snapshot.digest;
+        })) throw new RevisionConflictError();
+      }
+      if (draftPatch && Object.keys(draftPatch).length > 0) {
+        this.replaceCandidateDraft(candidateId, draftPatch, meta);
+      }
       const updated = this.update(candidateId, { status: 'active' }, meta);
-      const replaced = this.revisionTargetsOf(candidateId)
-        .filter((t) => t.status === 'active')
-        .map((t) => this.archive(t.id, meta));
+      const replaced = targets.map((t) => this.archive(t.id, meta));
       return { updated, replaced };
     })() as { updated: MemoryItem; replaced: MemoryItem[] };
   }
 
-
+  /**
+   * Extend a stale memory's lifecycle (延期): appends a 'renew' event, which
+   * resets the expiry window — `listExpired` only looks for freshness events
+   * after its boundary. Not a version: content untouched, no snapshot.
+   */
   renewMemory(id: string, meta: ActorMeta): MemoryItem {
     const item = this.getById(id);
     if (!item) throw new Error(`Memory not found: ${id}`);
-
-
+    // Only a LIVE memory has a lifecycle to extend — renewing an archived one
+    // (e.g. from a stale card raced by an archive in another tab) would log a
+    // "kept" decision for something that no longer exists.
     if (item.status !== 'active') throw new Error(`Only an active memory can be renewed (got ${item.status})`);
     this.appendEvent(id, 'renew', meta);
     return item;
   }
 
-
+  /**
+   * Expired (过期) memories — the paper's "not referenced in three commits"
+   * claim, operationalized on sessions: an ACTIVE personal/project memory
+   * that already existed before `boundaryTs` (start of the expiry window,
+   * typically the start of the 3rd-most-recent prior session with turns) and
+   * has produced NO freshness event since. Freshness = any event except the
+   * passive per-turn 'trace' verdicts — citations/operational use, reinforce,
+   * renew, edits, status changes all count as "the developer or agent touched
+   * this". Session-scoped memories never expire (they die with the session),
+   * and memories with an open revision proposal are excluded — they already
+   * sit in the revision lane.
+   */
   listExpired(opts: { boundaryTs: string; projectId?: string }): MemoryItem[] {
     const rows = this.db
       .query(
@@ -767,7 +958,11 @@ export class MemoryStore {
     return rows.map((r) => this.rowToItem(r));
   }
 
-
+  /**
+   * Pending revision proposals with their still-active targets, oldest first.
+   * Backs the gate's attention surface: a drafted revision the user scrolled
+   * past resurfaces once instead of silently sinking.
+   */
   listOpenRevisions(projectId?: string): Array<{ proposal: MemoryItem; target: MemoryItem }> {
     const rows = this.db
       .query(
@@ -789,7 +984,13 @@ export class MemoryStore {
     return pairs;
   }
 
-
+  /**
+   * Inverse of an AUTO-applied acceptance (delegating/Auto mode): the item
+   * returns to the review lane (status → candidate) and, when it was a
+   * revision, its archived target comes back to life — one transaction, so a
+   * revert can never leave both versions active. History keeps both status
+   * events; nothing is erased.
+   */
   revertAutoAccept(
     id: string,
     meta: ActorMeta,
@@ -798,8 +999,9 @@ export class MemoryStore {
       const existing = this.getById(id);
       if (!existing) throw new Error(`Memory not found: ${id}`);
       if (existing.status !== 'active') throw new Error(`Only an active memory can be reverted (got ${existing.status})`);
-
-
+      // Authority comes from the latest persisted transition, not the route
+      // name or a client-provided flag. Born-active and later-restored items
+      // must never be forged back into the Candidate lane.
       const lastStatus = this.db
         .query(
           `SELECT seq AS s,
@@ -814,7 +1016,9 @@ export class MemoryStore {
         throw new Error('Memory was not accepted from a Candidate review and cannot be reverted to Candidate.');
       }
 
-
+      // The one-click inverse only inverts the ACCEPTANCE. If the item was
+      // edited after it went active, a blind revert would throw away the
+      // user's newer text — that path belongs to explicit history rollback.
       const editedAfter = this.db
         .query(
           `SELECT 1 FROM memory_events
@@ -833,12 +1037,12 @@ export class MemoryStore {
     })() as { reverted: MemoryItem; restored: MemoryItem | null; restoredAll: MemoryItem[] };
   }
 
-
+  /** The memory a REVISION candidate proposes to replace, if any (first of possibly several). */
   revisionTargetOf(candidateId: string): MemoryItem | null {
     return this.revisionTargetsOf(candidateId)[0] ?? null;
   }
 
-
+  /** ALL memories a revision candidate proposes to replace (a merge proposal has two). */
   revisionTargetsOf(candidateId: string): MemoryItem[] {
     const rows = this.db
       .query(
@@ -851,7 +1055,14 @@ export class MemoryStore {
     return rows.map((r) => this.rowToItem(r));
   }
 
-
+  /**
+   * Atomically create a MERGE proposal: one candidate that revises BOTH
+   * originals — accepting it (acceptRevision) activates the merged text and
+   * archives the pair. Same guards as createRevisionProposal, applied to each
+   * target: active, content unchanged since the draft was conceived (CAS
+   * across the LLM await), and no open revision already in flight. Returns
+   * null when any guard fails — the caller drops its draft.
+   */
   createMergeProposal(
     input: CreateMemoryInput,
     targetIds: [string, string],
@@ -859,19 +1070,34 @@ export class MemoryStore {
     opts?: { expectedContents?: [string, string] },
   ): MemoryItem | null {
     return this.db.transaction(() => {
+      if (targetIds[0] === targetIds[1]) return null;
+      const targets: MemoryItem[] = [];
       for (let i = 0; i < targetIds.length; i++) {
         const target = this.getById(targetIds[i]!);
         if (!target || target.status !== 'active') return null;
         if (opts?.expectedContents && target.content !== opts.expectedContents[i]) return null;
         if (this.hasOpenRevision(target.id)) return null;
+        if (target.scope !== input.scope
+          || (input.scope === 'project' && (!input.projectId || target.projectId !== input.projectId))
+          || (input.scope === 'session' && (!input.sessionId || target.sessionId !== input.sessionId))) return null;
+        targets.push(target);
       }
       const proposal = this.create({ ...input, status: 'candidate' }, meta);
       for (const targetId of targetIds) this.addRelation(proposal.id, targetId, 'revises');
+      this.setKv(`revision_targets:${proposal.id}`, targets.map((target) => this.revisionSnapshot(target)));
       return proposal;
     })() as MemoryItem | null;
   }
 
+  private revisionSnapshot(item: MemoryItem) {
+    return {
+      id: item.id,
+      version: item.version,
+      digest: createHash('sha256').update(JSON.stringify(this.snapshotOf(item))).digest('hex'),
+    };
+  }
 
+  /** Read a JSON value from the memory_kv side table (null when absent/corrupt). */
   getKv<T>(key: string): T | null {
     const row = this.db.query('SELECT value FROM memory_kv WHERE key = ?').get(key) as
       | { value: string }
@@ -884,7 +1110,7 @@ export class MemoryStore {
     }
   }
 
-
+  /** Upsert a JSON value into the memory_kv side table. */
   setKv(key: string, value: unknown): void {
     this.db
       .query(
@@ -894,14 +1120,18 @@ export class MemoryStore {
       .run(key, JSON.stringify(value), new Date().toISOString());
   }
 
-
+  /** Commit a related group of JSON receipts as one SQLite transaction. */
   setKvBatch(entries: ReadonlyArray<readonly [key: string, value: unknown]>): void {
     this.db.transaction(() => {
       for (const [key, value] of entries) this.setKv(key, value);
     })();
   }
 
-
+  /**
+   * How many candidate resolutions (accept OR dismiss) happened after event
+   * `sinceSeq`, and the newest resolution seq. Drives the policy-memo refresh
+   * trigger (M2): regenerate after every N resolutions.
+   */
   candidateResolutionsSince(sinceSeq: number): { count: number; maxSeq: number } {
     const row = this.db
       .query(
@@ -916,7 +1146,7 @@ export class MemoryStore {
     return { count: row.count, maxSeq: row.max_seq };
   }
 
-
+  /** Full append-only history for one memory, oldest first. */
   getEvents(id: string): MemoryEvent[] {
     const rows = this.db
       .query(`SELECT * FROM memory_events WHERE memory_id = ? ORDER BY seq`)
@@ -935,7 +1165,12 @@ export class MemoryStore {
     }));
   }
 
-
+  /**
+   * Roll the memory back to the version captured by event `toSeq` (any change
+   * event with a snapshot). History is preserved: the rollback itself is
+   * appended as a 'revert' event. usage_count is NOT versioned state and
+   * survives. Returns the reverted item.
+   */
   rollback(id: string, toSeq: number, meta: ActorMeta): MemoryItem {
     return this.db.transaction(() => {
       const target = this.getEvents(id).find((e) => e.seq === toSeq);
@@ -964,8 +1199,8 @@ export class MemoryStore {
       sets.push(`${column} = $${column}`);
       params[`$${column}`] = value as Bind;
     }
-
-
+    // A rollback rewrites content the model acts on — it is a new version
+    // going FORWARD (history is append-only), not a return to an old number.
     if (CONTENT_VERSION_FIELDS.some((f) => f in changes)) {
       sets.push('version = version + 1');
     }
@@ -981,7 +1216,7 @@ export class MemoryStore {
     })();
   }
 
-
+  /** Replace the session's exclusion set (REDESIGN D7). Empty = nothing muted. */
   setSessionExclusions(sessionId: string, ids: string[]): void {
     this.db
       .query(
@@ -991,7 +1226,7 @@ export class MemoryStore {
       .run(sessionId, JSON.stringify(ids), new Date().toISOString());
   }
 
-
+  /** The ids muted for this session ([] when nothing is excluded). */
   getSessionExclusions(sessionId: string): string[] {
     const row = this.db.query('SELECT ids FROM session_exclusions WHERE session_id = ?').get(sessionId) as
       | { ids: string }
@@ -1024,7 +1259,7 @@ export class MemoryStore {
     }));
   }
 
-
+  /** Memories that `id` conflicts with (via a 'conflicts_with' relation). */
   getConflicts(id: string): MemoryItem[] {
     const rows = this.db
       .query(
@@ -1036,7 +1271,7 @@ export class MemoryStore {
     return rows.map((r) => this.rowToItem(r));
   }
 
-
+  /** Active memories that supersede `id` — the SOURCES of a conflicts_with relation targeting it. */
   getSupersedingItems(id: string): MemoryItem[] {
     const rows = this.db
       .query(
@@ -1048,7 +1283,19 @@ export class MemoryStore {
     return rows.map((r) => this.rowToItem(r));
   }
 
-
+  /**
+   * Active memories that another LIVE memory has flagged as contested — i.e.
+   * they are the TARGET of a conflicts_with relation whose SOURCE is still
+   * active or a pending candidate. These are the "needs attention" items
+   * surfaced after a drift event (SPEC maintenance / A1).
+   *
+   * - Requiring a live source means dismissing/archiving the superseding item
+   *   clears the conflict (no permanent ghost entry).
+   * - When `projectId` is omitted (the Board's global view) ALL project-scope
+   *   conflicts are included; a bound projectId narrows to that project.
+   *   (`project_id = ?` bound to NULL matches nothing in SQL — that was the
+   *   bug that hid every project-scope conflict from the Board.)
+   */
   listConflicted(projectId?: string): MemoryItem[] {
     const projectClause = projectId
       ? `(m.scope = 'project' AND m.project_id = ?)`
@@ -1068,7 +1315,7 @@ export class MemoryStore {
     return rows.map((r) => this.rowToItem(r));
   }
 
-
+  /** Which event kind a set of changed fields amounts to (scope > status > edit). */
   private classifyChange(
     before: MemoryItem,
     changes: Record<string, { before: unknown; after: unknown }>,

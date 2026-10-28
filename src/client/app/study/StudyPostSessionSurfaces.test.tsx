@@ -29,16 +29,18 @@ describe("RawTlxForm", () => {
   test("a fresh draft renders all six dimensions genuinely unanswered", () => {
     for (const activity of ["monitoring", "control"] as const) {
       const html = renderTlx(activity, {})
-
+      // Six explicit unanswered states — no dimension pretends to hold a value.
       expect(html.match(/>Not answered</g)).toHaveLength(6)
       expect(html.match(/data-answered="false"/g)).toHaveLength(6)
       expect(html).not.toContain('data-answered="true"')
-
-
+      // The native range thumb must not appear as a preselected midpoint
+      // answer: every unanswered slider suppresses its thumb and announces
+      // the unanswered state instead of the anchor value.
       expect(html.match(/::-webkit-slider-thumb\]:opacity-0/g)).toHaveLength(6)
       expect(html.match(/aria-valuetext="Not answered"/g)).toHaveLength(6)
-
-
+      // The track itself must also be neutral. A native accent-colored range
+      // at value 50 still paints a half-filled bar even when its thumb is
+      // hidden, which visually suggests a preselected midpoint.
       expect(html.match(/::-webkit-slider-runnable-track\]:bg-muted/g)).toHaveLength(6)
       expect(html).toContain("appearance-none")
       expect(html).not.toContain("accent-foreground")
@@ -46,8 +48,8 @@ describe("RawTlxForm", () => {
   })
 
   test("keeps Continue unavailable until every dimension is explicitly answered", () => {
-
-
+    // With submitting=false the submit Button is the only element that can
+    // carry the rendered disabled="" attribute.
     const emptyHtml = renderTlx("monitoring", {})
     expect(emptyHtml).toContain("Continue to control workload")
     expect(emptyHtml).toContain('disabled=""')
@@ -60,8 +62,8 @@ describe("RawTlxForm", () => {
   })
 
   test("an explicit midpoint answer is a real answer, distinct from unanswered", () => {
-
-
+    // 50 chosen on purpose must render as answered — the unanswered contract
+    // targets the fake preselected thumb, not the value 50 itself.
     const html = renderTlx("control", { ...FULL_DRAFT, mentalDemand: 50 })
     expect(html).not.toContain("Not answered")
     expect(html.match(/data-answered="true"/g)).toHaveLength(6)
@@ -83,7 +85,8 @@ describe("StudyCompleteSurface", () => {
     expect(withCode).toContain("completion code")
     expect(withCode).toContain("Return to Prolific")
 
-
+    // Without a server-issued code (Guide preview, or a legacy record) there
+    // is no code block and no placeholder that looks like a usable code.
     const withoutCode = renderToStaticMarkup(<StudyCompleteSurface completionCode={null} />)
     expect(withoutCode).not.toContain("SERVER-OWNED-CODE")
     expect(withoutCode).not.toContain("data-completion-code")

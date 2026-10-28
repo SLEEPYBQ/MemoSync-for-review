@@ -3,6 +3,7 @@ import type {
   ExpectedMemoryUse,
   MemoryPreviewDecision,
   StandaloneTranscriptAttachmentMode,
+  StandaloneTranscriptBundle,
 } from "../../../shared/types"
 
 export interface PreviewDemoDecision {
@@ -13,17 +14,26 @@ export interface PreviewDemoDecision {
   prompt?: string
 }
 
-
+/**
+ * Guide-tour rendering of the injection preview card: seed its internal UI
+ * state (pool expanded, prior ask-agent exchanges) and answer the ask box
+ * locally, so the demo card behaves fully without server calls. Absent
+ * outside the guide — live behavior is untouched.
+ */
 export interface PreviewDemoOptions {
   poolExpanded?: boolean
   exchanges?: Array<{ q: string; a: string }>
-
+  /** Canned ask-box reply; its presence switches the card into demo mode. */
   reviseReply: string
-
+  /** Guide-local decision sink. It never points at the participant API. */
   onDecision?: (decision: PreviewDemoDecision) => void
 }
 
-
+/**
+ * Observable seam used by the production preview card in Guide mode. Live
+ * previews return false and continue through their ordinary server handler;
+ * Guide previews consume the decision locally.
+ */
 export function dispatchPreviewDemoDecision(
   options: PreviewDemoOptions | undefined,
   decision: PreviewDemoDecision,
@@ -37,6 +47,7 @@ export interface TranscriptRenderOptions {
   readonly: boolean
   localLinkMode: "open" | "text"
   attachmentMode: "live" | StandaloneTranscriptAttachmentMode
+  textAttachmentPreviews?: StandaloneTranscriptBundle["textAttachmentPreviews"]
   previewDemo?: PreviewDemoOptions
 }
 
@@ -71,7 +82,13 @@ export function useTranscriptRenderOptions() {
   return useContext(TranscriptRenderOptionsContext)
 }
 
-
+/**
+ * The chat/project a transcript is rendered under. Memory review cards need it
+ * to bind a re-scoped candidate to the right project/session on accept —
+ * otherwise a scope change to Project/Session PATCHes without the required id
+ * and the server 400s (BUG MSG-1). Undefined outside a live chat (e.g. the
+ * standalone export viewer), where these controls are not shown.
+ */
 export interface TranscriptChatContextValue {
   chatId?: string
   projectId?: string
@@ -93,7 +110,12 @@ export function useTranscriptChatContext() {
   return useContext(TranscriptChatContext)
 }
 
-
+/**
+ * memory_trace 'violated' verdicts folded back onto reply messages
+ * (messageId → violated memory ids), so inline [M-NN] citation chips can show
+ * the drift AT the sentence — the highest-value monitoring signal must never
+ * sit behind a click. Provided by the transcript; null outside one.
+ */
 const ViolatedCitationsMapContext = createContext<ReadonlyMap<string, ReadonlySet<string>> | null>(null)
 
 export function ViolatedCitationsMapProvider({
@@ -110,7 +132,7 @@ export function useViolatedCitationsMap() {
   return useContext(ViolatedCitationsMapContext)
 }
 
-
+/** The violated ids for the ONE message currently being rendered. */
 const MessageViolatedCitationsContext = createContext<ReadonlySet<string> | null>(null)
 
 export function MessageViolatedCitationsProvider({

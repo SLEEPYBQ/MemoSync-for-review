@@ -1,5 +1,9 @@
-
-
+// Consolidated UI flow check (Playwright, no LLM calls): boots a local
+// serve-demo-style instance on a temp data dir and drives the memory UI —
+// Board search / drag-to-transfer / detail edit / candidate accept, per-item
+// History + rollback, and the session-start Bring-in panel. Asserts against
+// the HTTP API after each interaction and fails on any console error.
+//   bun run scripts/ui-flows-check.ts   (needs: bunx playwright install chromium)
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -7,13 +11,15 @@ import { execSync } from "node:child_process"
 import { chromium } from "playwright"
 import { startMemoSyncServer } from "../src/server/server"
 
-
+// Bun auto-loads .env. This check is intentionally deterministic and must not
+// spend API tokens merely because opening the transfer dialog requests a
+// proposal in production.
 process.env.DEEPSEEK_API_KEY = ""
 
 const outDir = process.argv[2] || join(process.cwd(), "tmp")
 mkdirSync(outDir, { recursive: true })
 
-
+// isolated instance with an opened project (bring-in needs a chat on a project)
 const dataDir = mkdtempSync(join(tmpdir(), "memv2-uiflow-"))
 const workspace = mkdtempSync(join(tmpdir(), "memv2-uiflow-ws-"))
 writeFileSync(join(workspace, "README.md"), "# ui flow demo\n")
@@ -43,7 +49,7 @@ const mProject = await post({
   topic: "Testing",
 })
 const mCandidate = await post({ content: "Prefers pnpm over npm", scope: "project", type: "preference", status: "candidate", projectId: project.id })
-
+// one item with edit history for the rollback flow
 await api(`/api/memories/${mPersonal.id}`, {
   method: "PATCH",
   headers: { "content-type": "application/json" },
@@ -67,11 +73,11 @@ const record = (name: string, pass: boolean, note = "") => {
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${note ? ` — ${note}` : ""}`)
 }
 
-
+// ---------- BOARD ----------
 await page.goto(`${base}/memory`, { waitUntil: "networkidle" })
 await page.waitForTimeout(800)
 
-
+// search filters every lane
 await page.getByPlaceholder(/search/i).fill("MainTests")
 await page.waitForTimeout(400)
 const visibleNonMatchingCards = await page.getByRole("button", { name: /Use fnm instead of nvm/ }).count()
@@ -84,13 +90,16 @@ record(
 await page.getByPlaceholder(/search/i).fill("")
 await page.waitForTimeout(400)
 
-
+// candidate accept from the lane. NOTE: exact:true matters — MemoryCard itself
+// carries role="button" (its accessible name contains "… Accept Edit Dismiss"),
+// so a fuzzy /accept/i .first() matches the CARD, not the inner button.
 await page.getByRole("button", { name: "Accept", exact: true }).first().click()
 await page.waitForTimeout(600)
 const accepted = await api<any[]>(`/api/memories?status=active`)
 record("board: candidate accept persists", accepted.some((m) => m.id === mCandidate.id))
 
-
+// Dragging across a scope boundary now opens the judged Transfer dialog. No
+// scope mutation is allowed until the user confirms the proposal.
 const dragged = await page.evaluate(
   ([id]) => {
     const card = document.querySelector(`[draggable="true"][data-memory-id="${id}"]`) ?? [...document.querySelectorAll('[draggable="true"]')].find((el) => el.textContent?.includes("Use fnm"))
@@ -121,7 +130,8 @@ if (transferOpened) {
   await page.waitForTimeout(300)
 }
 
-
+// detail panel: open + edit content. The panel's content textarea is inline-
+// editable; find it by its CURRENT VALUE (other textareas exist on the page).
 await page.getByText("Only run MainTests before pushing").first().click()
 await page.waitForTimeout(500)
 let editPass = false
@@ -139,7 +149,7 @@ for (let i = 0; i < (await textareas.count()); i++) {
 }
 record("board: detail-panel edit persists", editPass)
 
-
+// ---------- HISTORY + ROLLBACK ----------
 await page.getByRole("button", { name: /Use fnm instead of nvm/ }).first().click()
 await page.waitForTimeout(500)
 const historyTab = page.getByRole("button", { name: /history/i }).first()
@@ -153,7 +163,7 @@ if (await historyTab.count()) {
   if (await rollback.count()) {
     await rollback.click()
     await page.waitForTimeout(300)
-
+    // two-step confirm: second click (same or a confirm-labeled button)
     const confirm = page.getByRole("button", { name: /confirm|roll back/i }).first()
     await confirm.click()
     await page.waitForTimeout(800)
@@ -165,7 +175,8 @@ record("history: timeline renders", historyVisiblePass)
 record("history: two-step rollback appends a revert event", rollbackPass)
 await page.screenshot({ path: join(outDir, "uiflow-board.png") })
 
-
+// ---------- BRING-IN PANEL ----------
+// create a chat over WS, then open its (empty) page
 const ws = new WebSocket(`${base.replace(/^http/, "ws")}/ws`)
 await new Promise<void>((res) => (ws.onopen = () => res()))
 const chatCreated: Promise<any> = new Promise((res) => {
@@ -186,7 +197,7 @@ record("bring-in: panel replaces the empty state", panelVisible)
 
 let pinPass = false
 if (panelVisible) {
-
+  // suggest with an intent, toggle nothing, start with selected
   const intent = page.getByPlaceholder(/working on/i).first()
   if (await intent.count()) {
     await intent.fill("fix the MainTests failure before pushing")
@@ -209,7 +220,7 @@ if (panelVisible) {
 }
 await page.screenshot({ path: join(outDir, "uiflow-bringin.png") })
 
-
+// ---------- WRAP ----------
 record("zero console errors", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "))
 await browser.close()
 await srv.stop()

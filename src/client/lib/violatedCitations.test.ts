@@ -36,13 +36,13 @@ describe("buildViolatedCitationsByMessageId", () => {
 
     expect([...map.get("a1")!]).toEqual(["M-01"])
     expect([...map.get("a2")!]).toEqual(["M-01"])
-
+    // Turn 2 had no violation — its reply carries nothing.
     expect(map.has("a3")).toBe(false)
   })
 
   it("post-tool follow-up turns (no user_prompt between) blame only their own replies", () => {
-
-
+    // Turn A ends at trace t1; turn B is a post-tool continuation — appended
+    // with NO new user_prompt. t2's violation must not red-mark a1.
     const map = buildViolatedCitationsByMessageId([
       user("u1"),
       reply("a1"),

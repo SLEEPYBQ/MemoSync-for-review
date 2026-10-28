@@ -55,7 +55,9 @@ async function ensureContainedDirectory(
       info = await lstat(directoryPath)
     }
 
-
+    // Reject links even when they currently point inside the project: keeping
+    // the upload boundary as real directories avoids link swaps redirecting a
+    // later write or delete.
     if (info.isSymbolicLink() || !info.isDirectory()) {
       return { ok: false, reason: "outside" }
     }
@@ -75,7 +77,7 @@ async function resolveProjectUploadDirectory(localPath: string, create: boolean)
     const projectRoot = await realpath(projectPath)
     if (!(await stat(projectRoot)).isDirectory()) return { ok: false, reason: "missing" }
 
-
+    // getProjectDataDir also migrates a legacy `.kanna` dir on first touch.
     const dataDir = await ensureContainedDirectory(getProjectDataDir(projectPath), projectRoot, create)
     if (!dataDir.ok) return dataDir
     return ensureContainedDirectory(path.join(projectPath, PROJECT_DATA_DIR_NAME, "uploads"), projectRoot, create)
@@ -102,13 +104,17 @@ export async function resolveExistingProjectUpload(
 
 function sanitizeFileName(fileName: string) {
   const baseName = path.basename(fileName).trim()
-
-
+  // Keep Unicode letters/marks/numbers (CJK, accents, etc.) plus . _ -; collapse
+  // everything else to "-". `\w` is ASCII-only, so it erased entire non-Latin
+  // names — "报告.pdf" became ".pdf", a hidden extension-less dotfile whose
+  // Content-Type could not be inferred and which collided with every other
+  // pure-CJK file of the same type (BUG HTTP-2).
   const cleaned = baseName
     .replace(/[^\p{L}\p{M}\p{N}._-]+/gu, "-")
     .replace(/^-+|-+$/g, "")
-
-
+  // A leading dot means the base name collapsed away (e.g. an all-emoji name),
+  // leaving only an extension — path.parse reads ".png" as a dotfile with NO
+  // extension. Give it a real base so the extension (and Content-Type) survives.
   if (!cleaned || cleaned.startsWith(".")) return `upload${cleaned}`
   return cleaned
 }
@@ -138,8 +144,10 @@ export async function persistProjectUpload(args: {
   if (!resolvedUploadDir.ok) {
     throw new Error("Project upload directory is missing or escapes the project root")
   }
-
-
+  // Keep the attachment path in the same lexical form the caller supplied;
+  // the directory tree above has already been verified as real, contained
+  // directories, so writing through this path is safe without changing the
+  // public absolutePath shape (for example /var vs /private/var on macOS).
   const uploadDir = getProjectUploadDir(args.localPath)
 
   const detectedType = await fileTypeFromBuffer(args.bytes)

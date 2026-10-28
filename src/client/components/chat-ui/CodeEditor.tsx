@@ -1,5 +1,7 @@
-
-
+// CodeMirror-based code editor for the Files panel. One instance per file —
+// parents key the component by file path so switching files remounts with a
+// fresh undo history. Language is resolved from the file name and lazy-loaded
+// (vite splits each grammar into its own chunk via @codemirror/language-data).
 import { useEffect, useMemo, useRef } from "react"
 import { EditorState, Compartment, Prec } from "@codemirror/state"
 import {
@@ -21,13 +23,15 @@ interface CodeEditorProps {
   initialValue: string
   readOnly?: boolean
   onChange?: (doc: string) => void
-
+  /** Invoked on Mod-S. Return true when handled (always preventDefaults). */
   onSave?: () => void
-
+  /** Scroll to and select a 1-based line; bump `nonce` to re-trigger. */
   reveal?: { line: number; nonce: number }
 }
 
-
+// Palette follows GitHub's light theme (the app is light-locked); the chrome
+// (background, gutter) inherits the app CSS variables instead so the editor
+// blends in without hardcoding surface colors.
 const lightHighlight = HighlightStyle.define([
   { tag: [t.keyword, t.modifier, t.operatorKeyword], color: "#cf222e" },
   { tag: [t.string, t.special(t.string), t.inserted], color: "#0a3069" },
@@ -83,7 +87,7 @@ const chromeTheme = EditorView.theme({
   ".cm-selectionMatch": { backgroundColor: "hsl(var(--primary) / 0.12)" },
 })
 
-
+/** Resolve the CodeMirror language for a file name (null → plain text). */
 export function matchEditorLanguage(fileName: string): LanguageDescription | null {
   return LanguageDescription.matchFilename(languages, fileName)
 }
@@ -92,7 +96,7 @@ export function CodeEditor({ fileName, initialValue, readOnly = false, onChange,
   const containerRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
 
-
+  // Refs keep the callbacks fresh without rebuilding editor extensions.
   const onChangeRef = useRef(onChange)
   onChangeRef.current = onChange
   const onSaveRef = useRef(onSave)
@@ -122,8 +126,8 @@ export function CodeEditor({ fileName, initialValue, readOnly = false, onChange,
         bracketMatching(),
         closeBrackets(),
         highlightSelectionMatches(),
-
-
+        // Wrap long lines like Codex does — in a side panel, horizontal
+        // scrolling reads as clipped content (macOS hides idle scrollbars).
         EditorView.lineWrapping,
         Prec.high(
           keymap.of([
@@ -166,8 +170,9 @@ export function CodeEditor({ fileName, initialValue, readOnly = false, onChange,
       viewRef.current = null
       view.destroy()
     }
-
-
+    // Recreated only per file (parent keys this component by path); initial
+    // doc changes for the same file are handled by CodeMirror itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileName, compartments])
 
   useEffect(() => {

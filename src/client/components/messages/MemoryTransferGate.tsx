@@ -1,5 +1,18 @@
-
-
+// The Transfer card (Transfer design 2026-08-08; pipeline form follows the
+// user's own five-station figure, 2026-08-09). Memories from OUTSIDE this
+// conversation's context — other projects or other chats of this project —
+// suggested for bringing in.
+//
+// Each suggestion is the figure, miniaturized:
+//   source card (its scope's color) → Encoder machine → abstract-rule card
+//   (amber, with derived-from / applicability tags) → Decoder machine →
+//   localized card (the landing scope's color, switching live with the
+//   picker).
+// The concrete VALUES the encoder stripped and the decoder bound render as
+// monospace chips inside the texts — compare the chips across the two cards
+// and the transformation is visible without reading the sentence twice.
+// Rows stream in as current-task Decode/landing completes; a complete row
+// renders complete (no staged replay — it read as slowness).
 import { useState } from "react"
 import {
   ArrowDownToLine,
@@ -47,13 +60,13 @@ interface Props {
   onRespond: (transferId: string, decision: "handled" | "skipped") => Promise<void> | void
   canReopen?: boolean
   onReopen?: () => Promise<void> | void
-
+  /** Position in this turn's flow (the checkup renumbers itself after us). */
   stepNumber?: number
   surface?: MemoryControlSurface
   boardResolution?: MemoryBoardActionContext
-
+  /** Session-start Board: every resurfaced row must be handled before leaving. */
   requireAllRows?: boolean
-
+  /** Shared when the same active gate is expanded in the Memory Board. */
   settledRows?: ReadonlyMap<string, string>
   onSuggestionSettled?: (sourceId: string, outcome: string) => void
 }
@@ -70,7 +83,8 @@ const SCOPE_ICONS = { session: MessagesSquare, project: FolderGit2, personal: Us
 export const MEMORY_TRANSFER_HELP_COPY =
   "These are memories saved in other projects or conversations that could help here. The Encoder removes source-specific details and the Decoder adapts the rule to this project. Bring in saves the result to the Visible Memory Pool. Before Claude starts, the Working Memory review decides whether that saved memory is focused for this turn."
 
-
+/** Both memory cards wear their scope's color — the same three hues the
+ * MemoSync icon fans out. The localized card switches live with the picker. */
 const SCOPE_CARD_TINT: Record<MemoryScope, string> = {
   session: "border-session-border bg-session-surface",
   project: "border-project-border bg-project-surface",
@@ -79,7 +93,9 @@ const SCOPE_CARD_TINT: Record<MemoryScope, string> = {
 
 const HEX_COLOR_RE = /#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b/g
 
-
+/** Inline color swatches for hex values in memory text — a palette you can
+ * SEE beats one you have to imagine. Tiny enough that no library earns its
+ * dependency here. */
 function ColorizedText({ text }: { text: string }) {
   const parts: React.ReactNode[] = []
   let last = 0
@@ -102,7 +118,9 @@ function ColorizedText({ text }: { text: string }) {
   return <>{parts}</>
 }
 
-
+/** Every verbatim occurrence of `marks` inside `text`, merged when they
+ * overlap. Marks are short concrete VALUES (enforced server-side) and render
+ * as monospace chips — the user's figure's vocabulary. */
 function segmentByMarks(text: string, marks: string[] | undefined): Array<{ text: string; marked: boolean }> {
   if (!marks?.length) return [{ text, marked: false }]
   const intervals: Array<[number, number]> = []
@@ -161,10 +179,17 @@ function StageLabel({ icon: IconCmp, children }: { icon: typeof Lightbulb; child
   )
 }
 
-
+/**
+ * Encoder / Decoder as visible machines (the user's figure): violet funnels —
+ * the encoder narrows rightward (compressing away the source-local), the
+ * decoder widens rightward (re-binding into the target). On narrow screens
+ * they become small inline badges between the stacked cards.
+ */
 function StageMachine({ name, hint, expand }: { name: string; hint: string; expand?: boolean }) {
-
-
+  // Rounded funnel: the polygon is drawn inset and fattened by a same-color
+  // stroke with round joins — clip-path corners cannot round, a stroked SVG
+  // path can. Encoder narrows rightward (compressing), decoder widens
+  // (re-binding).
   const points = expand ? "8,26 48,10 48,86 8,70" : "8,10 48,26 48,70 8,86"
   return (
     <>
@@ -224,7 +249,8 @@ export function MemoryTransferGate({
     )
   }
 
-
+  // A visible search that found nothing settles into one quiet line. A task
+  // that completes empty before presentation never publishes a card at all.
   if (message.decision === "empty" || (!message.pending && suggestions.length === 0 && !message.decision)) {
     if (!message.pending && suggestions.length === 0 && message.decision === undefined) return null
     return (
@@ -235,7 +261,7 @@ export function MemoryTransferGate({
     )
   }
 
-
+  // "empty" already returned above — TS narrows the record lookup below.
   if (message.decision) {
     const mayReopen = canReopen && onReopen && (message.decision === "handled" || message.decision === "skipped")
     return (
@@ -257,7 +283,8 @@ export function MemoryTransferGate({
     )
   }
 
-
+  // Historical widening rows predate the retired feature. They are receipts,
+  // not pending choices, so an old open gate can still Continue safely.
   const pendingCount = suggestions.filter((s) => !s.widening && !effectiveSettledRows.has(s.sourceId)).length
 
   async function settle(decision: "handled" | "skipped") {
@@ -368,7 +395,8 @@ function LegacyWideningReceipt({ suggestion }: { suggestion: MemoryTransferSugge
   )
 }
 
-
+/** Keep the transcript-snapshot CAS fields explicit and testable. The same
+ * payload protects both a live chat gate and its later Board resurfacing. */
 export function buildAutomaticTransferCommitBody(input: {
   suggestion: MemoryTransferSuggestionSnapshot
   scope: MemoryScope
@@ -378,6 +406,7 @@ export function buildAutomaticTransferCommitBody(input: {
 }): Parameters<typeof memoriesApi.transfer>[1] {
   const { suggestion, scope, projectId, chatId } = input
   const content = input.content.trim()
+  const landing = scope === (suggestion.suggestedScope ?? "project") ? suggestion.landing : undefined
   return {
     sourceVersion: suggestion.sourceVersion,
     targetScope: scope,
@@ -389,9 +418,9 @@ export function buildAutomaticTransferCommitBody(input: {
     abstractionLevel: suggestion.abstractionLevel ?? "contextual",
     verdict: "rewrite",
     edited: content !== suggestion.content,
-    landingRoute: suggestion.landing?.route,
-    landingTargetId: suggestion.landing?.targetId,
-    landingTargetVersion: suggestion.landing?.targetVersion,
+    landingRoute: landing?.route ?? "new",
+    landingTargetId: landing?.targetId,
+    landingTargetVersion: landing?.targetVersion,
     rule: suggestion.rule,
     applicability: suggestion.applicability,
   }
@@ -420,11 +449,12 @@ function TransferSuggestionRow({
   const [busy, setBusy] = useState<"accept" | "decline" | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-
+  // The decode half streams in AFTER first render on live rows: the picker
+  // and the text adopt it when it lands, unless the user already intervened.
   const scope: MemoryScope = scopeChoice ?? suggestion.suggestedScope ?? "project"
   const content = contentDraft ?? suggestion.content ?? ""
   const decoded = Boolean(suggestion.content !== undefined && suggestion.landing)
-  const landing = suggestion.landing
+  const landing = scope === (suggestion.suggestedScope ?? "project") ? suggestion.landing : undefined
   const reinforcing = landing?.route === "reinforces"
   const SourceIcon = SCOPE_ICONS[suggestion.sourceScope] ?? MessagesSquare
   const acceptLabel = reinforcing ? "Reinforce" : "Bring in"
@@ -486,7 +516,9 @@ function TransferSuggestionRow({
   return (
     <div className="py-3">
       <div className="grid grid-cols-1 items-stretch gap-1.5 sm:grid-cols-[1fr_56px_1.15fr_56px_1.05fr]">
-
+        {/* Station 1 — the source, wearing ITS scope's color. Stripped
+            values render as chips: compare them with the last card's chips
+            and the move is visible. */}
         <RiseIn freshAt={freshAt} delay={0} className="flex min-w-0 flex-col">
           <StageLabel icon={SourceIcon}>
             <span className="truncate">Source · {suggestion.sourceLabel}</span>
@@ -506,12 +538,15 @@ function TransferSuggestionRow({
           </div>
         </RiseIn>
 
-
+        {/* flex: the machine column must track the ROW height (self-stretch
+            inside), or the funnel centers on its own min-height and drifts
+            upward next to a tall source card. */}
         <RiseIn freshAt={freshAt} delay={0.12} className="flex">
           <StageMachine name="Encoder" hint="Removes source-specific details and extracts the stable idea." />
         </RiseIn>
 
-
+        {/* Station 3 — the abstract representation: a card of its own kind
+            (amber = metadata, never a memory item). */}
         <RiseIn freshAt={freshAt} delay={0.24} className="flex min-w-0 flex-col">
           <StageLabel icon={Lightbulb}>Abstract rule</StageLabel>
           <div className="flex flex-1 flex-col rounded-lg border border-amber-500/35 bg-amber-500/[0.07] p-2.5">
@@ -534,7 +569,8 @@ function TransferSuggestionRow({
           <StageMachine name="Decoder" hint="Adapts the abstract rule to this project's structure and task." expand />
         </RiseIn>
 
-
+        {/* Station 5 — the localized memory, wearing the LANDING scope's
+            color (switches live with the picker below). Bound values chip. */}
         <RiseIn freshAt={freshAt} delay={0.48} className="flex min-w-0 flex-col">
           <StageLabel icon={Target}>In this project</StageLabel>
           <div
@@ -568,7 +604,8 @@ function TransferSuggestionRow({
 
       <LandingNote landing={landing} />
 
-
+      {/* One footer row: the landing picker left, the actions right. The
+          scope's consequence lives in each segment's title. */}
       <div className="mt-2 flex flex-wrap items-center gap-2">
         {reinforcing || !decoded ? null : (
           <>

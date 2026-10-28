@@ -1,5 +1,13 @@
-
-
+// Automatic cross-context Transfer is deliberately split into two stages:
+//
+//   turn end: source memory + stable source profile -> portable generic rule
+//   next send: current task + recent context -> relevance -> decode/landing
+//
+// Only the source-side rule is reused between prompts. Relevance and landing
+// are task-local and must be recomputed for every send. These prepared rules
+// are process-local temporary intermediate results; they are unrelated to a
+// provider/API prompt cache.
+import { memoryTransferSchema } from './branch-schemas';
 import type { LlmJsonCaller } from './deepseek';
 import type { MemoryService } from './index';
 import type { SessionClockEntry } from './maintenance';
@@ -17,7 +25,8 @@ export interface TransferSuggestionProgress {
   decoding?: TransferDecoding;
 }
 
-
+/** Source fields are a snapshot. The automatic card threads sourceVersion to
+ * the commit route, where a final active/version CAS protects the write. */
 export interface TransferSuggestionCard extends TransferSuggestionProgress {
   encoding: TransferEncoding;
   decoding: TransferDecoding;
@@ -30,17 +39,17 @@ export interface TransferSourceContext {
 }
 
 export interface TransferTaskContext extends TransferSourceContext {
-
+  /** The new prompt. It is never folded into the reusable source rule. */
   taskText: string;
-
+  /** Prior turns only; taskText is supplied separately. */
   recentContext?: string;
 }
 
 export interface TransferTaskResult {
   cards: TransferSuggestionCard[];
-
+  /** Task-local relevance selection, retained even if one Decode fails. */
   selectedSourceIds?: string[];
-
+  /** Content-bearing target snapshot used for these landing judgments. */
   targetKey: string;
 }
 
@@ -49,35 +58,35 @@ export interface TransferTaskOptions {
 }
 
 export interface TransferDetectService {
-
-  buildTaskBranchPrompt?(ctx: TransferTaskContext): { prompt: string; dependencyKey: string };
-
+  /** Full Encode/relevance/Decode prompt, with no preparation sidecars. */
+  buildTaskBranchPrompt?(ctx: TransferTaskContext): { prompt: string; dependencyKey: string; schema?: Record<string, unknown>; deltaSchema?: Record<string, unknown>; constraints?: string };
+  /** Validate full branch proposals against the exact source and target snapshot. */
   materializeTaskFromBranch?(ctx: TransferTaskContext, raw: Record<string, unknown>, dependencyKey: string): Promise<TransferTaskResult | null>;
-
-
+  /** Synchronous shelf probe used only to decide whether a slow cold-start
+   * preparation should render a scanning shell. It performs no LLM work. */
   hasSourceCandidates(ctx: TransferSourceContext): boolean;
-
-
+  /** Encode every currently eligible external source whose source version or
+   * stable source profile changed. Concurrent callers share the same work. */
   prepareSources(ctx: TransferSourceContext): Promise<void>;
-
+  /** Current-task relevance question over already-prepared portable rules. */
   buildTaskForkPrompt(ctx: TransferTaskContext): string | null;
-
-
+  /** Validate a current-session fork reply and decode its relevant rules.
+   * null means the reply was not a valid relevance answer and must fall back. */
   materializeTaskFromFork(
     ctx: TransferTaskContext,
     raw: Record<string, unknown>,
     opts?: TransferTaskOptions,
   ): Promise<TransferTaskResult | null>;
-
+  /** Sidecar relevance fallback for this prompt, followed by Decode/landing. */
   runTask(ctx: TransferTaskContext, opts?: TransferTaskOptions): Promise<TransferTaskResult>;
-
-
+  /** Candidate review may mutate the target pool while relevance is running.
+   * Re-decode the same selection only when that target snapshot changed. */
   refreshLandingsIfTargetChanged(
     ctx: TransferTaskContext,
     result: TransferTaskResult,
     opts?: TransferTaskOptions,
   ): Promise<TransferTaskResult>;
-
+  /** True when progressive rows were decoded against the current target. */
   landingsStillCurrent(ctx: TransferTaskContext, targetKey: string): boolean;
 }
 
@@ -90,7 +99,7 @@ const QUERY_TIMEOUT_MS = 60_000;
 const PREPARED_MAX_ENTRIES = 100;
 const MAX_CONCURRENT_SOURCE_ENCODINGS = 4;
 
-
+/** "Not this one" suppresses a source only for this destination context. */
 export const TRANSFER_DECLINED_PREFIX = 'transfer_declined:';
 
 const TASK_RELEVANCE_SYSTEM = `You select portable agent-memory rules that are relevant to the developer's current task. \
@@ -144,8 +153,8 @@ export function createTransferDetectService(opts: TransferDetectOptions): Transf
     if (activeSourceEncodings < MAX_CONCURRENT_SOURCE_ENCODINGS) {
       activeSourceEncodings += 1;
     } else {
-
-
+      // A completed caller transfers its occupied slot directly to this
+      // waiter, so a new caller cannot steal the gap between wake and resume.
       await new Promise<void>((resolve) => sourceEncodingWaiters.push(resolve));
     }
     try {
@@ -160,7 +169,8 @@ export function createTransferDetectService(opts: TransferDetectOptions): Transf
   const declined = (item: MemoryItem, ctx: TransferSourceContext) =>
     Boolean(memory.store.getKv(`${TRANSFER_DECLINED_PREFIX}${item.id}:${ctx.projectId ?? ctx.sessionId ?? ''}`));
 
-
+  /** The two automatic shelves. Current-session/current-project memories are
+   * intentionally absent because they are already in the visible pool. */
   function sourceCandidates(ctx: TransferSourceContext, respectDeclines: boolean): SourceCandidate[] {
     const candidates: SourceCandidate[] = [];
     for (const session of listRecentSessions(ctx.projectId, ctx.sessionId)) {
@@ -197,7 +207,8 @@ export function createTransferDetectService(opts: TransferDetectOptions): Transf
     return candidates;
   }
 
-
+  /** The source profile is deterministic and excludes usage/reinforcement
+   * counters. Those volatile evidence counters must never invalidate Encode. */
   function profileOf(ctx: TransferSourceContext, candidate: SourceCandidate): SourceProfile {
     const sourceSessionId = candidate.sourceSessionId;
     const sourceProjectId = candidate.sourceProjectId;
@@ -248,7 +259,7 @@ export function createTransferDetectService(opts: TransferDetectOptions): Transf
           representative: profile.representative,
         }),
       );
-
+      // Do not publish a result whose source/profile changed while Encode ran.
       const currentItem = memory.store.getById(candidate.item.id);
       if (!currentItem || currentItem.status !== 'active' || currentItem.version !== candidate.item.version) return;
       const currentCandidate: SourceCandidate = {
@@ -278,8 +289,8 @@ export function createTransferDetectService(opts: TransferDetectOptions): Transf
   }
 
   async function prepareSources(ctx: TransferSourceContext): Promise<void> {
-
-
+    // One failed source must not sink the other prepared rules. A later send
+    // or turn-end pass retries it because no completed result was stored.
     await Promise.all(sourceCandidates(ctx, true).map((candidate) => prepareOne(ctx, candidate).catch(() => {})));
   }
 
@@ -390,7 +401,7 @@ export function createTransferDetectService(opts: TransferDetectOptions): Transf
       selected.map(async (source, index) => {
         const row = rows[index]!;
         try {
-
+          // Re-check source active/version immediately before spending Decode.
           const live = memory.store.getById(source.sourceId);
           if (!live || live.status !== 'active' || live.version !== source.sourceVersion) throw new Error('stale source');
           const decoding = await transfer.decode(source.encoding, {
@@ -403,8 +414,9 @@ export function createTransferDetectService(opts: TransferDetectOptions): Transf
             taskText: ctx.taskText,
             recentContext: ctx.recentContext,
           });
-
-
+          // Decode is task-local and may outlive a concurrent source edit.
+          // Revalidate before exposing the completed row through progress or
+          // the final card; the route CAS remains the last write-time guard.
           const afterDecode = memory.store.getById(source.sourceId);
           if (!afterDecode || afterDecode.status !== 'active' || afterDecode.version !== source.sourceVersion) {
             throw new Error('stale source');
@@ -426,7 +438,14 @@ export function createTransferDetectService(opts: TransferDetectOptions): Transf
   return {
     buildTaskBranchPrompt(ctx) {
       const snapshot = branchSnapshot(ctx);
-      return { prompt: buildTransferBranchPrompt(snapshot.input), dependencyKey: snapshot.key };
+      const sources = snapshot.input.sources.map(source => ({ sourceId: source.item.id, sourceVersion: source.item.version }));
+      return {
+        prompt: buildTransferBranchPrompt(snapshot.input), dependencyKey: snapshot.key,
+        schema: memoryTransferSchema(sources), deltaSchema: memoryTransferSchema(sources, true),
+        constraints: sources.length
+          ? `Only these source snapshots may be transferred: ${JSON.stringify(sources)}. The task and target store are not additional sources.`
+          : 'The source snapshot is EMPTY. There are no transferable sources, including after target-store review. Return empty suggestions for initial analysis. For review deltas return {"upsert":{"suggestions":[]},"remove":{"suggestions":[]}}. Do not infer a source from the task, target store, examples, or earlier invalid replies. Call StructuredOutput directly if available; do not read files.',
+      };
     },
 
     async materializeTaskFromBranch(ctx, raw, dependencyKey) {

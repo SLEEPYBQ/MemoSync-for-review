@@ -1,5 +1,9 @@
-
-
+// Theme is locked to light across ALL study arms (user decision 2026-08-09):
+// every participant sees the identical appearance — no dark mode, no system
+// preference, no settings control. The provider/hook API survives so the
+// consumers that branch on resolvedTheme (editor, terminal, export) keep one
+// code path; they simply always resolve light. A legacy `theme` value in
+// stored app settings is ignored.
 import { createContext, useContext, useEffect, type ReactNode } from "react"
 
 export type ThemePreference = "light"

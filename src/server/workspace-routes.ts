@@ -1,13 +1,13 @@
-
-
+// Workspace metadata + file APIs for client surfaces that live outside a
+// chat's ws state (Memory Board origin labels, the Files workbench panel):
+// listing, recursive index, content search, and file operations
+// (create/mkdir/rename/delete). Same `{ data } / { error }` envelope as the
+// memory routes.
 import { existsSync } from "node:fs"
 import type { Dirent } from "node:fs"
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { resolveExistingPathWithinRoot } from "./paths"
-import { STATIC_MEMORY_FILENAME } from "./memory/static-files"
-import { resolveConditionPolicy } from "./experiment/condition"
-import type { ExperimentLogger } from "./experiment/logger"
 import type { StudyProjectAccess } from "./study-project-access"
 
 interface ProjectLike {
@@ -35,99 +35,10 @@ export interface WorkspaceFileEntry {
 }
 
 export interface WorkspaceRouteOptions {
-
+  /** Atomic study boundary: returns a release callback, or null once freeze starts. */
   beginStudyMemoryMutation?: () => (() => void) | null
-
-  experimentLogger?: Pick<ExperimentLogger, "event">
-
-  getActiveStudyTaskId?: () => string | null
-
+  /** Present only in study mode: gates project-scoped writes, never reads. */
   studyProjectAccess?: StudyProjectAccess
-}
-
-class StaticEditOperationError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-  ) {
-    super(message)
-  }
-}
-
-export async function runDurableStaticEditOperation<T>(input: {
-  logger?: Pick<ExperimentLogger, "event">
-  taskId: string | null
-  operationId?: string
-  chatId?: string
-  projectId: string
-  path: string
-  durationMs?: number
-  run: () => T | Promise<T>
-}): Promise<T> {
-  const operationId = input.operationId?.trim()
-  if (!input.logger || !input.taskId || !operationId) {
-    const result = await input.run()
-    input.logger?.event({
-      type: "memory.static_edit",
-      ...(operationId ? { eventId: operationId } : {}),
-      ...(input.chatId ? { sessionId: input.chatId } : {}),
-      projectId: input.projectId,
-      path: input.path,
-      ...(input.durationMs === undefined ? {} : { durationMs: input.durationMs }),
-    })
-    return result
-  }
-  const base = {
-    type: "study.control_operation" as const,
-    operationId,
-    taskId: input.taskId,
-    sessionId: input.taskId,
-    ...(input.chatId ? { chatId: input.chatId } : {}),
-    surface: "static_memory" as const,
-    action: "edit",
-    controlType: "static_edit" as const,
-    payload: {
-      projectId: input.projectId,
-      path: input.path,
-      durationMs: input.durationMs ?? null,
-    },
-  }
-  const attempted = input.logger.event({ ...base, phase: "attempted" })
-  if (
-    attempted !== null
-    && typeof attempted === "object"
-    && "durableCreated" in attempted
-    && attempted.durableCreated === false
-  ) {
-    throw new StaticEditOperationError(
-      409,
-      "OPERATION_ALREADY_RECORDED",
-      "This Static memory edit was already recorded. Refresh to recover its current outcome.",
-    )
-  }
-  let result: T
-  try {
-    result = await input.run()
-  } catch (error) {
-    try {
-      input.logger.event({
-        ...base,
-        phase: "failed",
-        errorClass: error instanceof Error ? error.constructor.name : typeof error,
-      })
-    } catch {
-
-    }
-    throw error
-  }
-  try {
-    input.logger.event({ ...base, phase: "completed" })
-  } catch {
-
-
-  }
-  return result
 }
 
 const ok = <T>(data: T): Response => Response.json({ data })
@@ -138,11 +49,10 @@ const FILES_RE = /^\/api\/projects\/([^/]+)\/files$/
 const FILE_INDEX_RE = /^\/api\/projects\/([^/]+)\/files\/index$/
 const FILE_SEARCH_RE = /^\/api\/projects\/([^/]+)\/files\/search$/
 const FILE_OP_RE = /^\/api\/projects\/([^/]+)\/files\/op$/
-const MEMORY_FILE_RE = /^\/api\/projects\/([^/]+)\/memory-file$/
+const MEMORY_FILE_RE = /^\/api\/projects\/[^/]+\/memory-file$/
 
-const MEMORY_FILE_MAX_BYTES = 256 * 1024
-
-
+/** Directories skipped by the recursive file index (filter/quick-open only —
+ * the lazy per-directory tree still lists them like any other folder). */
 const INDEX_IGNORED_DIRS = new Set([
   "node_modules", ".git", "dist", "build", "out", ".next", ".nuxt", ".cache",
   ".turbo", "coverage", "__pycache__", ".venv", "venv", "target", ".DS_Store",
@@ -150,7 +60,7 @@ const INDEX_IGNORED_DIRS = new Set([
 const INDEX_MAX_FILES = 8000
 const INDEX_MAX_DEPTH = 16
 
-
+/** Walk the workspace and collect relative file paths for the filter box. */
 async function collectFileIndex(root: string): Promise<{ files: string[]; truncated: boolean }> {
   const files: string[] = []
   let truncated = false
@@ -189,13 +99,13 @@ const SEARCH_MAX_FILE_BYTES = 512 * 1024
 export interface ContentSearchMatch {
   path: string
   line: number
-
+  /** The matching line, trimmed, capped at 200 chars. */
   text: string
-
+  /** 0-based column of the first hit inside `text`. */
   col: number
 }
 
-
+/** Case-insensitive substring search across indexed workspace files. */
 async function searchFileContents(root: string, query: string): Promise<{ results: ContentSearchMatch[]; truncated: boolean }> {
   const needle = query.toLowerCase()
   const { files, truncated: indexTruncated } = await collectFileIndex(root)
@@ -210,7 +120,7 @@ async function searchFileContents(root: string, query: string): Promise<{ result
     try {
       if ((await stat(abs)).size > SEARCH_MAX_FILE_BYTES) continue
       const content = await Bun.file(abs).text()
-
+      // Cheap binary sniff: NUL almost never appears in text files.
       if (content.includes("\0")) continue
       let perFile = 0
       const lines = content.split("\n")
@@ -231,7 +141,7 @@ async function searchFileContents(root: string, query: string): Promise<{ result
         }
       }
     } catch {
-
+      // Unreadable file (permissions, raced deletion) — skip it.
     }
   }
   return { results, truncated }
@@ -241,7 +151,11 @@ type TargetPathResult =
   | { ok: true; path: string; exists: boolean }
   | { ok: false; reason: "outside" | "invalid" }
 
-
+/**
+ * Resolve a possibly-not-yet-existing relative path without lexical traversal
+ * or symlink escape: the deepest existing ancestor's realpath must stay inside
+ * the (realpathed) root.
+ */
 async function resolveTargetPathWithinRoot(rootPath: string, rel: string): Promise<TargetPathResult> {
   const normalized = path.posix.normalize(rel.replaceAll("\\", "/"))
   if (!normalized || normalized === "." || normalized.startsWith("../") || normalized.includes("/../") || path.posix.isAbsolute(normalized)) {
@@ -315,7 +229,12 @@ async function handleFileOp(req: Request, localPath: string): Promise<Response> 
   return fail(400, "BAD_REQUEST", "unknown op")
 }
 
-
+/**
+ * Handle `/api/projects`, `/api/chats`, `/api/projects/:id/files?dir=rel`,
+ * `/api/projects/:id/files/index`, `/api/projects/:id/files/search?q=` and
+ * `POST /api/projects/:id/files/op`. Returns null when the path is not ours
+ * (caller falls through).
+ */
 export async function handleWorkspaceRequest(
   req: Request,
   url: URL,
@@ -327,105 +246,11 @@ export async function handleWorkspaceRequest(
   const indexMatch = pathname.match(FILE_INDEX_RE)
   const searchMatch = pathname.match(FILE_SEARCH_RE)
   const opMatch = pathname.match(FILE_OP_RE)
-  const memoryFileMatch = pathname.match(MEMORY_FILE_RE)
-  if (pathname !== "/api/projects" && pathname !== "/api/chats" && !filesMatch && !indexMatch && !searchMatch && !opMatch && !memoryFileMatch) {
+  if (pathname !== "/api/projects" && pathname !== "/api/chats" && !filesMatch && !indexMatch && !searchMatch && !opMatch && !MEMORY_FILE_RE.test(pathname)) {
     return null
   }
 
-
-  if (memoryFileMatch) {
-    if (resolveConditionPolicy().condition !== "static") {
-      return fail(404, "NOT_AVAILABLE", "the memory file surface only exists in the 'static' condition")
-    }
-    const project = store.getProject(decodeURIComponent(memoryFileMatch[1]))
-    if (!project) return fail(404, "NOT_FOUND", "unknown project")
-    const abs = path.join(project.localPath, STATIC_MEMORY_FILENAME)
-
-    if (req.method === "GET") {
-      try {
-        const [content, s] = await Promise.all([readFile(abs, "utf8"), stat(abs)])
-        return ok({ path: STATIC_MEMORY_FILENAME, content, mtimeMs: s.mtimeMs, exists: true })
-      } catch {
-        return ok({ path: STATIC_MEMORY_FILENAME, content: "", mtimeMs: 0, exists: false })
-      }
-    }
-    if (req.method === "PUT") {
-      const projectId = decodeURIComponent(memoryFileMatch[1])
-      const projectRefusal = options.studyProjectAccess?.projectRefusal(projectId)
-      if (projectRefusal) return fail(409, "STUDY_PROJECT_LOCKED", projectRefusal)
-      const release = options.beginStudyMemoryMutation?.()
-      if (options.beginStudyMemoryMutation && !release) {
-        return fail(409, "STUDY_FROZEN", "The current session is ending. Memory can no longer be changed.")
-      }
-      try {
-        let body: { content?: string; baseMtimeMs?: number; sessionId?: string; editDurationMs?: number; eventId?: string }
-        try {
-          body = (await req.json()) as typeof body
-        } catch {
-          return fail(400, "BAD_REQUEST", "invalid JSON body")
-        }
-        if (typeof body.content !== "string") return fail(400, "BAD_REQUEST", "content must be a string")
-        if (Buffer.byteLength(body.content, "utf8") > MEMORY_FILE_MAX_BYTES) {
-          return fail(413, "TOO_LARGE", "memory file exceeds 256 KB")
-        }
-        if (typeof body.baseMtimeMs === "number") {
-          try {
-            const s = await stat(abs)
-            if (Math.abs(s.mtimeMs - body.baseMtimeMs) > 1) {
-              return fail(409, "CONFLICT", "the file changed since you loaded it — reload before saving")
-            }
-          } catch {
-
-
-          }
-        }
-        let previousContent = ""
-        try {
-          previousContent = await readFile(abs, "utf8")
-        } catch {
-
-        }
-        const changed = body.content !== previousContent
-          || (typeof body.eventId === "string" && Boolean(body.eventId.trim()))
-        const activeTaskId = options.getActiveStudyTaskId?.() ?? null
-        const operationId = typeof body.eventId === "string" && body.eventId.trim() ? body.eventId.trim() : undefined
-        if (changed && activeTaskId && !operationId) {
-          return fail(400, "EVENT_ID_REQUIRED", "A durable Static edit operationId is required during the study")
-        }
-        const durationMs = typeof body.editDurationMs === "number"
-          && Number.isFinite(body.editDurationMs)
-          && body.editDurationMs >= 0
-          ? Math.round(body.editDurationMs)
-          : undefined
-        const writeAndStat = async () => {
-          await mkdir(path.dirname(abs), { recursive: true })
-          await writeFile(abs, body.content!, "utf8")
-          return stat(abs)
-        }
-        try {
-          const s = changed
-            ? await runDurableStaticEditOperation({
-                logger: options.experimentLogger,
-                taskId: activeTaskId,
-                operationId,
-                chatId: typeof body.sessionId === "string" ? body.sessionId : undefined,
-                projectId: project.id,
-                path: STATIC_MEMORY_FILENAME,
-                durationMs,
-                run: writeAndStat,
-              })
-            : await writeAndStat()
-          return ok({ path: STATIC_MEMORY_FILENAME, mtimeMs: s.mtimeMs })
-        } catch (error) {
-          if (error instanceof StaticEditOperationError) return fail(error.status, error.code, error.message)
-          return fail(500, "STATIC_EDIT_FAILED", "Failed to save Static memory")
-        }
-      } finally {
-        release?.()
-      }
-    }
-    return fail(405, "METHOD_NOT_ALLOWED", "use GET or PUT")
-  }
+  if (MEMORY_FILE_RE.test(pathname)) return fail(404, "NOT_FOUND", "route not found")
 
   if (opMatch) {
     if (req.method !== "POST") return fail(405, "METHOD_NOT_ALLOWED", "use POST")

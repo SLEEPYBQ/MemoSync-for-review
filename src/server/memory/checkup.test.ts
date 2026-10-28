@@ -6,7 +6,10 @@ import { MemoryService } from './index';
 import { createCheckupService } from './checkup';
 import type { DeepSeekJsonRequest, LlmJsonCaller } from './deepseek';
 
-
+/**
+ * A caller that dispatches on the system prompt (the four queries run in
+ * parallel — queue order would be nondeterministic). Records every request.
+ */
 function routedCaller(routes: Array<{ match: string; response: Record<string, unknown> | (() => Record<string, unknown>) }>) {
   const calls: DeepSeekJsonRequest[] = [];
   const call: LlmJsonCaller = async (req) => {
@@ -38,7 +41,7 @@ describe('createCheckupService (step-one container 2, redesign 2026-08-07)', () 
     const b = memory.store.create({ content: 'Commit messages in English', scope: 'personal', type: 'constraint' }, { actor: 'system' });
     const c = memory.store.create({ content: 'Use bun for scripts', scope: 'personal', type: 'constraint' }, { actor: 'system' });
     const d = memory.store.create({ content: 'Scripts run with bun', scope: 'personal', type: 'constraint' }, { actor: 'system' });
-
+    // d/c already acknowledged as "keep both" — must not be re-flagged.
     memory.store.addRelation(c.id, d.id, 'similar_to');
 
     const { call, calls } = routedCaller([
@@ -60,12 +63,39 @@ describe('createCheckupService (step-one container 2, redesign 2026-08-07)', () 
 
     const result = await checkup.run({});
     expect(result.cached).toBe(false);
-
+    // Conflict pair survives; hallucinated id and the related pair are dropped.
     expect(result.suggestions).toEqual([
       { kind: 'conflict', memoryId: a.id, otherMemoryId: b.id, reason: 'opposite commit-language rules' },
     ]);
-
+    // No quiet items and no promotable items → only the two pair queries ran.
     expect(calls).toHaveLength(2);
+  });
+
+  it('only offers same-context redundancy while preserving cross-scope conflicts', async () => {
+    const personal = memory.store.create({ content: 'Use bun', scope: 'personal', type: 'constraint' }, { actor: 'user' });
+    const project = memory.store.create({ content: 'Use bun in this project', scope: 'project', projectId: 'A', type: 'constraint' }, { actor: 'user' });
+    const projectCopy = memory.store.create({ content: 'Run project scripts with bun', scope: 'project', projectId: 'A', type: 'constraint' }, { actor: 'user' });
+    const session = memory.store.create({ content: 'Use bun this session', scope: 'session', sessionId: 's1', type: 'constraint' }, { actor: 'user' });
+    const sessionCopy = memory.store.create({ content: 'Run session scripts with bun', scope: 'session', sessionId: 's1', type: 'constraint' }, { actor: 'user' });
+    const conflict = memory.store.create({ content: 'Use npm', scope: 'personal', type: 'constraint' }, { actor: 'user' });
+    const { call } = routedCaller([
+      { match: 'CONTRADICTIONS', response: { findings: [
+        { memoryId: conflict.id, otherMemoryId: project.id, reason: 'different package managers' },
+      ] } },
+      { match: 'NEAR-DUPLICATES', response: { findings: [
+        { memoryId: personal.id, otherMemoryId: project.id, reason: 'cross-scope duplicate' },
+        { memoryId: project.id, otherMemoryId: session.id, reason: 'cross-context duplicate' },
+        { memoryId: project.id, otherMemoryId: projectCopy.id, reason: 'same project rule' },
+        { memoryId: session.id, otherMemoryId: sessionCopy.id, reason: 'same session rule' },
+      ] } },
+    ]);
+    const result = await createCheckupService({ memory, callJson: call, listRecentSessions: noSessions })
+      .run({ projectId: 'A', sessionId: 's1' });
+    expect(result.suggestions).toEqual([
+      { kind: 'conflict', memoryId: conflict.id, otherMemoryId: project.id, reason: 'different package managers' },
+      { kind: 'redundancy', memoryId: project.id, otherMemoryId: projectCopy.id, reason: 'same project rule' },
+      { kind: 'redundancy', memoryId: session.id, otherMemoryId: sessionCopy.id, reason: 'same session rule' },
+    ]);
   });
 
   it('keeps successful sidecar lanes, reports failed lanes, and never reuses an incomplete result', async () => {
@@ -137,14 +167,14 @@ describe('createCheckupService (step-one container 2, redesign 2026-08-07)', () 
   });
 
   it('the staleness query fires only for its shortlist, with evidence in the prompt', async () => {
-
-
+    // Session clock entries dated AFTER the items' creation so the quiet
+    // window (boundary = 2nd-most-recent session start) opens behind them.
     const sessions = [
       { id: 's-3', startedAt: '2999-01-03T00:00:00.000Z' },
       { id: 's-2', startedAt: '2999-01-02T00:00:00.000Z' },
       { id: 's-1', startedAt: '2999-01-01T00:00:00.000Z' },
     ];
-
+    // Quiet candidate: created long ago, never referenced since the boundary.
     const quiet = memory.store.create(
       { content: 'Staging maintenance window this week', scope: 'project', projectId: 'P1', type: 'fact' },
       { actor: 'system' },
@@ -168,7 +198,7 @@ describe('createCheckupService (step-one container 2, redesign 2026-08-07)', () 
     expect(result.suggestions).toEqual([
       { kind: 'staleness', memoryId: quiet.id, reason: 'time-bound window has passed' },
     ]);
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(3); // no promotion query exists anymore
     const stalePrompt = calls.find((c) => c.system.includes('STOPPED BEING TRUE'))!;
     expect(stalePrompt.user).toContain('no reference in the last');
   });
@@ -266,7 +296,7 @@ describe('createCheckupService (step-one container 2, redesign 2026-08-07)', () 
     expect(checkup.needsRecompute({})).toBe(false);
     const second = await checkup.run({});
     expect(second.cached).toBe(true);
-    expect(queries).toBe(2);
+    expect(queries).toBe(2); // no new calls
 
     const item = memory.store.list({})[0]!;
     memory.store.update(item.id, { content: 'A changed rule' }, { actor: 'user' });
@@ -417,7 +447,7 @@ describe('createCheckupService (step-one container 2, redesign 2026-08-07)', () 
     );
 
     const { call } = routedCaller([
-
+      // both.id draws a conflict finding AND a staleness finding → overlap.
       {
         match: 'CONTRADICTIONS',
         response: { findings: [{ memoryId: both.id, otherMemoryId: alsoStale.id, reason: 'VPN rule contradicts the token note' }] },
@@ -432,7 +462,7 @@ describe('createCheckupService (step-one container 2, redesign 2026-08-07)', () 
           ],
         },
       },
-
+      // Merge model keeps ONE row for the overlapping id but silently drops alsoStale.
       {
         match: 'consolidate audit findings',
         response: {
@@ -446,7 +476,7 @@ describe('createCheckupService (step-one container 2, redesign 2026-08-07)', () 
 
     const result = await checkup.run({ projectId: 'P1' });
     const ids = result.suggestions.map((s) => s.memoryId);
-
+    // One row per memory, and the silently-dropped finding was restored.
     expect(ids.sort()).toEqual([both.id, alsoStale.id].sort());
     expect(new Set(ids).size).toBe(ids.length);
   });
@@ -560,7 +590,7 @@ describe('fork prewarm (option B, 2026-08-08)', () => {
       { kind: 'conflict', memoryId: a.id, otherMemoryId: b.id, reason: 'opposite commit-language rules' },
     ]);
 
-
+    // The turn-end result is reusable: the next gate fires zero queries.
     expect(checkup.needsRecompute({})).toBe(false);
     const next = await checkup.run({});
     expect(next.cached).toBe(true);

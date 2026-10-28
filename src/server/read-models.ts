@@ -37,7 +37,7 @@ const MEMORY_RECORD_KINDS = new Set<TranscriptEntry["kind"]>([
   "memory_preparation_reset",
 ])
 
-
+/** Keep the Memory Record complete without rebroadcasting tool-heavy history. */
 export function deriveMemoryRecordTranscript(entries: TranscriptEntry[] | null | undefined): TranscriptEntry[] {
   return (entries ?? []).filter((entry) => (
     MEMORY_RECORD_KINDS.has(entry.kind)

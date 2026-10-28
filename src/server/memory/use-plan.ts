@@ -1,5 +1,8 @@
-
-
+// Turn-scoped use planning for the Injected Memory Set. Selection and use
+// planning are intentionally separate: another service chooses ids; this one
+// explains how the coding agent should apply every selected memory. The same
+// ExpectedMemoryUse objects are rendered in the review card and injected into
+// Claude, so the UI never promises behavior the prompt did not request.
 import type { LlmJsonCaller } from './deepseek';
 import type { ExpectedMemoryUse } from '../../shared/types';
 

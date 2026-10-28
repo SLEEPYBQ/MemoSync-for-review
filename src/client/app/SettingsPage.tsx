@@ -115,13 +115,15 @@ const enabledDisabledOptions = [
   { value: "enabled" as const, label: "On" },
 ]
 
-
+// Delegating mode (F4's two control styles): Ask parks every proposal for
+// review; Auto applies non-sensitive ones immediately with an auto badge +
+// one-click revert.
 const evolutionPolicyOptions = [
   { value: "ask" as const, label: "Ask" },
   { value: "auto" as const, label: "Auto" },
 ]
 
-
+// Point this at your fork's releases endpoint before enabling SELF_UPDATE_ENABLED.
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/OWNER/MemoSync/releases"
 const CHANGELOG_CACHE_TTL_MS = 5 * 60 * 1000
 
@@ -330,6 +332,13 @@ export function ChangelogSection({
 
 
               <div className="flex flex-row items-center justify-end min-w-0 flex-1 gap-2 ">
+                {/* <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
+
+                  <span className="rounded-full bg-muted px-2.5 py-1 font-mono text-foreground/80">
+                    {release.tag_name}
+                  </span>
+                </div> */}
+
 
 
                   <a
@@ -519,8 +528,8 @@ export function SkillsSection({
 }) {
   const socket = state.socket
   const connectionStatus = state.connectionStatus
-
-
+  // Study deployments cut outbound registry access; the installed list stays
+  // (local lock-file reads only). The server refuses search/install too.
   const remoteSkillsEnabled = !useConditionPolicy().studyMode
   const [query, setQuery] = useState("")
   const [results, setResults] = useState<SkillSearchResult[]>([])
@@ -821,8 +830,8 @@ export function SettingsPage() {
   const [keybindingDrafts, setKeybindingDrafts] = useState<Record<string, string>>({})
   const [keybindingsError, setKeybindingsError] = useState<string | null>(null)
   const [appSettingsError, setAppSettingsError] = useState<string | null>(null)
-
-
+  // Memory evolution delegating mode — undefined = still loading (the control
+  // stays read-only until the truth lands, same as the panel it moved from).
   const [evolutionMode, setEvolutionMode] = useState<"ask" | "auto" | undefined>(undefined)
   const updateSnapshot = state.updateSnapshot
   const handleWriteAppSettings = state.handleWriteAppSettings
@@ -1476,6 +1485,26 @@ export function SettingsPage() {
                           planMode={providerDefaults.codex.planMode}
                           onPlanModeChange={(planMode) => handleProviderDefaultPlanModeChange("codex", planMode)}
                           includePlanMode
+                          className="justify-start flex-wrap"
+                        />
+                      </SettingsRow>
+                    ) : null}
+
+                    {state.availableProviders.some((provider) => provider.id === "pi") ? (
+                      <SettingsRow title="Pi Defaults" description="Saved model and reasoning settings for new Pi chats." alignStart>
+                        <ChatPreferenceControls
+                          availableProviders={state.availableProviders}
+                          selectedProvider="pi"
+                          showProviderPicker={false}
+                          providerLocked
+                          model={providerDefaults.pi.model}
+                          modelOptions={providerDefaults.pi.modelOptions}
+                          onModelChange={(_, model) => handleProviderDefaultModelChange("pi", model)}
+                          onModelOptionChange={(change) => {
+                            if (change.type === "piReasoningEffort") handleProviderDefaultModelOptionsChange("pi", { reasoningEffort: change.effort })
+                          }}
+                          planMode={providerDefaults.pi.planMode}
+                          onPlanModeChange={(planMode) => handleProviderDefaultPlanModeChange("pi", planMode)}
                           className="justify-start flex-wrap"
                         />
                       </SettingsRow>

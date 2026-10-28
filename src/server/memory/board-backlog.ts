@@ -56,7 +56,7 @@ export interface MemoryBoardOpeningPromptState {
   chatId: string
   reviewId: string
   phase: MemoryBoardOpeningPromptPhase
-
+  /** One-way binding for clearing only the exact locally restored draft. */
   promptHash?: string
 }
 
@@ -73,7 +73,7 @@ export interface MemoryBoardOpeningPromptInput {
   reviewId: string
   content: string
   attachments?: unknown[]
-
+  /** Private server admission evidence; never accepted from the browser. */
   attachmentSnapshots?: StudyOpeningAttachmentSnapshot[]
   dispatch?: {
     provider?: AgentProvider
@@ -84,11 +84,12 @@ export interface MemoryBoardOpeningPromptInput {
   }
 }
 
-
+/** Private server recovery payload. `reviewState` deliberately exposes only
+ * the state machine identity and never echoes participant prompt content. */
 export interface MemoryBoardOpeningPromptRecovery extends MemoryBoardOpeningPromptState {
   content: string
   attachments: ChatAttachment[]
-
+  /** Only these immutable paths may cross the provider boundary. */
   providerAttachments: ChatAttachment[]
   attachmentFailure?: string
   dispatch?: MemoryBoardOpeningPromptInput["dispatch"]
@@ -103,7 +104,7 @@ export interface MemoryBoardOpeningProviderDispatch {
   previewId: string
   decision: MemoryBoardOpeningProviderDecision
   phase: MemoryBoardOpeningProviderDispatchPhase
-
+  /** Exact measurement receipt reserved before the provider accepts the prompt. */
   focusDelivery?: DeliveredFocusEvent
 }
 
@@ -150,13 +151,13 @@ export interface MemoryBoardBacklogService {
   reviewState: (taskId: string) => MemoryBoardReviewState
   completeReview: (taskId: string) => { completed: boolean; state: MemoryBoardReviewState }
   promptRefusal: (taskId: string, attempt?: MemoryBoardOpeningPromptAttempt) => string | null
-
+  /** Atomically names the exact first message whose full Long-term review owns the opening Board. */
   prepareOpeningPrompt: (input: MemoryBoardOpeningPromptInput) => MemoryBoardOpeningPromptState
-
+  /** Trusted exact payload used only to re-prime an interrupted server process. */
   recoverOpeningPrompt: (taskId: string) => MemoryBoardOpeningPromptRecovery | null
-
+  /** Claims the single server dispatch. Same exact retry is acknowledged without a second turn. */
   claimOpeningPromptDispatch: (input: MemoryBoardOpeningPromptInput) => "claimed" | "duplicate"
-
+  /** Durable reconciliation flags for effects that follow the transcript append. */
   openingPromptBookkeeping: (
     input: Pick<MemoryBoardOpeningPromptState, "taskId" | "chatId" | "reviewId">,
   ) => MemoryBoardOpeningPromptBookkeeping
@@ -164,28 +165,28 @@ export interface MemoryBoardBacklogService {
     input: Pick<MemoryBoardOpeningPromptState, "taskId" | "chatId" | "reviewId">,
     completed: Partial<MemoryBoardOpeningPromptBookkeeping>,
   ) => void
-
+  /** Marks Candidate → Transfer → Checkup settled; Working Memory still waits for Continue. */
   markOpeningPromptLongTermReady: (input: MemoryBoardOpeningPromptState) => void
-
+  /** Server-owned barrier between Long-term review and the separate Working Memory surface. */
   waitForOpeningPromptCompletion: (input: MemoryBoardOpeningPromptState) => Promise<MemoryBoardOpeningCompletionOutcome>
-
+  /** Final explicit Continue boundary for the exact prepared prompt. */
   completeOpeningPromptReview: (input: MemoryBoardOpeningPromptState) => {
     completed: boolean
     state: MemoryBoardReviewState
   }
-
+  /** Durable pre-provider linearization. A recovered `dispatching` state is ambiguous and must not resend. */
   claimOpeningProviderDispatch: (input: MemoryBoardOpeningProviderDispatchInput) =>
     "claimed" | MemoryBoardOpeningProviderDispatchPhase
-
+  /** Durable provider acceptance or fail-closed terminal for that exact Working Memory decision. */
   settleOpeningProviderDispatch: (
     input: MemoryBoardOpeningProviderDispatchInput,
     outcome: "delivered" | "failed",
   ) => void
-
+  /** Whether mutation should run, or the durable result of an earlier attempt. */
   assertPending: (input: MemoryBoardResolution) => { pending: true } | { pending: false; resultId?: string }
-
+  /** The transcript-owned destination and immutable Transfer snapshot. */
   assertTransferPending: (input: MemoryBoardTransferResolution) => MemoryBoardTransferAdmission
-
+  /** Persist a line-level receipt after the corresponding mutation succeeds. */
   resolve: (input: MemoryBoardResolution, outcome?: { resultId?: string }) => void
 }
 
@@ -203,20 +204,21 @@ interface BoardReceiptStore {
 
 interface MemoryBoardOpeningPromptRecord extends MemoryBoardOpeningPromptState {
   promptHash: string
-
+  /** CAS binding for the exact Visible Memory Pool whose downstream gates settled. */
   longTermReadyHash?: string
-
-
+  /** Candidates explicitly deferred by this opening review, bound to their
+   * exact state so a later/external mutation cannot inherit the exemption. */
   deferredCandidates?: Array<{ id: string; dependencyHash: string }>
-
-
+  /** Transfer/Checkup rows explicitly skipped by this exact opening review.
+   * The owner and occurrence identity prevent another gate or a later row
+   * with the same semantic key from inheriting the exemption. */
   deferredBacklogRows?: Array<{
     semanticKey: string
     chatId: string
     gateId: string
     occurrenceAt: number
   }>
-
+  /** Increments only when a ready dependency CAS fails; retries reuse this lineage. */
   longTermRevision?: number
   content: string
   attachments: unknown[]
@@ -476,8 +478,8 @@ function projectPendingRows(
     if (receipt && receipt.throughCreatedAt >= row.occurrenceAt) return false
     const invalid = invalidReasonFor(row, memoryState, receiptStore)
     if (!invalid) return true
-
-
+    // Prompt admission is a read-only authority check. It must filter stale
+    // rows without turning a refused prompt into a persistence/log side effect.
     if (!persistInvalidations) return false
     receiptStore.setKv(receiptKey(row.semanticKey), {
       taskId: currentTaskId ?? "system",
@@ -519,8 +521,9 @@ function matchesTransferDestination(
   item: ReturnType<BoardMemoryState["getById"]> & {},
 ): boolean {
   if (item.status !== "active") return false
-
-
+  // The participant may legitimately choose a different scope from the
+  // suggestion. Every allowed destination is still bound to this row's
+  // trusted project/chat context; unrelated projects/sessions never match.
   if (item.scope === "personal") return true
   if (item.scope === "session") return item.sessionId === row.chatId
   return item.scope === "project" && item.projectId === row.projectId
@@ -533,8 +536,8 @@ function transferMaterializedAfterSkip(
 ): boolean {
   const createdAt = Date.parse(item.createdAt)
   if (Number.isFinite(createdAt) && createdAt > row.occurrenceAt) return true
-
-
+  // Reinforce lands into a pre-existing target, so creation time cannot prove
+  // causality. Its canonical reinforce event is the post-skip action proof.
   return hasEventAfter(memoryState, item.id, row.occurrenceAt, (kind) => kind === "reinforce")
 }
 
@@ -584,8 +587,9 @@ function invalidReasonFor(
   }
   const [first, second] = ids
   if (first && second) {
-
-
+    // Checkup's pair detector excludes a pair after ANY direct relation or an
+    // open revision, regardless of whether the original lane was Conflict or
+    // Redundancy. Mirror that structural eligibility exactly.
     const alreadyRelated = memoryState.getRelations(first).some(
       (relation) => relation.targetId === second,
     ) || memoryState.getRelations(second).some(
@@ -655,16 +659,20 @@ function toSnapshot(rows: SemanticRow[]): MemoryBoardBacklogSnapshot {
   return { transfers, checkups }
 }
 
-
+/**
+ * Durable projection of suggestions the participant explicitly skipped in a
+ * prior chat gate. The transcript remains the suggestion source of truth;
+ * Board receipts only record that one resurfaced row was later handled.
+ */
 export function createMemoryBoardBacklogService(input: {
   transcript: BoardTranscript
   receiptStore: BoardReceiptStore
   memoryState: BoardMemoryState
   assignedProjectIds: () => ReadonlySet<string>
   currentTaskId?: () => string | null
-
+  /** Exact registered project for a task; prevents another assigned project from claiming its opening prompt. */
   projectIdForTask?: (taskId: string) => string | null
-
+  /** Formal MemoSync-only immutable attachment authority. */
   openingAttachmentSnapshots?: StudyOpeningAttachmentSnapshotStore
   onInvalidated?: (input: {
     kind: "transfer" | "checkup"
@@ -715,8 +723,8 @@ export function createMemoryBoardBacklogService(input: {
         if (item.scope === "personal") return true
         if (item.scope === "project") return item.projectId === projectId
         if (item.scope === "session") return item.sessionId === record.chatId
-
-
+        // Legacy rows without a scope remain in the conservative dependency
+        // set instead of silently escaping invalidation.
         return item.scope === undefined
       })
       .filter((item) => !excluded.has(item.id))
@@ -845,8 +853,8 @@ export function createMemoryBoardBacklogService(input: {
     }
     const invalid = invalidReasonFor(row, input.memoryState, input.receiptStore)
     if (invalid) {
-
-
+      // Materialize the auditable invalidation receipt using the same path
+      // as GET; a retry after mutation-before-receipt is idempotent.
       pendingRows()
       return { pending: false, ...(invalid.resultId ? { resultId: invalid.resultId } : {}) }
     }
@@ -1080,8 +1088,8 @@ export function createMemoryBoardBacklogService(input: {
           ?? new Set<(outcome: MemoryBoardOpeningCompletionOutcome) => void>()
         waiters.add(resolve)
         openingCompletionWaiters.set(record.taskId, waiters)
-
-
+        // Re-read after registration so a synchronous completion cannot land
+        // between the first read and installing this waiter.
         if (assertOpeningRecord(openingInput).phase === "completed") {
           waiters.delete(resolve)
           resolve("completed")
@@ -1178,8 +1186,8 @@ export function createMemoryBoardBacklogService(input: {
           ? null
           : "The waiting first message must finish its opening Memory Board review before another prompt can be sent."
       }
-
-
+      // The Board is a once-per-task opening barrier. New memory work after
+      // this receipt belongs to the normal per-turn chat gates.
       if (input.receiptStore.getKv<boolean>(`board_reviewed:${taskId}`) === true) return null
       const state = computeReviewState(taskId, false)
       return state.pending.total > 0

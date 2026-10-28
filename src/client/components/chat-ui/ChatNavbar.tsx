@@ -1,7 +1,6 @@
 import { type MouseEvent as ReactMouseEvent } from "react"
 import { BrainCircuit, FolderOpen, GitBranch, Globe, Menu, MoreHorizontal, PanelLeft, PanelRight, SquarePen, Terminal } from "lucide-react"
 import { BrandIcon } from "../BrandMark"
-import { useConditionPolicy } from "../../lib/conditionApi"
 import { Button } from "../ui/button"
 import { CardHeader } from "../ui/card"
 import { HotkeyTooltip, HotkeyTooltipContent, HotkeyTooltipTrigger } from "../ui/tooltip"
@@ -81,7 +80,7 @@ interface Props {
   branchName?: string
   hasGitRepo?: boolean
   gitStatus?: "unknown" | "ready" | "no_repo"
-
+  /** When set, show the session-memories popover (mid-session pin editing). */
   memoryChatId?: string
   memoryProjectId?: string
 }
@@ -112,7 +111,6 @@ export function ChatNavbar({
     : gitStatus === "unknown"
       ? null
       : (branchName ?? "Detached HEAD")
-  const memoryPolicy = useConditionPolicy()
   const rightPanelVisible = rightPanel !== "hidden"
   const handleCloseRightPanel =
     rightPanel === "browser"
@@ -177,14 +175,13 @@ export function ChatNavbar({
 
         {localPath && (onToggleEmbeddedTerminal || onToggleGitPanel || onToggleBrowserPanel) ? (
           <div className="flex items-center gap-2 flex-shrink-0">
-
             {memoryChatId && onToggleMemoryPanel ? (
               <Button
                 variant="ghost"
                 size="none"
                 onClick={onToggleMemoryPanel}
-                title={memoryPolicy.condition === "memosync" ? "Session memories" : "Memory"}
-                aria-label={memoryPolicy.condition === "memosync" ? "Session memories" : "Memory"}
+                title="Session memories"
+                aria-label="Session memories"
                 className={cn(
                   "border border-border/0 hover:!border-border/0 px-1.5 h-9 hover:!bg-transparent",
                   rightPanel === "memory" && "text-foreground",

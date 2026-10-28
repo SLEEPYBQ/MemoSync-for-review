@@ -1,5 +1,11 @@
-
-
+// Experiment shell · the post-session quiz (MemoSync Experiment Final).
+// A dedicated full-screen surface with NO way back into the app: once the
+// quiz starts, the participant must not re-inspect the conversation, the
+// memory panels, or the board, or the monitoring probe would be contaminated.
+// Items are the memories injected during the task's time window (across all
+// chats, with no manual session picking); per item three question groups yield
+// D_i, A_i, and the participant's execution judgment. The full frozen cue is
+// shown; O_i remains server-side and immutable.
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useNavigate, useParams } from "react-router-dom"
 import { Loader2 } from "lucide-react"
@@ -91,8 +97,9 @@ async function readPostSessionPayload(res: Response, fallback: string): Promise<
 
 async function getFrozenQuestionnaire(taskId: string, signal?: AbortSignal): Promise<StudyQuestionnairePayload | null> {
   const res = await fetch(`/api/study/questionnaire?taskId=${encodeURIComponent(taskId)}`, { signal })
-
-
+  // The service uses 409 specifically for an active task with no freeze
+  // snapshot yet. This read-only probe must return to the confirmation screen,
+  // never turn that state into an automatic freeze.
   if (res.status === 404 || res.status === 409) return null
   if (!res.ok) throw new Error(await readError(res, `could not load the questions (${res.status})`))
   return readQuestionnairePayload(res, "the frozen questionnaire response was invalid")
@@ -156,8 +163,8 @@ export function StudyQuizPage() {
   const [sus, setSus] = useState<SusDraft>({})
   const [eligibility, setEligibility] = useState<StudyCompletionEligibilityPayload | null>(null)
   const freezeInFlight = useRef(false)
-
-
+  // Ending a session is irreversible — one stray click must not do it
+  // (it happened during piloting). The button arms a confirm step instead.
   const [confirmArmed, setConfirmArmed] = useState(false)
 
   const installQuestionnaire = useCallback((payload: StudyQuestionnairePayload) => {
@@ -208,7 +215,8 @@ export function StudyQuizPage() {
     }
   }, [openQuestionnaire, taskId])
 
-
+  // Reload only restores an already-frozen questionnaire. A missing snapshot
+  // returns to the confirmation screen; GET never ends an active session.
   useEffect(() => {
     if (!taskId || !task) return
     const controller = new AbortController()
@@ -254,7 +262,7 @@ export function StudyQuizPage() {
     }
   }, [phase, taskId])
 
-
+  // No accidental escape while the session is freezing or answers are pending.
   useEffect(() => {
     if (phase === "loading" || phase === "intro" || phase === "next_session" || phase === "complete") return
     const guard = (event: BeforeUnloadEvent) => event.preventDefault()
@@ -262,7 +270,8 @@ export function StudyQuizPage() {
     return () => window.removeEventListener("beforeunload", guard)
   }, [phase])
 
-
+  // Each item and each post-session block starts at its top; the preceding
+  // memory questionnaire or scale may leave this full-screen surface mid-scroll.
   useEffect(() => {
     document.querySelector("[data-study-quiz-scroll]")?.scrollTo({ top: 0 })
   }, [itemIndex, phase])
@@ -281,7 +290,9 @@ export function StudyQuizPage() {
     if (stage) void recordStudyStageEntered(stage, stage === "sus" ? undefined : taskId)
   }, [phase, taskId])
 
-
+  // Ending the session comes first: the task's window closes server-side (no
+  // more prompts anywhere until the questionnaire is in), then the questions
+  // open over everything injected during that window.
   const startQuiz = useCallback(async () => {
     if (!taskId || freezeInFlight.current) return
     freezeInFlight.current = true
@@ -298,8 +309,8 @@ export function StudyQuizPage() {
       try {
         payload = await readQuestionnairePayload(res, "the freeze response was invalid")
       } catch {
-
-
+        // A freeze implementation may return only the snapshot id. GET is the
+        // canonical reload path and reads the same immutable snapshot.
         payload = await getFrozenQuestionnaire(taskId)
       }
       if (!payload) throw new Error("the session ended, but its questionnaire is not ready yet")
@@ -380,8 +391,8 @@ export function StudyQuizPage() {
       installPostSession(remaining)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "submit failed")
-
-
+      // Once POST succeeded, never reopen editable D/A/E answers just because
+      // loading the next step failed. The retry path reloads durable state.
       setPhase(questionnaireRecorded ? "loading" : "quiz")
     }
   }, [attentionCheck, attentionCheckAnswer, drafts, installPostSession, items, questionnaireVersion, snapshotId, taskId])

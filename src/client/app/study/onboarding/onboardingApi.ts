@@ -73,7 +73,11 @@ function jsonRequest(method: "PUT" | "POST", body: unknown): RequestInit {
   }
 }
 
-
+/**
+ * The single client transport seam for the durable, server-owned onboarding
+ * stage. Pages never infer completion from browser storage or from a local
+ * form submit; every transition returns the authoritative next state.
+ */
 export function loadStudyOnboarding(fetcher: StudyFetch = fetch): Promise<StudyOnboardingState> {
   return fetcher("/api/study/onboarding", { cache: "no-store" }).then(readState)
 }

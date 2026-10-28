@@ -3,29 +3,32 @@ import { memoryStageSchema, memoryStageDeltaSchema } from './branch-schemas';
 import { buildMemoryBranchReviewPrompt, memoryBranchDeltaContract, MemoryBranchResultError, mergeMemoryBranchUpdate } from './branch-stages';
 
 export type PreparationStage = 'candidate' | 'transfer' | 'changes';
-export interface BranchRequest { prompt: string; dependencyKey: string }
+export interface BranchRequest { prompt: string; dependencyKey: string; schema?: Record<string, unknown>; deltaSchema?: Record<string, unknown>; constraints?: string }
 export interface PreparedBranchResult { raw: Record<string, unknown>; dependencyKey: string }
 
-
+/** Three conversations start together. Review messages extend the original
+ * conversations; only their validated JSON state reaches the coordinator. */
 export class MemoryBranchPipeline {
   private readonly branches: Record<PreparationStage, MemoryBranch>;
   private readonly results: Record<PreparationStage, Promise<PreparedBranchResult>>;
   private readonly controller = new AbortController();
+  private readonly requests: Record<PreparationStage, BranchRequest>;
 
   constructor(input: {
     createBranch: (stage: PreparationStage) => MemoryBranch;
     requests: Record<PreparationStage, BranchRequest>;
   }) {
+    this.requests = input.requests;
     this.branches = Object.fromEntries(
       (['candidate', 'transfer', 'changes'] as const).map(stage => [stage, input.createBranch(stage)]),
     ) as Record<PreparationStage, MemoryBranch>;
     this.results = Object.fromEntries(
       (['candidate', 'transfer', 'changes'] as const).map(stage => {
         const request = input.requests[stage];
-        const result = this.ask(stage, request.prompt)
+        const result = this.ask(stage, request.prompt, request.schema)
           .then(raw => ({ raw, dependencyKey: request.dependencyKey }));
-
-
+        // A downstream failure may precede its review gate by minutes.
+        // Retain rejection for its consumer without an unhandled rejection.
         void result.catch(() => {});
         return [stage, result];
       }),
@@ -35,6 +38,7 @@ export class MemoryBranchPipeline {
   result(stage: PreparationStage): Promise<PreparedBranchResult> { return this.results[stage]; }
 
   private async ask(stage: PreparationStage, prompt: string, schema = memoryStageSchema(stage), budget?: Partial<MemoryBranchBudget>): Promise<Record<string, unknown>> {
+    prompt = [prompt, this.requests[stage].constraints].filter(Boolean).join('\n\n');
     const signal = this.controller.signal;
     signal.throwIfAborted();
     let rejectAbort!: () => void;
@@ -59,19 +63,20 @@ export class MemoryBranchPipeline {
     const result = this.results[stage].then(async previous => {
       const update = await this.ask(stage, buildMemoryBranchReviewPrompt({
         decision: input.review, updatedStore: input.changes, stage,
-      }), memoryStageDeltaSchema(stage), { maxTurns: 3, maxToolCalls: 1 });
+      }), this.requests[stage].deltaSchema ?? memoryStageDeltaSchema(stage), { maxTurns: 3, maxToolCalls: 1 });
       let raw: Record<string, unknown>;
       try {
         raw = mergeMemoryBranchUpdate(previous.raw, update);
       } catch (error) {
         if (!(error instanceof MemoryBranchResultError)) throw error;
-
-
+        // One schema-only correction in the same child conversation. Provider
+        // failures/cancellation are not retried, and a second invalid shape
+        // remains a failed review instead of an empty successful result.
         const repaired = await this.ask(stage, [
           `The previous reply had an invalid proposal format: ${error.message}`,
           'Correct only the response schema using the review decision and analysis already in this conversation. Do not run a new analysis or change the store.',
           memoryBranchDeltaContract(stage),
-        ].join('\n\n'), memoryStageDeltaSchema(stage), { maxTurns: 2, maxToolCalls: 0 });
+        ].join('\n\n'), this.requests[stage].deltaSchema ?? memoryStageDeltaSchema(stage), { maxTurns: 2, maxToolCalls: 0 });
         raw = mergeMemoryBranchUpdate(previous.raw, repaired);
       }
       return { raw, dependencyKey: input.dependencyKey };

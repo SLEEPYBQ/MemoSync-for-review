@@ -17,7 +17,7 @@ interface DiffLine {
   content: string
 }
 
-
+// Parse content and extract line numbers if they match the pattern: N→content
 function parseContent(content: string): ParsedLine[] {
   const lines = content.split("\n")
   const lineNumberPattern = /^\s*(\d+)→(.*)$/
@@ -37,7 +37,7 @@ function parseContent(content: string): ParsedLine[] {
   })
 }
 
-
+// Compute unified diff (same logic as EditDiffView)
 function computeUnifiedDiff(oldStr: string, newStr: string): DiffLine[] {
   const oldLines = oldStr.split("\n")
   const newLines = newStr.split("\n")
@@ -92,7 +92,7 @@ function buildDiffLines(rawDiff: RawLine[]): DiffLine[] {
 }
 
 export function FileContentView({ content, isDiff = false, oldString, newString }: FileContentViewProps) {
-
+  // Diff mode
   const diffLines = useMemo(() => {
     if (isDiff && oldString !== undefined && newString !== undefined) {
       return computeUnifiedDiff(oldString, newString)
@@ -100,7 +100,7 @@ export function FileContentView({ content, isDiff = false, oldString, newString 
     return []
   }, [isDiff, oldString, newString])
 
-
+  // Text mode with line numbers
   const parsedLines = useMemo(() => {
     if (!isDiff) {
       return parseContent(content)
@@ -112,7 +112,7 @@ export function FileContentView({ content, isDiff = false, oldString, newString 
     return parsedLines.some((line) => line.lineNumber !== null)
   }, [parsedLines])
 
-
+  // Diff rendering
   if (isDiff && diffLines.length > 0) {
     return (
       <div className="my-1 rounded-lg border border-border overflow-hidden">
@@ -152,7 +152,7 @@ export function FileContentView({ content, isDiff = false, oldString, newString 
     )
   }
 
-
+  // Text rendering with optional line numbers
   return (
     <div className="my-1 rounded-lg border border-border overflow-hidden">
       <div className="overflow-auto max-h-64 md:max-h-[50vh]">
@@ -165,7 +165,9 @@ export function FileContentView({ content, isDiff = false, oldString, newString 
                     {line.lineNumber !== null ? line.lineNumber : ""}
                   </td>
                 )}
-
+                {/* Render verbatim — React escapes text children, so tags/
+                    generics like <div> or Array<string> must survive intact
+                    (stripping them corrupted the shown file content, BUG MSG-6). */}
                 <td className="px-2 py-0 whitespace-pre select-all text-foreground">
                   {line.content}
                 </td>

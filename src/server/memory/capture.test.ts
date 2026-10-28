@@ -4,12 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MemoryService } from './index';
 import { createCaptureService, validateCandidate } from './capture';
-import { planMemoryInjection } from './injection';
+
 import { MEMORY_ATOM_SPEC } from './atom-spec';
 import { LlmJsonError, type DeepSeekJsonRequest, type LlmJsonCaller } from './deepseek';
-import { resolveConditionPolicy } from '../experiment/condition';
+import { handleMemoryRequest } from './routes';
 
-
+/** A scripted LlmJsonCaller: returns the next queued response per call, records every call. */
 function stubCaller(responses: Array<Record<string, unknown>>): { call: LlmJsonCaller; calls: DeepSeekJsonRequest[] } {
   const calls: DeepSeekJsonRequest[] = [];
   const call: LlmJsonCaller = async (req) => {
@@ -60,7 +60,7 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
       revisions: 0,
       pending: [],
     });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(1); // routing must NOT have been called
   });
 
   it('happy path: new candidate surfaces; in-batch restatement is counted once, not carded twice', async () => {
@@ -125,12 +125,12 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
     expect(created.provenanceSessionId).toBe('s1');
     expect(created.provenanceTurn).toBe(3);
 
-
+    // Store actually persisted exactly one candidate.
     const stored = memory.store.list({ scope: 'project', projectId: 'RenderX', status: 'candidate' });
     expect(stored).toHaveLength(1);
     expect(stored[0]!.id).toBe(created.id);
 
-
+    // The create event on the store records actor 'agent' + session/turn provenance.
     const storeEvents = memory.store.getEvents(created.id);
     expect(storeEvents).toHaveLength(1);
     expect(storeEvents[0]!.kind).toBe('create');
@@ -138,7 +138,7 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
     expect(storeEvents[0]!.sessionId).toBe('s1');
     expect(storeEvents[0]!.turn).toBe(3);
 
-
+    // Logger: one memory.propose per created item, then one memory.capture summary.
     expect(events).toHaveLength(2);
     expect(events[0]).toEqual({
       type: 'memory.propose',
@@ -174,7 +174,7 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
           { content: 'SSH deploy key lives at ~/.ssh/id_ed25519_server', type: 'fact', scope: 'personal', abstractionLevel: 'concrete', sensitive: false },
         ],
       },
-      { decisions: [] },
+      { decisions: [] }, // gate lost the verdict — the observation must survive
     ]);
     const capture = createCaptureService({ memory, callJson: call });
     const outcome = await capture.capture({ sessionId: 's', userText: 'u', assistantText: 'a' });
@@ -247,77 +247,6 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
     expect(memory.store.list({ status: 'candidate' })).toEqual([]);
   });
 
-  it('does not treat an exact dismissal as an exclusion in Auto', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    const rejected = memory.store.create(
-      { content: 'User dislikes celery', scope: 'personal', type: 'preference', status: 'candidate' },
-      { actor: 'agent' },
-    );
-    memory.store.discardCandidate(rejected.id);
-    const { call, calls } = stubCaller([
-      { candidates: [{
-        content: '  USER  DISLIKES CELERY ',
-        type: 'preference',
-        scope: 'personal',
-        abstractionLevel: 'general',
-        sensitive: false,
-      }] },
-      { decisions: [{ index: 0, route: 'new', targetId: null }] },
-    ]);
-    const capture = createCaptureService({ memory, callJson: call, surface: 'silent' });
-
-    const outcome = await capture.capture({
-      projectId: 'apartment',
-      sessionId: 'auto-chat',
-      engine: 'claude',
-      profile: 'auto-project-copy',
-      userText: 'No celery in the results.',
-      assistantText: 'Applied the preference.',
-    });
-
-    expect(calls).toHaveLength(2);
-    expect(outcome).toMatchObject({ surfaced: 1, dropped: 0 });
-    expect(memory.autoProjectMemories('apartment').map((item) => item.content)).toContain('USER DISLIKES CELERY');
-  });
-
-  it('does not expose dismissed choices to Auto routing or suppress a semantic restatement', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    const rejected = memory.store.create(
-      { content: 'Use linen as the apartment page background', scope: 'project', projectId: 'apartment', type: 'constraint', status: 'candidate' },
-      { actor: 'agent' },
-    );
-    memory.store.dismissCandidate(rejected.id, { actor: 'user' });
-    const { call, calls } = stubCaller([
-      { candidates: [{
-        content: 'Apartment pages should have a linen background',
-        type: 'constraint',
-        scope: 'project',
-        abstractionLevel: 'contextual',
-        sensitive: false,
-      }] },
-
-
-      { decisions: [{ index: 0, route: 'reinforces-dismissed', targetId: null }] },
-    ]);
-    const capture = createCaptureService({ memory, callJson: call, surface: 'silent' });
-
-    const outcome = await capture.capture({
-      projectId: 'apartment',
-      sessionId: 'auto-chat',
-      engine: 'claude',
-      profile: 'auto-project-copy',
-      userText: 'Apply the apartment visual theme.',
-      assistantText: 'Set the page background to linen.',
-    });
-
-    expect(calls[1]!.user).not.toContain('Recently dismissed by the user');
-    expect(calls[1]!.user).not.toContain('Use linen as the apartment page background');
-    expect(outcome).toMatchObject({ surfaced: 1, dropped: 0 });
-    expect(memory.autoProjectMemories('apartment').map((item) => item.content)).toContain(
-      'Apartment pages should have a linen background',
-    );
-  });
-
   it('omits the dismissed section when the user has never rejected a candidate', async () => {
     memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
     const { call, calls } = stubCaller([
@@ -343,7 +272,7 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
           {
             content: longContent,
             type: 'nonsense-type',
-            scope: 'project',
+            scope: 'project', // no projectId on the input -> must downgrade to 'session'
             abstractionLevel: 'nonsense-level',
             sensitive: true,
           },
@@ -364,15 +293,16 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
 
     expect(outcome.created).toHaveLength(1);
     const created = outcome.created[0]!;
-
-
+    // The 100-word target is an extraction contract. If a provider overruns
+    // it, preserve the complete statement instead of manufacturing a broken
+    // half-sentence with a character slice.
     expect(created.content).toBe(longContent);
-    expect(created.type).toBe('fact');
-    expect(created.scope).toBe('session');
+    expect(created.type).toBe('fact'); // clamped
+    expect(created.scope).toBe('session'); // downgraded (no projectId)
     expect(created.sessionId).toBe('s2');
     expect(created.projectId).toBeUndefined();
-    expect(created.abstractionLevel).toBe('contextual');
-    expect(created.sensitive).toBe(true);
+    expect(created.abstractionLevel).toBe('contextual'); // clamped
+    expect(created.sensitive).toBe(true); // sensitive candidates are still created
   });
 
   it('drops malformed pass-1 entries (missing content / non-object) without discarding valid ones', async () => {
@@ -380,8 +310,8 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
     const { call } = stubCaller([
       {
         candidates: [
-          { type: 'fact', scope: 'session' },
-          null,
+          { type: 'fact', scope: 'session' }, // missing content -> malformed
+          null, // non-object -> malformed
           { content: 'Tests must run with --runInBand on this repo', type: 'constraint', scope: 'project' },
         ],
       },
@@ -398,331 +328,12 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
       assistantText: 'Understood, will use --runInBand.',
     });
 
-
+    // Only the one well-formed candidate reaches routing / gets counted as "proposed".
     expect(outcome.proposed).toBe(1);
     expect(outcome.surfaced).toBe(1);
-    expect(outcome.dropped).toBe(2);
+    expect(outcome.dropped).toBe(2); // the two malformed entries
     expect(outcome.created).toHaveLength(1);
     expect(outcome.created[0]!.content).toBe('Tests must run with --runInBand on this repo');
-  });
-
-  it('silent surface (auto arm): stores directly as ACTIVE and syncs the projection', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    const { call } = stubCaller([
-      {
-        candidates: [
-          {
-            content: 'Deploys must go through staging first',
-            detail: 'Direct prod deploys are forbidden by the release policy.',
-            type: 'constraint',
-            scope: 'project',
-            abstractionLevel: 'contextual',
-            sensitive: false,
-          },
-        ],
-      },
-      { decisions: [{ index: 0, route: 'new', targetId: null, reason: 'durable' }] },
-    ]);
-    const capture = createCaptureService({ memory, callJson: call, surface: 'silent' });
-
-    const outcome = await capture.capture({
-      projectId: 'RenderX',
-      sessionId: 's-auto',
-      userText: 'remember: deploys must go through staging',
-      assistantText: 'Noted.',
-    });
-
-    expect(outcome.created).toHaveLength(1);
-    expect(outcome.created[0]!.status).toBe('active');
-
-    expect(memory.injectedFor('RenderX', 's-auto').map((m) => m.id)).toContain(outcome.created[0]!.id);
-
-    const { readFileSync } = await import('node:fs');
-    const md = readFileSync(join(dir, 'projects', 'RenderX', 'memories.md'), 'utf8');
-    expect(md).toContain('Deploys must go through staging first');
-  });
-
-  it('Auto broadly captures useful lessons from an ordinary benchmark turn without a remember request', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    const { call, calls } = stubCaller([
-      {
-        candidates: [{
-          content: 'Booking cancellation requires an explicit confirmation dialog',
-          detail: 'The benchmark flow requires a confirmation step before a booking is cancelled.',
-          type: 'constraint',
-          scope: 'project',
-          abstractionLevel: 'contextual',
-          sensitive: false,
-        }],
-      },
-      { decisions: [{ index: 0, route: 'new', targetId: null }] },
-    ]);
-    const capture = createCaptureService({
-      memory,
-      callJson: call,
-      surface: 'silent',
-      profile: 'auto-project-copy',
-    });
-
-    const outcome = await capture.capture({
-      projectId: 'apartment',
-      sessionId: '038-S1-chat',
-      engine: 'claude',
-      userText: 'Implement the apartment booking and cancellation flows from the task specification.',
-      assistantText: 'Implemented both flows. Cancellation now opens ConfirmDialog before the delete request.',
-    });
-
-    expect(calls[0]!.system).toContain('ordinary task work often produces useful memory');
-    expect(calls[0]!.system).toContain('Do not require long-term stability');
-    expect(calls[0]!.system).toContain('return an empty array when');
-    expect(calls[0]!.system).toContain('at most 100 words');
-    expect(calls[0]!.system).not.toContain('at most 160 characters');
-    expect(outcome.created).toHaveLength(1);
-    expect(outcome.created[0]!.status).toBe('active');
-    expect(outcome.created[0]!.scope).toBe('project');
-    expect(outcome.created[0]!.projectId).toBe('apartment');
-    expect(outcome.created[0]!.sessionId).toBeUndefined();
-  });
-
-  it('Auto enforces at most four combined new, revised, or reinforced memory operations per completed turn', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    const candidates = Array.from({ length: 8 }, (_, index) => ({
-      content: `Distinct future-useful project fact ${index + 1}`,
-      type: 'fact',
-      scope: 'project',
-      abstractionLevel: 'contextual',
-      sensitive: false,
-    }));
-    const { call, calls } = stubCaller([
-      { candidates },
-      { decisions: Array.from({ length: 4 }, (_, index) => ({ index, route: 'new', targetId: null })) },
-    ]);
-    const capture = createCaptureService({
-      memory,
-      callJson: call,
-      surface: 'silent',
-      profile: 'auto-project-copy',
-    });
-
-    const outcome = await capture.capture({
-      projectId: 'apartment',
-      sessionId: '038-S1-chat',
-      engine: 'claude',
-      userText: 'Implement the task.',
-      assistantText: 'Implemented the task.',
-    });
-
-    expect(calls[0]!.system).toContain('0 to 4 total memory operations')
-    expect(calls[0]!.system).toContain('reinforcements of existing memories')
-    expect(calls[0]!.system).toContain('More is not better')
-    expect(calls[1]!.user).not.toContain('Distinct future-useful project fact 5')
-    expect(outcome).toMatchObject({ proposed: 8, surfaced: 4, dropped: 4 })
-    expect(outcome.created).toHaveLength(4)
-  });
-
-  it('Auto routes and stores a broad capture only inside the current Project Copy', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    memory.store.create(
-      { content: 'Apartment filters use URL search params', scope: 'project', projectId: 'apartment', type: 'fact' },
-      { actor: 'agent' },
-    );
-    memory.store.create(
-      { content: 'Car checkout has three steps', scope: 'project', projectId: 'car', type: 'fact' },
-      { actor: 'agent' },
-    );
-    const { call, calls } = stubCaller([
-      { candidates: [{
-        content: 'Apartment cancellations require confirmation',
-        type: 'constraint',
-        scope: 'personal',
-        abstractionLevel: 'contextual',
-        sensitive: false,
-      }] },
-      { decisions: [{ index: 0, route: 'new', targetId: null }] },
-    ]);
-    const capture = createCaptureService({
-      memory,
-      callJson: call,
-      surface: 'silent',
-      profile: 'auto-project-copy',
-    });
-
-    const outcome = await capture.capture({
-      projectId: 'apartment',
-      sessionId: '038-S2-chat',
-      engine: 'claude',
-      userText: 'Finish apartment cancellation.',
-      assistantText: 'Added the confirmation flow.',
-    });
-
-    expect(calls[1]!.user).toContain('Apartment filters use URL search params');
-    expect(calls[1]!.user).not.toContain('Car checkout has three steps');
-    expect(outcome.created[0]).toMatchObject({
-      content: 'Apartment cancellations require confirmation',
-      scope: 'project',
-      projectId: 'apartment',
-      version: 1,
-      status: 'active',
-    });
-    expect(memory.autoProjectMemories('apartment').map((item) => item.id)).toContain(outcome.created[0]!.id);
-    expect(memory.autoProjectMemories('car').map((item) => item.id)).not.toContain(outcome.created[0]!.id);
-  });
-
-  it('does not apply the Auto Project Copy capture profile to a Codex turn', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    memory.store.create(
-      { content: 'Car-only checkout uses Stripe', scope: 'project', projectId: 'car', type: 'fact' },
-      { actor: 'system' },
-    );
-    memory.store.create(
-      { content: 'Apartment listings use linen backgrounds', scope: 'project', projectId: 'apartment', type: 'fact' },
-      { actor: 'system' },
-    );
-    const { call, calls } = stubCaller([
-      { candidates: [{
-        content: 'Apartment filters persist in the query string',
-        type: 'fact',
-        scope: 'project',
-        abstractionLevel: 'contextual',
-        sensitive: false,
-      }] },
-      { decisions: [{ index: 0, route: 'new', targetId: null }] },
-    ]);
-    const capture = createCaptureService({
-      memory,
-      callJson: call,
-      surface: 'silent',
-
-
-      profile: 'auto-project-copy',
-    });
-
-    const outcome = await capture.capture({
-      projectId: 'apartment',
-      sessionId: 'codex-chat',
-      engine: 'codex',
-      userText: 'Finish the apartment filters.',
-      assistantText: 'Implemented query-string persistence.',
-    });
-
-    expect(calls[0]!.system).toContain('costly to rediscover');
-    expect(calls[0]!.system).not.toContain('ordinary task work often produces useful memory');
-    expect(calls[1]!.user).toContain('Apartment listings use linen backgrounds');
-    expect(calls[1]!.user).not.toContain('Car-only checkout uses Stripe');
-    expect(outcome.created[0]).toMatchObject({
-      scope: 'project',
-      projectId: 'apartment',
-    });
-  });
-
-  it('Auto routes against the whole current Project Copy and updates one identity in place', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    const prior = memory.store.create(
-      { content: 'The frontend dev server runs on port 5173', scope: 'project', projectId: 'apartment', type: 'fact' },
-      { actor: 'agent', sessionId: '038-S1-chat' },
-    );
-    memory.store.create(
-      { content: 'Car checkout uses Stripe', scope: 'project', projectId: 'car', type: 'fact' },
-      { actor: 'agent' },
-    );
-    memory.syncProjection('apartment');
-    const { call, calls } = stubCaller([
-      { candidates: [{
-        content: 'The frontend dev server runs on port 4173',
-        detail: 'The project moved the Vite server from port 5173 to port 4173.',
-        type: 'fact',
-        scope: 'project',
-        abstractionLevel: 'concrete',
-        sensitive: false,
-      }] },
-      { decisions: [{ index: 0, route: 'updates', targetId: prior.id }] },
-    ]);
-    const capture = createCaptureService({
-      memory,
-      callJson: call,
-      surface: 'silent',
-      profile: 'auto-project-copy',
-    });
-
-    const outcome = await capture.capture({
-      projectId: 'apartment',
-      sessionId: '038-S2-chat',
-      engine: 'claude',
-      userText: 'Update the dev setup and finish the booking page.',
-      assistantText: 'Moved Vite to port 4173 and completed the page.',
-    });
-
-    expect(calls[1]!.user).toContain('The frontend dev server runs on port 5173');
-    expect(calls[1]!.user).not.toContain('Car checkout uses Stripe');
-    expect(calls[1]!.system).toContain('current project');
-    expect(calls[1]!.system).toContain('correction or newer value');
-    expect(outcome.created).toEqual([]);
-    expect(memory.store.getById(prior.id)).toMatchObject({
-      content: 'The frontend dev server runs on port 4173',
-      detail: 'The project moved the Vite server from port 5173 to port 4173.',
-      scope: 'project',
-      projectId: 'apartment',
-      version: 2,
-      status: 'active',
-    });
-    expect(memory.autoProjectMemories('apartment').filter((item) => item.content.includes('frontend dev server'))).toHaveLength(1);
-    const { readFileSync } = await import('node:fs');
-    expect(readFileSync(join(dir, 'projects', 'apartment', 'memories.md'), 'utf8')).toContain('port 4173');
-  });
-
-  it('drops a sensitive Auto update before it can mutate or enter Project Copy delivery', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    const prior = memory.store.create(
-      { content: 'The backend API uses a relative /api base URL', scope: 'project', projectId: 'car', type: 'fact' },
-      { actor: 'agent' },
-    );
-    memory.syncProjection('car');
-    const secret = 'The backend API token is sk-secret-123456789012345678';
-    const { call } = stubCaller([
-      { candidates: [{
-        content: secret,
-        type: 'fact',
-        scope: 'project',
-        abstractionLevel: 'concrete',
-        sensitive: true,
-      }] },
-      { decisions: [{ index: 0, route: 'updates', targetId: prior.id }] },
-    ]);
-    const capture = createCaptureService({
-      memory,
-      callJson: call,
-      surface: 'silent',
-      profile: 'auto-project-copy',
-    });
-
-    const outcome = await capture.capture({
-      projectId: 'car',
-      sessionId: 'auto-claude-chat',
-      engine: 'claude',
-      userText: 'Use the current backend credentials.',
-      assistantText: 'Configured the API client.',
-    });
-    const delivered = planMemoryInjection({
-      policy: resolveConditionPolicy('auto'),
-      provider: 'claude',
-      memory,
-      projectId: 'car',
-      chatId: 'auto-claude-chat',
-      workspaceDir: dir,
-    });
-    const { readFileSync } = await import('node:fs');
-
-    expect(outcome).toMatchObject({ created: [], dropped: 1, revisions: 0 });
-    expect(memory.store.getById(prior.id)).toMatchObject({
-      content: 'The backend API uses a relative /api base URL',
-      scope: 'project',
-      projectId: 'car',
-      version: 1,
-    });
-    expect(delivered.block).not.toContain(secret);
-    expect(memory.autoProjectMemories('car').map((item) => item.content)).not.toContain(secret);
-    expect(readFileSync(join(dir, 'projects', 'car', 'memories.md'), 'utf8')).not.toContain(secret);
-    expect(readFileSync(join(dir, 'personal', 'memories.md'), 'utf8')).not.toContain(secret);
   });
 
   it('does not reinforce (or bind a revision to) a memory whose content moved during the routing await (CAS)', async () => {
@@ -748,8 +359,8 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
     let callCount = 0;
     const call = (async () => {
       const next = responses[callCount++];
-
-
+      // The user rewrites the stored fact while routing is in flight — both
+      // verdicts now refer to text that's gone.
       if (callCount === 2) memory.store.update(stored.id, { content: 'Use port 4000' }, { actor: 'user' });
       return next!;
     }) as LlmJsonCaller;
@@ -757,11 +368,12 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
 
     const outcome = await capture.capture({ sessionId: 's-cas', userText: 'u', assistantText: 'a' });
 
-
+    // No reinforcement lands on the user's newer text…
     expect(outcome.reinforced).toBe(0);
     expect(memory.store.getById(stored.id)!.reinforcedCount).toBe(0);
-
-
+    // …the stale reinforce claim surfaces its observation instead of
+    // discarding it, and the update surfaces as a PLAIN candidate — neither
+    // binds a revision to the moved target.
     expect(outcome.created).toHaveLength(2);
     for (const created of outcome.created) expect(memory.store.revisionTargetOf(created.id)).toBeNull();
     expect(memory.store.hasOpenRevision(stored.id)).toBe(false);
@@ -772,13 +384,13 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
     memory = new MemoryService({ dbPath: ':memory:', dataDir: dir, logger });
     const captureEvents = () => (events as Array<{ type: string; status?: string; stage?: string }>).filter((e) => e.type === 'memory.capture');
 
-
+    // Zero candidates from pass 1 → still a terminal ok event with zeros.
     const { call: zeroCall } = stubCaller([{ candidates: [] }]);
     await createCaptureService({ memory, callJson: zeroCall }).capture({ sessionId: 's', userText: 'u', assistantText: 'a' });
     expect(captureEvents()).toHaveLength(1);
     expect(captureEvents()[0]).toMatchObject({ status: 'ok', proposed: 0, surfaced: 0 });
 
-
+    // An LLM failure → exactly one terminal failed event with the stage.
     const failingCall = (async () => {
       throw new Error('DeepSeek timed out');
     }) as LlmJsonCaller;
@@ -811,7 +423,7 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
     const call = (async () => {
       const next = responses[callCount++];
       if (callCount === 2) {
-
+        // Both targets move while routing is in flight.
         memory.store.update(dupTarget.id, { content: 'Use port 4000' }, { actor: 'user' });
         memory.store.update(conflictTarget.id, { content: 'Deploys move to Mondays' }, { actor: 'user' });
       }
@@ -821,61 +433,14 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
 
     const outcome = await capture.capture({ sessionId: 's-cas2', userText: 'u', assistantText: 'a' });
 
-
+    // The stale reinforce claim can't discard the observation — it surfaces…
     expect(outcome.created.map((c) => c.content)).toContain('Use port 3000');
     expect(outcome.reinforced).toBe(0);
-
+    // …and the stale conflict claim creates NO conflicts_with relation.
     const conflicted = outcome.created.find((c) => c.content === 'Never deploy on Fridays')!;
     expect(conflicted.status).toBe('candidate');
     expect(memory.store.getById(conflicted.id)!.relations ?? []).toHaveLength(0);
     expect(outcome.conflicts).toBe(0);
-  });
-
-  it('silent surface drops SENSITIVE candidates instead of activating them', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    const { call } = stubCaller([
-      {
-        candidates: [
-          {
-            content: 'production API key = sk-secret-123456789012345678',
-            type: 'fact',
-            scope: 'project',
-            abstractionLevel: 'concrete',
-            sensitive: true,
-          },
-          {
-            content: 'Deploys must go through staging first',
-            type: 'constraint',
-            scope: 'project',
-            abstractionLevel: 'contextual',
-            sensitive: false,
-          },
-        ],
-      },
-      {
-        decisions: [
-          { index: 0, route: 'new', targetId: null },
-          { index: 1, route: 'new', targetId: null },
-        ],
-      },
-    ]);
-    const capture = createCaptureService({ memory, callJson: call, surface: 'silent' });
-
-    const outcome = await capture.capture({
-      projectId: 'RenderX',
-      sessionId: 's-auto',
-      userText: 'the prod key is sk-secret-…, and deploys go through staging',
-      assistantText: 'Noted.',
-    });
-
-
-    expect(outcome.created).toHaveLength(1);
-    expect(outcome.created[0]!.sensitive).toBe(false);
-    expect(memory.store.list().some((m) => m.content.includes('sk-secret'))).toBe(false);
-
-    const { readFileSync } = await import('node:fs');
-    const md = readFileSync(join(dir, 'projects', 'RenderX', 'memories.md'), 'utf8');
-    expect(md).not.toContain('sk-secret');
   });
 
   it('keeps a gate-approved candidate when a reinforce verdict names a nonexistent id (bug #8 lineage)', async () => {
@@ -886,7 +451,7 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
           { content: 'Use tabs, not spaces', type: 'preference', scope: 'personal', abstractionLevel: 'general', sensitive: false },
         ],
       },
-
+      // Hallucinated target id — must NOT drop the candidate.
       { decisions: [{ index: 0, route: 'reinforces', targetId: 'M-999-nope' }] },
     ]);
     const capture = createCaptureService({ memory, callJson: call });
@@ -946,15 +511,15 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
       assistantText: 'Understood — I will run `bun test --coverage`.',
     });
 
-
+    // The superseding candidate is surfaced (NOT dropped like a duplicate).
     expect(outcome.created).toHaveLength(1);
     expect(outcome.conflicts).toBe(1);
     const fresh = outcome.created[0]!;
-
+    // A conflicts_with relation links the new item to the stale one.
     expect(memory.store.getConflicts(fresh.id).map((m) => m.id)).toContain(stale.id);
-
+    // The stale memory is discoverable as needing attention (target of a conflict).
     expect(memory.store.listConflicted('RenderX').map((m) => m.id)).toContain(stale.id);
-
+    // A memory.conflict event is logged for the study (drift signal).
     const conflictEvent = events.find((e) => (e as { type?: string }).type === 'memory.conflict') as
       | { staleId?: string; newId?: string; turn?: number }
       | undefined;
@@ -1002,6 +567,112 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
     expect(memory.store.getEvents(existing.id).some((e) => e.kind === 'reinforce')).toBe(true);
   });
 
+  it.each([false, true])('capture UPDATE accepts only its reviewed target through PATCH (changed=%s)', async (changed) => {
+    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
+    const target = memory.store.create(
+      { content: 'Dev server runs on port 3000', scope: 'project', projectId: 'RenderX', type: 'fact' },
+      { actor: 'user' },
+    );
+    const { call } = stubCaller([
+      { candidates: [{ content: 'Dev server now runs on port 3210', type: 'fact', scope: 'project', evidenceClass: 'user_stated' }] },
+      { decisions: [{ index: 0, route: 'updates', targetId: target.id }] },
+    ]);
+    const outcome = await createCaptureService({ memory, callJson: call }).capture({
+      projectId: 'RenderX', sessionId: 's-update', turn: 5, userText: 'We moved the dev server to 3210', assistantText: 'Noted.',
+    });
+    expect(outcome).toMatchObject({ surfaced: 1, revisions: 1, dropped: 0 });
+    const proposal = outcome.created[0]!;
+    expect(proposal).toMatchObject({
+      status: 'candidate', scope: 'project', projectId: 'RenderX', provenanceSessionId: 's-update',
+      provenanceTurn: 5, evidenceClass: 'user_stated',
+    });
+    if (changed) memory.store.update(target.id, { content: 'Use port 443 with mandatory TLS' }, { actor: 'user' });
+    const state = () => [proposal.id, target.id].map((id) => ({ item: memory.store.getById(id), events: memory.store.getEvents(id) }));
+    const before = state();
+    const url = new URL(`http://localhost/api/memories/${proposal.id}`);
+    const response = await handleMemoryRequest(new Request(url, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'active' }),
+    }), url, memory);
+    expect(response!.status).toBe(changed ? 409 : 200);
+    if (changed) {
+      expect(state()).toEqual(before);
+    } else {
+      expect(memory.store.getById(proposal.id)!.status).toBe('active');
+      expect(memory.store.getById(target.id)!.status).toBe('archived');
+    }
+  });
+
+  it('capture UPDATE preserves a distinct observation when a revision is already pending', async () => {
+    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
+    const target = memory.store.create(
+      { content: 'Dev server runs on port 3000', scope: 'personal', type: 'fact' }, { actor: 'user' },
+    );
+    const { call } = stubCaller([
+      { candidates: [{ content: 'Dev server now runs on port 4000', type: 'fact', scope: 'personal' }] },
+      { decisions: [{ index: 0, route: 'updates', targetId: target.id }] },
+      { candidates: [{ content: 'Dev server now runs on port 5000', type: 'fact', scope: 'personal' }] },
+      { decisions: [{ index: 0, route: 'updates', targetId: target.id }] },
+    ]);
+    const capture = createCaptureService({ memory, callJson: call });
+    const first = await capture.capture({
+      sessionId: 's-update', turn: 1, userText: 'We moved the dev server to 4000', assistantText: 'Noted.',
+    });
+    expect(first).toMatchObject({ surfaced: 1, revisions: 1, dropped: 0 });
+    const draft = first.created[0]!;
+    const draftEvents = memory.store.getEvents(draft.id);
+    const outcome = await capture.capture({
+      sessionId: 's-update', turn: 2, userText: 'We moved the dev server to 5000', assistantText: 'Noted.',
+    });
+    expect(outcome).toMatchObject({ surfaced: 1, revisions: 1, dropped: 0 });
+    expect(outcome.created).toHaveLength(1);
+    const latest = outcome.created[0]!;
+    expect(latest).toMatchObject({ content: 'Dev server now runs on port 5000', status: 'candidate', provenanceTurn: 2 });
+    expect(memory.store.list({ status: 'candidate' }).map(({ id }) => id).sort()).toEqual([draft.id, latest.id].sort());
+    expect(memory.store.getById(draft.id)).toEqual(draft);
+    expect(memory.store.getEvents(draft.id)).toEqual(draftEvents);
+    expect(memory.store.revisionTargetOf(draft.id)?.id).toBe(target.id);
+    expect(memory.store.getKv(`revision_targets:${draft.id}`)).not.toBeNull();
+    expect(memory.store.revisionTargetOf(latest.id)?.id).toBe(target.id);
+    expect(memory.store.getKv(`revision_targets:${latest.id}`)).not.toBeNull();
+    expect(memory.store.getById(target.id)).toEqual(target);
+  });
+
+  for (const winnerIndex of [0, 1]) it(`competing capture updates accept only one replacement (winner ${winnerIndex})`, async () => {
+    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
+    const target = memory.store.create(
+      { content: 'Use port 3000', scope: 'personal', type: 'fact' }, { actor: 'user' },
+    );
+    const { call } = stubCaller([
+      { candidates: [{ content: 'Use port 4000', type: 'fact', scope: 'personal' }] },
+      { decisions: [{ index: 0, route: 'updates', targetId: target.id }] },
+      { candidates: [{ content: 'Use port 5000', type: 'fact', scope: 'personal' }] },
+      { decisions: [{ index: 0, route: 'updates', targetId: target.id }] },
+    ]);
+    const capture = createCaptureService({ memory, callJson: call });
+    const proposals = [];
+    for (const turn of [1, 2]) {
+      const result = await capture.capture({ sessionId: 's-update', turn, userText: `port changed ${turn}`, assistantText: 'Noted.' });
+      proposals.push(result.created[0]!);
+    }
+    const accept = (id: string) => {
+      const url = new URL(`http://localhost/api/memories/${id}`);
+      return handleMemoryRequest(new Request(url, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'active' }),
+      }), url, memory);
+    };
+    const winner = proposals[winnerIndex]!;
+    const loser = proposals[1 - winnerIndex]!;
+    expect((await accept(winner.id))!.status).toBe(200);
+    const snapshot = () => memory.store.list().map((item) => ({ item, events: memory.store.getEvents(item.id) }));
+    const before = snapshot();
+    expect((await accept(loser.id))!.status).toBe(409);
+    expect(snapshot()).toEqual(before);
+    expect(memory.store.list({ status: 'active' }).map(({ id }) => id)).toEqual([winner.id]);
+    expect(memory.store.getById(target.id)!.status).toBe('archived');
+    expect(memory.store.getById(loser.id)!.status).toBe('candidate');
+    expect(memory.store.getById(loser.id)!.content).toBe(loser.content);
+  });
+
   it('updates verdict surfaces a REVISION candidate linked revises → target', async () => {
     memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
     const outdated = memory.store.create(
@@ -1040,7 +711,7 @@ describe('createCaptureService (routing gate, REDESIGN D4)', () => {
     expect(proposal.evidenceClass).toBe('user_stated');
     expect(memory.store.revisionTargetOf(proposal.id)?.id).toBe(outdated.id);
     expect(memory.store.hasOpenRevision(outdated.id)).toBe(true);
-
+    // The untouched original stays active until the user accepts the revision.
     expect(memory.store.getById(outdated.id)!.status).toBe('active');
   });
 });
@@ -1073,9 +744,9 @@ describe('routeProposal (propose_memory channel, REDESIGN D3)', () => {
       { sessionId: 's-tool', turn: 7, engine: 'claude' },
     );
 
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(1); // routing only — no extraction pass
     expect(outcome!.created).toHaveLength(1);
-    expect(outcome!.created[0]!.status).toBe('candidate');
+    expect(outcome!.created[0]!.status).toBe('candidate'); // never silently active
     expect(outcome!.created[0]!.evidenceClass).toBe('user_stated');
     const propose = events.find((e) => (e as { type?: string }).type === 'memory.propose') as { via?: string };
     expect(propose.via).toBe('propose_tool');
@@ -1108,7 +779,7 @@ describe('routeProposal (propose_memory channel, REDESIGN D3)', () => {
       { projectId: 'RenderX', sessionId: 's-tool', turn: 7, engine: 'claude' },
     );
 
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(2); // prompt extraction + first routing; the repeat never reaches Routing
     expect(memory.store.list({ status: 'candidate' })).toHaveLength(1);
     expect(repeated).toMatchObject({
       created: [],
@@ -1219,23 +890,6 @@ describe('routeProposal (propose_memory channel, REDESIGN D3)', () => {
     expect(memory.store.list({ status: 'candidate' })).toHaveLength(4);
   });
 
-  it('does not enable the turn ledger for Claude silent capture', async () => {
-    memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-    const { call, calls } = stubCaller([
-      { decisions: [{ index: 0, route: 'new', targetId: null }] },
-      { decisions: [{ index: 0, route: 'new', targetId: null }] },
-    ]);
-    const capture = createCaptureService({ memory, callJson: call, surface: 'silent' });
-    const proposal = { content: 'Use pnpm in this repo', type: 'constraint', scope: 'project' };
-    const context = { projectId: 'RenderX', sessionId: 'auto-chat', turn: 3, engine: 'claude' };
-
-    await capture.routeProposal(proposal, context);
-    await capture.routeProposal(proposal, context);
-
-    expect(calls).toHaveLength(2);
-    expect(memory.store.list({ status: 'active' })).toHaveLength(2);
-  });
-
   it('does not deduplicate the same observation across turns or chats', async () => {
     memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
     const { call, calls } = stubCaller([
@@ -1338,7 +992,7 @@ describe('routeProposal (propose_memory channel, REDESIGN D3)', () => {
       context,
     );
 
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(2); // semantic rewrites still use the Router for correctness
     expect(first!.reinforcedIds).toEqual([existing.id]);
     expect(rewritten).toMatchObject({
       reinforced: 0,
@@ -1433,7 +1087,7 @@ describe('captureFromPrompt (step-one prompt parse, redesign 2026-08-07)', () =>
     expect(outcome.created).toHaveLength(1);
     expect(outcome.created[0]!.status).toBe('candidate');
     expect(outcome.created[0]!.evidenceClass).toBe('user_stated');
-
+    // Fast pass: reasoning off + hard timeout ride the extraction call.
     expect(calls[0]!.disableThinking).toBe(true);
     expect(calls[0]!.timeoutMs).toBe(15_000);
     const captureEvents = events.filter((e) => (e as { type?: string }).type === 'memory.capture');
@@ -1470,7 +1124,8 @@ describe('captureFromPrompt (step-one prompt parse, redesign 2026-08-07)', () =>
     expect(first.created).toHaveLength(1);
     const firstId = first.created[0]!.id;
 
-
+    // The caller has not yet persisted its memory_proposals_result. Reopening
+    // the same SQLite file models a process death in that exact crash window.
     memory.close();
     memory = new MemoryService({ dbPath, dataDir: dir });
     const recovered = await createStudyPromptCapture(call).captureFromPrompt(input);
@@ -1701,7 +1356,7 @@ describe('captureFromPrompt (step-one prompt parse, redesign 2026-08-07)', () =>
 
     const none = await capture.captureFromPrompt({ sessionId: 's1', userText: 'fix the login bug please' });
     expect(none.created).toHaveLength(0);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(1); // extraction ran, router did not
   });
 
   it('degrades to an empty outcome when the sidecar fails (send path must not block)', async () => {
@@ -1833,7 +1488,7 @@ describe('captureFromExtraction (fork channel, 2026-08-08 option A)', () => {
 
   it('routes fork-extracted candidates through the same gate (validation + fingerprint + routing)', async () => {
     memory = new MemoryService({ dbPath: ':memory:', dataDir: dir });
-
+    // Routing pass is the ONLY LLM call on this channel (extraction happened on the fork).
     const { call, calls } = stubCaller([{ decisions: [{ index: 0, route: 'new', targetId: null }] }]);
     const capture = createCaptureService({ memory, callJson: call });
 
@@ -1841,7 +1496,7 @@ describe('captureFromExtraction (fork channel, 2026-08-08 option A)', () => {
       {
         candidates: [
           { content: 'Vite dev server must run behind the preview proxy', type: 'constraint', scope: 'project' },
-          { content: '', type: 'fact' },
+          { content: '', type: 'fact' }, // malformed → dropped
         ],
       },
       { projectId: 'RenderX', sessionId: 's1', turn: 2, userText: 'u', assistantText: 'a' },
@@ -1850,7 +1505,7 @@ describe('captureFromExtraction (fork channel, 2026-08-08 option A)', () => {
     expect(outcome.created).toHaveLength(1);
     expect(outcome.created[0]!.status).toBe('candidate');
     expect(outcome.dropped).toBe(1);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(1); // routing only — no extraction call
   });
 
   it('drops an exact prompt-channel repeat but still routes a different post-turn lesson', async () => {
@@ -1886,7 +1541,7 @@ describe('captureFromExtraction (fork channel, 2026-08-08 option A)', () => {
       { ...turn, userText: 'u', assistantText: 'a' },
     );
 
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(3); // extraction + first Routing + one Routing for the genuinely new lesson
     expect(prompt.created).toHaveLength(1);
     expect(postTurn.created).toHaveLength(1);
     expect(postTurn.sameTurnDuplicates).toEqual([
@@ -1911,6 +1566,6 @@ describe('captureFromExtraction (fork channel, 2026-08-08 option A)', () => {
     );
     expect(outcome.created).toHaveLength(0);
     expect(outcome.dropped).toBe(1);
-    expect(calls).toHaveLength(0);
+    expect(calls).toHaveLength(0); // fingerprint hit — the router never ran
   });
 });

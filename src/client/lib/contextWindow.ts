@@ -49,7 +49,9 @@ export function deriveLatestContextWindowSnapshot(
     const entry = entries[index]
     if (!entry) continue
 
-
+    // A boundary invalidates every usage sample before it. Until the engine
+    // emits a post-compaction sample, hiding the meter is more accurate than
+    // continuing to show the nearly-full pre-compaction window.
     if (
       entry.kind === "compact_boundary"
       || entry.kind === "compact_summary"

@@ -193,7 +193,11 @@ function readCodexConfiguredProjects(configPath: string) {
   return projects
 }
 
-
+// Rollout session files grow to hundreds of MB, and only the session_meta
+// FIRST line matters here. Reading whole files wedged the single-threaded
+// server for a minute+ on hosts with a large ~/.codex (observed: 23 GB / 789
+// sessions → 63 s of synchronous CPU per discovery scan). A session_meta line
+// is well under 8 KB; anything longer parses as null and is skipped.
 const FIRST_LINE_READ_BYTES = 8192
 
 function readBoundedFirstLine(filePath: string): string | null {
@@ -307,7 +311,10 @@ export class CodexProjectDiscoveryAdapter implements ProjectDiscoveryAdapter {
   }
 }
 
-
+// Claude-only deployment: the Codex adapter stays exported for direct use and
+// tests, but the default scan no longer touches ~/.codex — this build ships
+// without the Codex engine, and hosts with years of Codex history pay dearly
+// for a scan whose results the picker would never use.
 export const DEFAULT_PROJECT_DISCOVERY_ADAPTERS: ProjectDiscoveryAdapter[] = [
   new ClaudeProjectDiscoveryAdapter(),
 ]

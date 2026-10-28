@@ -47,11 +47,13 @@ export interface ResolvedSingleTranscriptRow {
   isLatestTodoWrite: boolean
   hideResult: boolean
   isFinalStatus: boolean
-
+  /** Undecided memory_preview that newer turn entries have passed by (orphan). */
   isStaleMemoryPreview: boolean
 }
 
-
+/** Persisted assistant chunks can replace the streaming footer before a turn
+ * ends. Keep every chunk after the latest prompt live until a terminal result
+ * arrives, so its memory citations do not lose the Stop control. */
 export function getCurrentTurnAssistantMessageIds(
   messages: HydratedTranscriptMessage[],
   canCancel: boolean,
@@ -158,8 +160,10 @@ function getTranscriptMessageRenderState(
         shouldRender = false
         break
       case "status":
-
-
+        // "requesting" is SDK plumbing the user should never see (user
+        // decision 2026-08-11): the footer's "Running…" is the one live
+        // indicator. Other statuses (e.g. compacting) may still surface
+        // while they are the trailing visible entry.
         shouldRender = isFinalStatus && message.status !== "requesting"
         break
       case "memory_candidates":
@@ -168,8 +172,8 @@ function getTranscriptMessageRenderState(
       case "memory_proposals":
       case "memory_transfer":
       case "memory_checkup":
-
-
+        // Memory UI (step-one gates / candidate review / trace annotation /
+        // pre-turn preview): visible by default, same as any other message.
         shouldRender = true
         break
       default:
@@ -188,7 +192,11 @@ function getTranscriptMessageRenderState(
   }
 }
 
-
+/**
+ * The latest SDK status ("requesting"/"compacting") still describing the
+ * present — i.e. the last VISIBLE transcript entry is a status row. Returns
+ * undefined once anything the user can see landed after it.
+ */
 export function getTrailingSdkStatus(messages: HydratedTranscriptMessage[]): string | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const entry = messages[index]
@@ -205,8 +213,12 @@ function buildTranscriptMessageRenderStates(
 ) {
   const firstSystemIndex = messages.findIndex((entry) => entry.kind === "system_init")
   const firstAccountIndex = messages.findIndex((entry) => entry.kind === "account_info")
-
-
+  // The live status row ("Requesting...") stays up until something the user
+  // can actually SEE lands after it — invisible entries (hidden interrupted
+  // markers, context_window_updated ticks) used to dethrone it mid-turn,
+  // leaving dead air until the reply arrived. When the footer already shows
+  // a live indicator, the row is suppressed entirely instead (the footer
+  // carries the SDK status label — one signal, not two spinners).
   let lastVisibleIndex = -1
   if (!options?.suppressTrailingStatus) {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -388,8 +400,9 @@ function sameMessage(left: HydratedTranscriptMessage, right: HydratedTranscriptM
         && left.interruptId === right.interruptId
         && JSON.stringify(left.resolution) === JSON.stringify(right.resolution)
     case "memory_preview":
-
-
+      // The relevance prediction FOLDS INTO this message seconds after it
+      // first renders — ignoring it froze the card on its pre-prediction
+      // state (the "highlights only after Go on" bug).
       return right.kind === "memory_preview"
         && left.previewId === right.previewId
         && left.decision === right.decision
@@ -407,7 +420,7 @@ function sameMessage(left: HydratedTranscriptMessage, right: HydratedTranscriptM
         && JSON.stringify(left.attentions) === JSON.stringify(right.attentions)
         && JSON.stringify(left.attentionIds) === JSON.stringify(right.attentionIds)
     case "memory_proposals":
-
+      // The decision folds in when the gate settles — the card must re-render.
       return right.kind === "memory_proposals"
         && left.proposalsId === right.proposalsId
         && left.openingReviewId === right.openingReviewId
@@ -415,8 +428,8 @@ function sameMessage(left: HydratedTranscriptMessage, right: HydratedTranscriptM
         && left.decision === right.decision
         && JSON.stringify(left.candidates) === JSON.stringify(right.candidates)
     case "memory_checkup":
-
-
+      // Result and decision both fold in after first render (skeleton →
+      // suggestions → settled) — each fold must break memoization.
       return right.kind === "memory_checkup"
         && left.checkupId === right.checkupId
         && left.openingReviewId === right.openingReviewId
@@ -425,8 +438,8 @@ function sameMessage(left: HydratedTranscriptMessage, right: HydratedTranscriptM
         && left.decision === right.decision
         && JSON.stringify(left.suggestions) === JSON.stringify(right.suggestions)
     case "memory_transfer":
-
-
+      // Result and decision fold in after first render (live-search skeleton
+      // → suggestions → settled) — each fold must break memoization.
       return right.kind === "memory_transfer"
         && left.transferId === right.transferId
         && left.openingReviewId === right.openingReviewId
@@ -791,8 +804,12 @@ export function buildResolvedTranscriptRows(
     isLoading: boolean
     localPath?: string
     latestToolIds: Record<string, string | null>
-
-
+    /**
+     * True while the transcript footer shows its own live indicator — the
+     * trailing SDK status row would duplicate it ("Requesting…" above a
+     * "Running…" spinner), so the footer becomes the single live signal and
+     * carries the SDK status label itself (getTrailingSdkStatus).
+     */
     suppressTrailingStatus?: boolean
   }
 ): ResolvedTranscriptRow[] {
@@ -824,7 +841,8 @@ export function buildResolvedTranscriptRows(
       .map((message) => message.turn),
   )
 
-
+  // A pending preview is only actionable while the turn is actually parked on
+  // it — i.e. no newer turn-flow entry exists (covers server-restart orphans).
   let lastTurnFlowIndex = -1
   for (let i = messages.length - 1; i >= 0; i--) {
     const kind = messages[i]!.kind
@@ -850,8 +868,8 @@ export function buildResolvedTranscriptRows(
             || checkupReopenableTurns.has(message.turn)
             || transferReopenableTurns.has(message.turn),
         ),
-
-
+        // Like Step 1: the Transfer card stays editable while Step 2 is still
+        // computing or undecided, not only once the preview is parked.
         canReopenTransfer: item.messages.some(
           (message) => previewReopenableTurns.has(message.turn) || checkupReopenableTurns.has(message.turn),
         ),
@@ -984,7 +1002,9 @@ export const ChatTranscriptRow = memo(function ChatTranscriptRow({
   )
 }, areChatTranscriptRowPropsEqual)
 
-
+// Exported for tests: this comparator is the one actually wired into the
+// live transcript (ChatTranscriptViewport renders ChatTranscriptRow); a
+// forgotten field here silently freezes rows.
 export function areChatTranscriptRowPropsEqual(prev: ChatTranscriptRowProps, next: ChatTranscriptRowProps): boolean {
   if (prev.isCurrentTurnAssistant !== next.isCurrentTurnAssistant) return false
   if (prev.toolGroupExpanded !== next.toolGroupExpanded) return false
@@ -1024,8 +1044,9 @@ export function areChatTranscriptRowPropsEqual(prev: ChatTranscriptRowProps, nex
       && prev.row.isLatestTodoWrite === next.row.isLatestTodoWrite
       && prev.row.hideResult === next.row.hideResult
       && prev.row.isFinalStatus === next.row.isFinalStatus
-
-
+      // A preview card goes stale the moment a later turn starts; the row is
+      // otherwise byte-identical, so dropping this field froze the card in
+      // its live/actionable look.
       && prev.row.isStaleMemoryPreview === next.row.isStaleMemoryPreview
       && sameMessage(prev.row.message, next.row.message)
   }

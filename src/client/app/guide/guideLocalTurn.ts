@@ -5,7 +5,11 @@ import type {
 } from "../../../shared/types"
 import type { GuideScene } from "./guideScenes"
 
-
+/**
+ * A Guide-only overlay on top of a scripted scene. It records actions from
+ * the mounted production controls without starting a participant turn or
+ * writing to the participant transcript.
+ */
 export interface GuideLocalTurnState {
   entries: TranscriptEntry[]
   running: boolean | null

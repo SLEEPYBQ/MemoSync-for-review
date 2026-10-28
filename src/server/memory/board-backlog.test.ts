@@ -627,7 +627,8 @@ describe("Memory Board durable skipped backlog", () => {
       state: { openingPrompt: { phase: "completed" }, pending: { total: 0 } },
     })
 
-
+    // The exemption belongs only to this opening task. The same skipped
+    // occurrences remain ordinary backlog for the next task.
     expect(service.reviewState("038-S2")).toMatchObject({
       pending: { transfers: 1, checkups: 1, total: 2 },
     })
@@ -660,7 +661,8 @@ describe("Memory Board durable skipped backlog", () => {
     service.markOpeningPromptLongTermReady(prepared)
     expect(service.completeOpeningPromptReview(prepared)).toMatchObject({ completed: true })
 
-
+    // A later ordinary turn in the same chat skips the same pair again. That is
+    // a new occurrence: it owes the next opening a review and is not exempt.
     chats["assigned-chat"].messages.push(...checkupGate({
       gateId: "later-turn-checkup",
       decision: "skipped",
@@ -707,7 +709,7 @@ describe("Memory Board durable skipped backlog", () => {
     chats["external-chat"].messages.push(...checkupGate({
       gateId: "external-checkup-new",
       decision: "skipped",
-
+      // Deliberately collide with the opening gate's millisecond timestamp.
       createdAt: 10,
     }))
 
@@ -1019,7 +1021,8 @@ describe("Memory Board durable skipped backlog", () => {
         { actor: "agent" },
       )
 
-
+      // Simulate process death after canonical actions committed but before
+      // MemoryBoardBacklogService.resolve could persist its Board receipt.
       first.store.setKv(`transfer_declined:${source.id}:assigned-project`, "declined")
       first.store.archive(conflicting.id, { actor: "user" })
       const personalLanding = first.store.create(

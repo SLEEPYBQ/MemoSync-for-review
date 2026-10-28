@@ -11,7 +11,7 @@ interface OnboardingRouteAccessInput {
   stage: StudyOnboardingStage | null
 }
 
-
+/** Keep unfinished study enrollment ahead of the Guide, task, and chat UI. */
 export function resolveOnboardingRouteAccess(input: OnboardingRouteAccessInput): OnboardingRouteAccess {
   if (input.checkedPathname !== input.pathname || input.stage === null) return { kind: "wait" }
   if (input.stage !== "complete") {
